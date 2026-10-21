@@ -1,0 +1,5 @@
+name = "fixtures"
+defaultTargets = ["Fixtures"]
+
+[[lean_lib]]
+name = "Fixtures"

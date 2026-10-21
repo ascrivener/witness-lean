@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# witness-check and witness-types come from ascrivener/witness, a private repository, so Cargo
+# needs a token that can read it: a fine-grained personal access token with read access to its
+# contents, saved as the WITNESS_READ_TOKEN secret.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global url."https://x-access-token:${{ secrets.WITNESS_READ_TOKEN }}@github.com/ascrivener/witness".insteadOf "https://github.com/ascrivener/witness"
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  blobs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global url."https://x-access-token:${{ secrets.WITNESS_READ_TOKEN }}@github.com/ascrivener/witness".insteadOf "https://github.com/ascrivener/witness"
+      - run: |
+          rustup toolchain install stable --profile minimal -c rust-src
+          cargo install cargo-jam-build --version 0.1.29 --locked
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo jam-build --out-dir out -- --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blobs
+          path: out/

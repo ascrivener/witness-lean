@@ -1,0 +1,12 @@
+[package]
+name = "lean-host"
+description = "Runs the Lean check natively on layer files, and times it, for sizing layers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+lean-check = { path = "../../check" }
+witness-check.workspace = true
+witness-types = { workspace = true, features = ["std"] }

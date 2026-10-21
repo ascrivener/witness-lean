@@ -1,0 +1,20 @@
+
+[package]
+name = "nanoda_lib"
+version = "0.4.25"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/ammkrn/nanoda_lib"
+description = "A type checker for the Lean 4 programming language and theorem prover"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+indexmap = { version = "2.13.0", default-features = false }
+rustc-hash = { version = "1.1.0", default-features = false }
+hashbrown = { version = "0.15", default-features = false, features = ["inline-more", "default-hasher"] }
+num-bigint = { version = "0.5.1", default-features = false, features = ["serde"] }
+num-integer = { version = "0.1.47", default-features = false }
+num-traits = { version = "0.2.19", default-features = false }
+semver = { version = "1.0.27", default-features = false }
+serde_json = { version = "1.0.111", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"] }

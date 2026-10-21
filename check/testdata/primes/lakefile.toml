@@ -1,0 +1,11 @@
+name = "primes"
+defaultTargets = ["Primes"]
+
+# Pinned to a commit whose build is in Mathlib's cache (`lake exe cache get`).
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "94d4e1d4cc69cbd57e34133f2d5c9d8c48c00f9c"
+
+[[lean_lib]]
+name = "Primes"

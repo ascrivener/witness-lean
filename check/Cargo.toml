@@ -1,0 +1,19 @@
+[package]
+name = "lean-check"
+description = "Witness check for Lean 4 proofs: attests library layers once, then binds and checks a solver's proof against them"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# A check has one entry point at pc 0, which is the authorizer layout.
+[package.metadata.jam]
+type = "authorizer"
+
+[dependencies]
+witness-check = { workspace = true, features = ["alloc"] }
+polkavm-derive.workspace = true
+nanoda_lib = { path = "../vendor/nanoda" }
+
+[dev-dependencies]
+witness-types = { workspace = true, features = ["std"] }

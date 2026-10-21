@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["check", "tools/lean-host"]
+# vendor/nanoda is a member too (a path dependency inside the workspace), but its own tests
+# predate the no_std port, so `cargo test` covers only these.
+default-members = ["check", "tools/lean-host"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["Adam Scrivener <adam@oneoff.world>"]
+
+[workspace.dependencies]
+# The check interface and the types it's encoded with, from witness (pinned).
+witness-check = { git = "https://github.com/ascrivener/witness", rev = "98a9942" }
+witness-types = { git = "https://github.com/ascrivener/witness", rev = "98a9942", default-features = false }
+polkavm-derive = { version = "0.37.0", default-features = false }
+
+# `cargo jam-build` builds PVM blobs with this profile.
+[profile.production]
+inherits = "release"
+lto = true
+codegen-units = 1
