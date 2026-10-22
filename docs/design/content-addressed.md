@@ -78,7 +78,8 @@ library the solver uses is attested once, by anyone, and reused by every later b
 
 ## What witness needs (generic)
 
-1. **Attestations form a DAG.** A claim names a set of parents. In attest and reveal mode the
+1. **Attestations form a DAG, and cover sets.** A claim names a set of parents and a set of
+   subjects (a batch's statement nodes), any of which a check may receive as trusted alone. In attest and reveal mode the
    check receives the parents' subjects, and witness makes sure every trusted subject arrives
    with its own parents (the closure), so trust never skips a step. Linear chains are the case
    of one parent each; their closure is the chain.
@@ -102,9 +103,8 @@ stays the same. Nothing about the format has to change.
 
 ## Plan
 
-1. **Measure batching.** Cut the closure into batches (by module, then by size), compute each
-   batch's trusted set and its native check time with `tools/lean-host`, and the number of
-   rounds. Then do the same for one larger Mathlib target, to check the estimates.
+1. **Measure batching.** Done for infinite primes (above). Still to do: the cost of preimage
+   lookups per statement node, and the same measurements for one larger Mathlib target.
 2. **The format.** A converter from NDJSON to nodes and batches, and a nanoda loader that builds
    an environment from nodes by hash.
 3. **witness.** DAG attestations, attest-mode witnesses, sets of cited blobs.
@@ -112,11 +112,47 @@ stays the same. Nothing about the format has to change.
 5. **End to end.** Infinite primes on the testnet, compared with today's 66-layer chain: total gas,
    gas of the heaviest step, and rounds. Then a bigger theorem.
 
+## Batching: attest in batches, load single statements
+
+Measured on the infinite-primes closure (`tools/lean/measure_batches.py`), with each batch's
+trusted set being the batches that hold any statement its declarations need:
+
+| Batches | Count | Rounds | Trusted batches per batch (median / max) | Trusted statements, NDJSON (median / max) |
+|---|---|---|---|---|
+| ~50 KB, export order | 293 | 208 | 28 / 89 | 1.1 MB / 3.2 MB |
+| ~150 KB, export order | 113 | 101 | 24 / 61 | 2.3 MB / 4.8 MB |
+| ~50 KB, by depth | 337 | 75 | 44 / 169 | 1.7 MB / 4.8 MB |
+| ~400 KB, by depth | 94 | 75 | 29 / 69 | 5.3 MB / 7.2 MB |
+
+Two things go wrong when the unit of loading is the batch:
+
+- **A batch loads far more than it needs.** One declaration needs a median of 31 KB of statements
+  and at most 1.1 MB; a batch pulls in every batch that holds any of them, 1 to 7 MB.
+- **Export order chains the batches.** Consecutive batches depend on each other, so attesting
+  takes as many rounds as there are batches. Batching by dependency depth gets the minimum, 75,
+  at the cost of loading even more.
+
+So the unit of attestation and the unit of loading should differ. **Attest in batches**, to keep
+the number of refines and records down, but **publish each declaration's statement as its own
+node blob**, which the batch's attestation vouches for. A later check then loads exactly the
+statement nodes it needs. For witness that means an attestation can cover a *set* of subject
+blobs (a batch's statement nodes), any of which a check may receive as trusted on its own, and a
+check may receive many more blobs than `MAX_BLOBS` (128) allows today: up to about 700 here, so
+blobs need a cheaper path than one lookup each, or a much higher limit.
+
+For infinite primes alone this doesn't matter much: even the worst batch-level load, 7 MB of
+NDJSON (about 1 MB in the binary format), parses in about 10⁹ gas. It's what keeps the cost per
+check bounded by what a declaration uses, rather than by the size of the library, at Mathlib's
+scale.
+
 ## Open questions
 
-- **Batching.** A batch's trusted set is every attested batch holding a node its load set needs.
-  Batches that follow Mathlib's modules should keep that set small, since a module mostly uses its
-  own imports. Step 1 measures it.
+- **Batch shape.** Batching by depth minimizes rounds; batching by Mathlib module probably
+  minimizes how many batches a check draws statements from. With statements loaded one by one,
+  only the rounds matter, so batch by depth.
+- **Many blobs.** Hundreds of statement nodes per check means hundreds of preimage lookups in
+  refine. Measure their cost, or pack the nodes a check needs into one blob per reveal (the
+  solver can't forge one, since every node is checked against its hash).
 - **Names.** Lean environments need unique names. Two different nodes with the same name (two
   versions of a lemma) can't both be loaded into one check; the check rejects it. Different
   Mathlib versions can still share every node that didn't change, since unchanged declarations
