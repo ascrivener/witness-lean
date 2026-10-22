@@ -151,9 +151,13 @@ fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Opt
 	Some(nodes)
 }
 
-/// Add `node` to `entries`, refusing a duplicate.
+/// Add `node` to `entries`. The same trusted node may come twice (an op may cite a subject
+/// twice, say a bounty's and again among the solver's); anything else twice is refused.
 fn insert<'a>(entries: &mut BTreeMap<Hash, Entry<'a>>, hash: Hash, node: &'a [u8], trusted: bool) -> Option<()> {
-	entries.insert(hash, Entry { node, trusted, proof: None }).is_none().then_some(())
+	match entries.insert(hash, Entry { node, trusted, proof: None }) {
+		None => Some(()),
+		Some(old) => (old.trusted && trusted).then_some(()),
+	}
 }
 
 /// Attach each of `proofs` to the untrusted node it proves.

@@ -105,6 +105,8 @@ fn honest_proofs_are_accepted() {
 		let mut env = p.env().to_vec();
 		env.reverse();
 		assert!(reveal(p.goal(), &p.pins(), &env, &solver), "a reversed environment");
+		env.extend_from_slice(&p.env()[..3]);
+		assert!(reveal(p.goal(), &p.pins(), &env, &solver), "trusted nodes cited twice");
 	}
 }
 
@@ -211,6 +213,7 @@ fn attesting_batches() {
 	assert!(!attest(&pins[1..], &[], &f.nodes, &proofs_of(&f.nodes)), "pins not 32 bytes each");
 	assert!(!attest(&pins, first, second, &[proofs_of(second), vec![second[0]]].concat()), "a node in the proofs");
 	assert!(!attest(&pins, first, &[second, &second[..1]].concat(), &proofs_of(second)), "a node twice");
+	assert!(!attest(&pins, first, &[second, &first[..1]].concat(), &proofs_of(second)), "trusted and a subject");
 }
 
 #[test]
