@@ -68,3 +68,24 @@ for target in (50_000, 150_000, 400_000):
     print(f"batches of ~{target//1000} KB: {len(batches)} batches, {max(depth)} rounds; "
           f"trusted batches per batch median {q(counts,.5)} max {counts[-1]}; "
           f"trusted statement KB median {q(loads,.5)//1000} p90 {q(loads,.9)//1000} max {loads[-1]//1000}")
+
+print("-- by depth, loading single statements: each batch loads the union of its declarations' load sets --")
+for target in (50_000, 150_000, 400_000):
+    batches, by_level = [], {}
+    for n in order: by_level.setdefault(depth_of[n], []).append(n)
+    for lvl in sorted(by_level):
+        cur, size = [], 0
+        for n in by_level[lvl]:
+            cur.append(n); size += stmt_bytes(n) + proof_bytes(n)
+            if size >= target: batches.append(cur); cur, size = [], 0
+        if cur: batches.append(cur)
+    unions = []
+    for b in batches:
+        mine = set(b)
+        need = set().union(*(load(n) for n in b)) - mine
+        unions.append((len(need), sum(stmt_bytes(c) for c in need)))
+    counts = sorted(u[0] for u in unions); loads = sorted(u[1] for u in unions)
+    q = lambda xs, f: xs[int(f * (len(xs) - 1))]
+    print(f"batches of ~{target//1000} KB: {len(batches)} batches; statements loaded per batch: "
+          f"median {q(counts,.5)} ({q(loads,.5)//1000} KB), p90 {q(counts,.9)} ({q(loads,.9)//1000} KB), "
+          f"max {counts[-1]} ({loads[-1]//1000} KB)")

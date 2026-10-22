@@ -1,6 +1,7 @@
 # Design: content-addressed Lean, attested as a DAG
 
-Status: proposal. Measurements below are on the infinite-primes closure; nothing is built yet.
+Status: proposal. Measurements below are on the infinite-primes and FLT-for-n = 4 closures;
+nothing is built yet.
 
 ## Why
 
@@ -29,6 +30,27 @@ actually uses.
   [the design keeps a way out](#if-a-proof-is-needed).
 - **Proofs are two thirds of the bytes.** Of the closure's expression data, 64% is reachable only
   from theorem proofs.
+
+### A bigger closure: FLT for n = 4
+
+Mathlib's `fermatLastTheoremFour` (x⁴ + y⁴ ≠ z⁴) is a closure 2.5 times bigger. The positional
+format can't take it at all: its last layers would parse 4.6 MB, about 4.6×10⁹ gas, more than a
+refine allows. What a declaration needs grows far more slowly than the closure:
+
+| | Infinite primes | FLT, n = 4 | Growth |
+|---|---|---|---|
+| Declarations | 3,321 | 8,328 | 2.5× |
+| Closure, binary format | 1.5 MB | 4.6 MB | 3.0× |
+| Native check of the whole closure | 0.98 s (≈ 28×10⁹ gas) | 2.4 s (≈ 70×10⁹ gas) | 2.5× |
+| Load set, median | 41 (31 KB) | 51 (40 KB) | 1.3× |
+| Load set, 90th percentile | 167 (203 KB) | 263 (295 KB) | 1.5× |
+| Load set, largest | 684 (1.1 MB) | 1,395 (2.4 MB) | 2.2× |
+| DAG depth | 75 | 92 | 1.2× |
+
+Load sets are in declarations and NDJSON bytes; the binary format is about a seventh of NDJSON.
+So total work grows with the library, as it must, but the work of any one check grows with what
+it uses: the worst FLT check loads about 330 KB of binary statements, around 3.5×10⁸ gas to
+parse.
 
 ## The format
 
@@ -78,8 +100,9 @@ library the solver uses is attested once, by anyone, and reused by every later b
 
 ## What witness needs (generic)
 
-1. **Attestations form a DAG, and cover sets.** A claim names a set of parents and a set of
-   subjects (a batch's statement nodes), any of which a check may receive as trusted alone. In attest and reveal mode the
+1. **Attestations form a DAG, and cover sets.** A claim names a set of parents and a subject list
+   (a preimage listing a batch's statement nodes), any of which a check may receive as trusted
+   alone. Ops cite a claim once and its entries by index, and `MAX_BLOBS` rises into the thousands. In attest and reveal mode the
    check receives the parents' subjects, and witness makes sure every trusted subject arrives
    with its own parents (the closure), so trust never skips a step. Linear chains are the case
    of one parent each; their closure is the chain.
@@ -103,8 +126,7 @@ stays the same. Nothing about the format has to change.
 
 ## Plan
 
-1. **Measure batching.** Done for infinite primes (above). Still to do: the cost of preimage
-   lookups per statement node, and the same measurements for one larger Mathlib target.
+1. **Measure batching.** Done (above), for infinite primes and FLT for n = 4.
 2. **The format.** A converter from NDJSON to nodes and batches, and a nanoda loader that builds
    an environment from nodes by hash.
 3. **witness.** DAG attestations, attest-mode witnesses, sets of cited blobs.
@@ -140,19 +162,42 @@ blobs (a batch's statement nodes), any of which a check may receive as trusted o
 check may receive many more blobs than `MAX_BLOBS` (128) allows today: up to about 700 here, so
 blobs need a cheaper path than one lookup each, or a much higher limit.
 
-For infinite primes alone this doesn't matter much: even the worst batch-level load, 7 MB of
-NDJSON (about 1 MB in the binary format), parses in about 10⁹ gas. It's what keeps the cost per
-check bounded by what a declaration uses, rather than by the size of the library, at Mathlib's
-scale.
+Loading single statements, a batch loads the union of its declarations' load sets:
+
+| Batches, by depth | Infinite primes: statements per batch (median / max) | FLT, n = 4 |
+|---|---|---|
+| ~50 KB | 188, 230 KB / 684, 1.1 MB | 242, 299 KB / 1,395, 2.4 MB |
+| ~150 KB | 322, 419 KB / 697, 1.1 MB | 434, 579 KB / 1,526, 2.8 MB |
+| ~400 KB | 438, 629 KB / 699, 1.1 MB | 683, 1.0 MB / 1,754, 3.3 MB |
+
+(NDJSON bytes; about a seventh of that in the binary format.) Compare 1 to 7 MB per batch when
+loading whole batches, for the smaller closure.
+
+### Many blobs, cheaply
+
+A check may draw on hundreds to about 1,700 statement blobs. In gas that's cheap: a `lookup` costs
+600 gas plus 248 per KiB, so 1,700 lookups of 3 MB in all cost about 2×10⁶ gas, a tiny fraction
+of a refine. What doesn't scale is the op: a claim per trusted blob is about 140 bytes, so 1,700
+of them would be about 240 KB, far over a work item's payload. So:
+
+- An attestation names its batch's statement nodes through **one subject list**: a preimage
+  listing their hashes. The claim covers the list's hash.
+- An op carries each attestation's claim once, plus, per statement used, which claim and which
+  entry of its list (a few bytes). Refine looks up the list and the node, and checks the node's
+  hash against the list.
+
+For the worst FLT batch, that's around 200 claims and 1,526 entries: under 40 KB. witness's
+`MAX_BLOBS` (128) has to rise into the thousands for this.
 
 ## Open questions
 
 - **Batch shape.** Batching by depth minimizes rounds; batching by Mathlib module probably
   minimizes how many batches a check draws statements from. With statements loaded one by one,
   only the rounds matter, so batch by depth.
-- **Many blobs.** Hundreds of statement nodes per check means hundreds of preimage lookups in
-  refine. Measure their cost, or pack the nodes a check needs into one blob per reveal (the
-  solver can't forge one, since every node is checked against its hash).
+- **Holding many small preimages.** Each statement node is a preimage the service holds, with a
+  storage deposit per item. Mathlib's hundreds of thousands of declarations would be as many
+  items. If that's too costly, a batch's nodes can share one blob, with a check given byte ranges
+  of it; the subject list then lists (offset, length, hash).
 - **Names.** Lean environments need unique names. Two different nodes with the same name (two
   versions of a lemma) can't both be loaded into one check; the check rejects it. Different
   Mathlib versions can still share every node that didn't change, since unchanged declarations
