@@ -213,6 +213,14 @@ fn attesting_batches() {
 	assert!(!attest(&pins[1..], &[], &f.nodes, &proofs_of(&f.nodes)), "pins not 32 bytes each");
 	assert!(!attest(&pins, first, second, &[proofs_of(second), vec![second[0]]].concat()), "a node in the proofs");
 	assert!(!attest(&pins, first, &[second, &second[..1]].concat(), &proofs_of(second)), "a node twice");
+	// Proofs may come among the subjects instead, or some there and some in the witness.
+	let in_bundle = [second, &proofs_of(second)].concat();
+	assert!(attest(&pins, first, &in_bundle, &[]), "proofs among the subjects");
+	let second_proofs = proofs_of(second);
+	let (some, rest) = second_proofs.split_at(1);
+	assert!(attest(&pins, first, &[second, some].concat(), rest), "split between the two");
+	assert!(!attest(&pins, first, &proofs_of(second), &[]), "proofs but no nodes");
+	assert!(!attest(&pins, first, &in_bundle, &proofs_of(second)), "a proof twice");
 	assert!(!attest(&pins, first, &[second, &first[..1]].concat(), &proofs_of(second)), "trusted and a subject");
 }
 

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Lay out a lean_plan.py plan as files for attesting with the witness CLI.
 
-    lean_batches.py DIR PLAN WORK
+    lean_batches.py DIR PLAN WORK [MAX_OP_BYTES]
 
 For each batch N, in WORK: batch-N.subjects (comma-separated paths of its nodes, for `witness
 bundle`), batch-N.trust (comma-separated CLAIM:ENTRY references to the nodes it trusts, CLAIM
 being batch-M.claim, the claim file `witness attest --claim-out` writes for batch M) and
-batch-N.proofs (its proofs, packed as the check's witness). For a plan with a goal: goal.trust,
+batch-N.proofs (its proofs, packed as the check's witness). A batch whose op would pass
+MAX_OP_BYTES (default 60000: an op travels as a hex command-line argument to `jamt item`, which
+Linux caps at 128 KiB) carries its proofs among its subjects instead, and gets an empty witness.
+For a plan with a goal: goal.trust,
 goal.pack (the goal's node and proof, the reveal's witness), goal.hash (its hash, hex), and
 goal.cite (one CLAIM:ENTRY the bounty cites, to fix the pins: a node the goal imports). Also
-pins (the pinned nodes' hashes, hex, back to back: the check's attest params).
+pins (the pinned nodes' hashes, hex, back to back: the check's attest params). Prints the number
+of batches.
 """
 import json
 import os
@@ -27,7 +31,7 @@ PINNED = {
 }  # nanoda_lib::nodes::PINNED_NAMES
 
 
-def main(d, plan_path, work):
+def main(d, plan_path, work, max_op=60000):
     manifest = json.load(open(f"{d}/manifest.json"))
     by_hash = {e["hash"]: e for e in manifest}
     plan = json.load(open(plan_path))
@@ -45,6 +49,7 @@ def main(d, plan_path, work):
             f.write(data)
 
     proof = lambda h: open(f"{d}/proofs/{h}", "rb").read()
+    bundled = 0
     for n, b in enumerate(plan):
         if "goal" in b:
             g = b["goal"]
@@ -53,14 +58,25 @@ def main(d, plan_path, work):
             write("goal.hash", g)
             write("goal.cite", refs(by_hash[g]["imports"][:1]))
             continue
-        write(f"batch-{n}.subjects", ",".join(f"{d}/nodes/{h}" for h in b["subjects"]))
+        proven = [h for h in b["subjects"] if "proof_size" in by_hash[h]]
+        cited = len({home[h][0] for h in b["trusted"]})
+        # Claims, trusted references and proofs, roughly as the op encodes them.
+        op = 200 + 132 * cited + 7 * len(b["trusted"]) + sum(by_hash[h]["proof_size"] + 3 for h in proven)
+        subjects = [f"{d}/nodes/{h}" for h in b["subjects"]]
+        if op > max_op:
+            subjects += [f"{d}/proofs/{h}" for h in proven]
+            proven = []
+            bundled += 1
+        write(f"batch-{n}.subjects", ",".join(subjects))
         write(f"batch-{n}.trust", refs(b["trusted"]))
-        write(f"batch-{n}.proofs", pack([proof(h) for h in b["subjects"] if "proof_size" in by_hash[h]]))
+        write(f"batch-{n}.proofs", pack([proof(h) for h in proven]))
     write("pins", "".join(e["hash"] for e in manifest if PINNED & set(e["names"])))
-    print(sum("subjects" in b for b in plan), file=sys.stderr)
+    if bundled:
+        print(f"{bundled} batches carry their proofs in their bundles", file=sys.stderr)
+    print(sum("subjects" in b for b in plan))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         sys.exit(__doc__)
-    main(*sys.argv[1:])
+    main(*sys.argv[1:4], *[int(a) for a in sys.argv[4:]])

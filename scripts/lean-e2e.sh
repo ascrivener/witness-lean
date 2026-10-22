@@ -2,13 +2,15 @@
 # A Lean proof bounty, end to end, on a local PolkaJam testnet (v0.1.29):
 #
 #   WITNESS_DIR=path/to/witness LEAN4EXPORT=path/to/lean4export POLKAJAM_DIR=... \
-#     scripts/lean-e2e.sh [gcd|primes]
+#     scripts/lean-e2e.sh [gcd|primes|flt4]
 #
 # - gcd (the default): gcd a b = gcd b a, over Lean core (check/testdata/lean). Fits the
 #   testnet's "tiny" refine limit of 10⁹ gas.
 # - primes: there are infinitely many primes, proved by Mathlib's Nat.exists_infinite_primes
 #   (check/testdata/primes): 2,942 nodes in 112 batches over 73 depths. The heaviest batch uses
-#   about 1.1×10⁹ gas, so it needs a testnet with the full spec's 5×10⁹ refine gas (see README).
+#   about 1.25×10⁹ gas, so it needs a testnet with the full spec's 5×10⁹ refine gas (see README).
+# - flt4: x⁴ + y⁴ ≠ z⁴, Mathlib's fermatLastTheoremFour, revealed as is (in the primes project):
+#   7,579 nodes in 269 batches over 91 depths. Like primes, it needs the full spec's refine gas.
 #
 # The solver's export is converted to content-addressed nodes (tools/lean/lean_nodes.py), and
 # everything but the solver's theorem is planned into batches by dependency depth
@@ -34,7 +36,10 @@ case "${1:-gcd}" in
 		PROJECT=check/testdata/lean SOLUTION_MODULE=Fixtures.Solutions THEOREM=goal_gcd GAS=950000000 ;;
 	primes)
 		PROJECT=check/testdata/primes SOLUTION_MODULE=Primes.Solution THEOREM=goal_primes GAS=4500000000 ;;
-	*) echo "usage: $0 [gcd|primes]" >&2; exit 2 ;;
+	flt4)
+		PROJECT=check/testdata/primes SOLUTION_MODULE=Mathlib.NumberTheory.FLT.Four
+		THEOREM=fermatLastTheoremFour GAS=4500000000 ;;
+	*) echo "usage: $0 [gcd|primes|flt4]" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 JAMT=${POLKAJAM_DIR:+$POLKAJAM_DIR/}jamt
@@ -120,7 +125,7 @@ step "exporting the proof ($THEOREM) and converting it to nodes"
 python3 tools/lean/lean_nodes.py "$TMP/full.ndjson" "$TMP/nodes"
 python3 tools/lean/lean_plan.py "$TMP/nodes" --goal "$THEOREM" >"$TMP/plan.json"
 W_DIR=$TMP/w
-BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR" 2>&1)
+BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
 PINS=$(cat "$W_DIR/pins")
 GOAL=$(cat "$W_DIR/goal.hash")
 for ((n = 0; n < BATCHES; n++)); do
