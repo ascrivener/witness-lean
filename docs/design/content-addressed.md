@@ -1,7 +1,7 @@
 # Design: content-addressed Lean, attested as a DAG
 
-Status: proposal. Measurements below are on the infinite-primes and FLT-for-n = 4 closures;
-nothing is built yet.
+Status: implemented (see `tools/lean/node_format.md`, `nanoda_lib::nodes` and the check), with
+witness's attestation DAG over bundles. The measurements below are from before it was built.
 
 ## Why
 

@@ -12,13 +12,13 @@ pub(crate) mod prelude {
     pub use alloc::{borrow::ToOwned, boxed::Box, format, string::{String, ToString}, vec, vec::Vec};
 }
 
-pub mod binding;
 pub mod debug_printer;
 pub mod env;
 pub mod expr;
 pub mod inductive;
 pub mod level;
 pub mod name;
+pub mod nodes;
 pub mod parser;
 pub mod pretty_printer;
 pub mod quot;

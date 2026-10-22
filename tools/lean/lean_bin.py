@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a lean4export NDJSON export (or a delta from lean_delta.py) to the binary format.
+"""Convert a lean4export NDJSON export to the binary format (lean_nodes.py uses its encoder).
 
     lean_bin.py IN.ndjson > OUT.bin
 
@@ -7,7 +7,7 @@ The format is described in binary_format.md. In short: an 8-byte magic, then one
 another, each a tag byte followed by its fields in a fixed order. Integers are unsigned LEB128,
 strings and byte strings are length-prefixed, and big number literals are little-endian bytes.
 Name, level and expression items carry no index: each one's index is its position among the items
-of its kind, so the input must number them consecutively, which lean4export and lean_delta.py do.
+of its kind, so the input must number them consecutively, which lean4export does.
 """
 
 import json

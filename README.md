@@ -4,43 +4,49 @@ A [witness](https://github.com/ascrivener/witness) check for Lean 4 proofs: boun
 paid to whoever proves them, checked on JAM by an independent Lean kernel,
 [nanoda](vendor/nanoda/VENDORED.md).
 
-It has proved "there are infinitely many primes" on a local PolkaJam testnet, from Mathlib, in 66
-attested layers (see [Numbers](#numbers)).
+It has proved "there are infinitely many primes" on a local PolkaJam testnet, from Mathlib (see
+[Numbers](#numbers)).
 
 ## How it works
 
-Every blob the check receives, and the witness, is a *layer*: a consecutive part of one
-lean4export export, continuing the numbering of names, levels and expressions of the layers
-before it. So a layer only means something right after the exact layers it was cut after, which
-is why witness trusts an attested subject only after its own chain.
+Every blob the check receives is a *node*: one declaration with its own tables of names, levels and
+expressions, naming the nodes it uses by hash ([format](tools/lean/node_format.md)). A theorem's
+node is its statement; its proof is separate. So a node means the same thing wherever it's
+loaded, and checking a declaration needs only the statements it uses, not a whole export.
 
-- **Attest mode** type-checks the subject layer, trusting its chain. Params are empty. A library
-  is attested this way layer by layer, each layer once, by anyone.
-- **Reveal mode** takes params `statement\ntheorem`: a `Prop`-valued definition in the blobs (the
-  poster's statement) and the solver's theorem. The witness is the solver's delta, the last layer.
-  The check binds the theorem to the statement: it must be a theorem whose type is exactly that
-  constant, so the solver can't prove something else or redefine the statement's vocabulary. Then
-  it type-checks the untrusted layers and the delta.
+- **Attest mode** type-checks a batch of nodes (the subjects), each theorem with its proof (the
+  witness), trusting attested nodes for everything the batch imports. Params are the *pins*: the
+  hashes of the nodes allowed to declare the names the kernel treats specially (`Nat`, `Nat.add`
+  and the other operations it computes with natively, and the permitted axioms). A library is
+  attested this way in batches, by dependency depth, each once, by anyone.
+- **Reveal mode** takes params `goal ++ pins`, where `goal` is the hash of the bounty's theorem
+  statement node, say `theorem goal : Goal`. The poster can hash it without a proof, since a
+  statement node doesn't hold one. The witness is the solver's nodes and proofs; they must prove
+  the goal node, trusting attested nodes for the rest.
+- Every node must import every constant it mentions, no name may be declared twice, and the
+  kernel's special names may only come from pinned nodes. Otherwise a node could declare its own
+  `Nat.add` (or `axiom propext : False`) and the kernel would trust it by name.
 - Only `propext`, `Classical.choice` and `Quot.sound` may appear as axioms, so no `sorry`.
 
 A bounty goes like this (`scripts/lean-e2e.sh` runs it end to end):
 
-1. The poster writes the statement as `def Goal : Prop := ...` and exports it with
-   `lean4export Module -- Goal`. Its layers are pinned and attested once, and the bounty cites the
-   chain.
-2. The solver exports their theorem and makes a delta against the statement environment
-   (`tools/lean/lean_delta.py`). A delta too big for one refine, or for a witness, is cut into
-   layers (`tools/lean/lean_layers.py`). The solver commits first (attesting publishes the
-   layers, and the earliest commitment wins), then attests all but the last layer on top of the
-   bounty's chain, and reveals with them as extra layers and the last as the witness.
+1. The library is converted to nodes (`tools/lean/lean_nodes.py`), planned into batches by
+   dependency depth (`lean_plan.py`), and attested batch by batch. Batches of one depth are
+   independent, so they can be attested at once.
+2. The poster hashes the statement node of `theorem goal : Goal` and posts a bounty with params
+   `goal ++ pins`. The bounty cites one node attested with params `pins` (its `Goal`, say):
+   witness makes every attestation a reveal relies on share the params of those the bounty
+   cites, so every node the check trusts was checked under the same pins.
+3. The solver exports their proof, commits, and reveals their theorem and its proof (and any
+   lemmas of their own), trusting the attested nodes they need.
 
 ## Layout
 
 ```
 check/                Lean check (crate lean-check), with test fixtures in check/testdata
 vendor/nanoda/        nanoda_lib, a Lean 4 kernel checker, ported to no_std (VENDORED.md)
-tools/lean/           lean4export helpers: to the binary format, solver deltas, layers
-tools/lean-host/      runs the check natively and times it, for sizing layers
+tools/lean/           lean4export to nodes, batch planning, packing witnesses; measurements
+tools/lean-host/      runs the check natively and times it, for sizing batches
 scripts/lean-e2e.sh   a Lean bounty end to end on a local PolkaJam testnet
 ```
 
@@ -55,8 +61,9 @@ cargo jam-build --out-dir out     # out/lean-check.jam
 ```
 
 The fixtures in `check/testdata` (regenerated by its `make.sh`, from the Lean project beside it)
-cover honest proofs and the attacks: a different theorem, a `def`, an extra axiom, `sorry`, a
-redefinition, a statement edited after the fact, and layers out of their order.
+are node packs, and cover honest proofs and the attacks: a different theorem, a `def`, an extra
+axiom, `sorry`, a redefinition, a statement edited after the fact, unpinned built-ins, nodes
+missing an import or mentioning what they don't import, and theorems without proofs.
 
 End to end, with a witness checkout for the service and its CLI, and a PolkaJam testnet (see
 witness's README for running one in a container, and with the full spec's refine gas):
@@ -72,36 +79,34 @@ WITNESS_DIR=../witness LEAN4EXPORT=../lean4export/.lake/build/bin/lean4export \
 
 ## Numbers
 
-Each attestation and the reveal must fit one refine, including parsing every layer before it.
-`tools/lean-host` runs the check natively and times it: on PolkaJam v0.1.29 a native millisecond
-costs about 29 M gas.
+Each attestation and the reveal must fit one refine. `tools/lean-host` runs the check natively
+and times it (on PolkaJam v0.1.29 a native millisecond costs about 29 M gas), and
+`scripts/lean-e2e.sh` with `WITNESS_SIM=1` runs the whole flow against witness's simulator, which
+charges checks the gas PolkaJam does.
 
-**gcd a b = gcd b a** (Lean core). Checked in one refine it needs about 1.4×10⁹ gas, more than
-PolkaJam's tiny 10⁹ limit. In layers:
+**gcd a b = gcd b a** (Lean core): 437 nodes in 33 batches over 33 depths. The heaviest
+attestation uses 1.9×10⁸ gas, so it fits PolkaJam's tiny 10⁹ limit.
 
-| Step | Gas |
-|---|---|
-| Attest the statement environment (52 KB) | 522 M |
-| Attest the solver's first library layer (26 KB) | 373 M |
-| Attest the second (25 KB) | 326 M |
-| Reveal the last layer (24 KB), all else trusted | 399 M |
+**There are infinitely many primes** (`Nat.exists_infinite_primes`, Mathlib): 2,942 nodes
+(1.8 MB of statements, 2.3 MB of proofs) in 112 batches over 73 depths, then the reveal.
 
-**There are infinitely many primes** (`Nat.exists_infinite_primes`, Mathlib). The proof's
-dependency closure is 2,945 declarations, 1.5 MB in the binary format, cut into 66 layers: 3 for
-the statement environment and 63 for the proof. On a testnet with the full spec's 5×10⁹ refine
-limit, the heaviest attestation used 1.9×10⁹ gas, the median about 8×10⁸, and the reveal 1.1×10⁹.
-The run takes about 40 minutes, two slots per signed op. It doesn't fit the tiny 10⁹ limit: the
-last layers spend about 1.5×10⁹ gas just parsing the 1.5 MB before them.
+| | Content-addressed | The positional format before it |
+|---|---|---|
+| Attestations | 112 batches, 73 rounds | 66 layers, one after another |
+| Heaviest attestation | 1.25×10⁹ gas | 1.9×10⁹ gas |
+| Median attestation | 2.9×10⁸ gas | 8×10⁸ gas |
+| Reveal | 7.8×10⁷ gas | 1.1×10⁹ gas |
+
+The reveal loads only the 220 statements the theorem needs. The heaviest batch trusts 796 nodes
+(412 KB) from 76 earlier batches. Batches of one depth are independent, so with enough cores the
+library attests in 73 rounds.
 
 ## Limits and next steps
 
-Parsing the chain is the limit of this format. A refine of at most 4.5×10⁹ gas can parse about
-4 MB of chain, roughly 8,000 declarations, whatever the layer sizes; theorem proofs are about
-two thirds of that. Mathlib is perhaps 50 times bigger.
-
-The plan is a content-addressed format: each declaration names the declarations it uses by hash,
-an attestation covers a batch of declarations given the attested statements they use, and a
-refine loads only those statements. Attestations then form a DAG, so independent lemmas attest in
-parallel, on different cores. Measured on the infinite-primes closure (3,321 declarations), the
-statements a declaration needs, closed over the definitions it might unfold, are a median of 41
-declarations (31 KB of NDJSON) and at most 684 (1.1 MB), and the dependency DAG is 75 deep.
+- **Ops are capped at about 64 KB** while they travel as a hex command-line argument to `jamt
+  item` (Linux caps one argument at 128 KiB), so a batch's proofs are kept under 36 KB.
+- **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
+  and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
+  them; a bounty must cite a node attested under the same pins (see How it works).
+- **Next:** FLT for n = 4 (8,328 declarations), which the positional format couldn't fit at all,
+  then batches attested in parallel.

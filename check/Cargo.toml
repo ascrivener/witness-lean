@@ -1,6 +1,6 @@
 [package]
 name = "lean-check"
-description = "Witness check for Lean 4 proofs: attests library layers once, then binds and checks a solver's proof against them"
+description = "Witness check for Lean 4 proofs over content-addressed declarations: attests library batches once, then checks a solver's proof against them"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ type = "authorizer"
 witness-check = { workspace = true, features = ["alloc"] }
 polkavm-derive.workspace = true
 nanoda_lib = { path = "../vendor/nanoda" }
+blake2b_simd = { version = "1.0.5", default-features = false }
 
 [dev-dependencies]
 witness-types = { workspace = true, features = ["std"] }

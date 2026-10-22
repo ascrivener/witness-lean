@@ -5,11 +5,13 @@
 #
 # Needs elan (the toolchain in lean/lean-toolchain) and a lean4export built for it.
 #
-# - env-two-layer-N.bin: the statement environment of GoalTwo (2 + 2 = 4), cut into three layers.
-# - env-five-layer-2.bin: GoalTwo's last layer, edited to say 2 + 2 = 5.
-# - env-f.bin: the environment of GoalF, over the poster's own definition myF, in one layer.
-# - delta-*.bin: solver deltas: honest proofs of GoalTwo and GoalF, and attacks (a theorem of the
-#   wrong statement, a def instead of a theorem, an extra axiom, sorry, and a redefinition of myF).
+# Each fixture NAME.pack holds every node of one theorem's closure, in dependency order (the
+# theorem's statement last), then every proof (see tools/lean/lean_pack.py):
+# - two: an honest proof of GoalTwo (2 + 2 = 4); f: of GoalF, over the poster's own myF.
+# - wrong, def, axiom, sorry: attacks on GoalTwo (a theorem of another statement, a def instead of
+#   a theorem, an extra axiom, sorry).
+# - redefine: GoalF proved over the solver's own myF.
+# - five: GoalTwo edited to say 2 + 2 = 5, with the honest proof of 2 + 2 = 4.
 set -euo pipefail
 : "${LEAN4EXPORT:?set LEAN4EXPORT to the lean4export binary}"
 here=$(cd "$(dirname "$0")" && pwd)
@@ -19,23 +21,17 @@ work=$(mktemp -d)
 	cd "$here/lean"
 	lake build >/dev/null
 	lake build Fixtures.Redefine >/dev/null
-	lake env "$LEAN4EXPORT" Fixtures.Statements -- GoalTwo >"$work/env-two.ndjson"
-	lake env "$LEAN4EXPORT" Fixtures.Statements -- GoalF >"$work/env-f.ndjson"
 	for t in goal_two goal_f goal_wrong goal_def goal_two_axiom goal_two_sorry; do
-		lake env "$LEAN4EXPORT" Fixtures.Solutions -- $t >"$work/full-$t.ndjson"
+		lake env "$LEAN4EXPORT" Fixtures.Solutions -- $t >"$work/$t.ndjson"
 	done
-	lake env "$LEAN4EXPORT" Fixtures.Redefine -- goal_f >"$work/full-redefine.ndjson"
+	lake env "$LEAN4EXPORT" Fixtures.Redefine -- goal_f >"$work/redefine.ndjson"
 )
 cd "$work"
-python3 "$tools/lean_layers.py" env-two.ndjson 12000 env-two-layer >/dev/null
-for t in goal_two goal_wrong goal_def goal_two_axiom goal_two_sorry; do
-	python3 "$tools/lean_delta.py" env-two.ndjson full-$t.ndjson >delta-$t.ndjson
-done
-python3 "$tools/lean_delta.py" env-f.ndjson full-goal_f.ndjson >delta-goal_f.ndjson
-python3 "$tools/lean_delta.py" env-f.ndjson full-redefine.ndjson >delta-redefine.ndjson
-# GoalTwo edited to say 2 + 2 = 5, which the honest proof doesn't prove.
-sed 's/"natVal":"4"}/"natVal":"5"}/' env-two-layer-2.ndjson >env-five-layer-2.ndjson
-for f in env-two-layer-*.ndjson env-five-layer-2.ndjson env-f.ndjson delta-*.ndjson; do
-	python3 "$tools/lean_bin.py" "$f" >"$here/${f%.ndjson}.bin"
+sed 's/"natVal":"4"}/"natVal":"5"}/' goal_two.ndjson >five.ndjson
+for pair in two:goal_two f:goal_f wrong:goal_wrong def:goal_def axiom:goal_two_axiom \
+	sorry:goal_two_sorry redefine:redefine five:five; do
+	name=${pair%%:*} src=${pair#*:}
+	python3 "$tools/lean_nodes.py" $src.ndjson nodes-$name 2>/dev/null
+	python3 "$tools/lean_pack.py" nodes-$name >"$here/$name.pack"
 done
 echo "fixtures written to $here"
