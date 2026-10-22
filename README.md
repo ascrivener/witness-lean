@@ -108,6 +108,14 @@ proofs) in 269 batches over 90 depths. The heaviest attestation uses 2.6×10⁹ 
 up to 168 earlier batches cited, would make ops too big for `jamt item`, so they carry their
 proofs in their bundles. Against witness's simulator the whole flow takes under three minutes.
 
+**The fundamental theorem of algebra** (`Complex.exists_root`, Mathlib): 46,201 nodes (52 MB of
+statements, 81 MB of proofs) in 2,584 batches over 294 depths. A batch trusts only the nodes the
+kernel touches while checking it (traced natively by `lean-host trace`), not their import
+closure: that cuts trusted nodes 4.5-fold, to at most 1,040 per batch and 347 cited batches per
+op. The median attestation uses 4.7×10⁸ gas, as for FLT, and 99% use under 1.8×10⁹. Against the
+simulator, 2,185 batches attest; then one lemma, `iteratedFDerivWithin_succ_apply_right`, needs
+more gas to check than a refine has (about 6.5×10⁹), and everything downstream waits on it.
+
 ## Limits and next steps
 
 - **Ops are capped at about 64 KB** while they travel as a hex command-line argument to `jamt
@@ -116,4 +124,6 @@ proofs in their bundles. Against witness's simulator the whole flow takes under 
 - **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
   and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
   them; a bounty must cite a node attested under the same pins (see How it works).
-- **Next:** attesting batches of one depth in parallel, and a bigger closure still.
+- **A single declaration can be too heavy for a refine:** one lemma of FTA's 46,201 is. A faster
+  kernel (allocation and hash-consing dominate) is the next step.
+- **Next:** that, and attesting batches of one depth in parallel.

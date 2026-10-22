@@ -2,7 +2,7 @@
 # A Lean proof bounty, end to end, on a local PolkaJam testnet (v0.1.29):
 #
 #   WITNESS_DIR=path/to/witness LEAN4EXPORT=path/to/lean4export POLKAJAM_DIR=... \
-#     scripts/lean-e2e.sh [gcd|primes|flt4]
+#     scripts/lean-e2e.sh [gcd|primes|flt4|fta]
 #
 # - gcd (the default): gcd a b = gcd b a, over Lean core (check/testdata/lean). Fits the
 #   testnet's "tiny" refine limit of 10⁹ gas.
@@ -11,6 +11,9 @@
 #   about 1.25×10⁹ gas, so it needs a testnet with the full spec's 5×10⁹ refine gas (see README).
 # - flt4: x⁴ + y⁴ ≠ z⁴, Mathlib's fermatLastTheoremFour, revealed as is (in the primes project):
 #   7,579 nodes in 269 batches over 91 depths. Like primes, it needs the full spec's refine gas.
+# - fta: the fundamental theorem of algebra, Mathlib's Complex.exists_root: 46,201 nodes in about
+#   2,600 batches over 294 depths. One lemma on the way (iteratedFDerivWithin_succ_apply_right)
+#   takes more gas than a refine has, so it doesn't complete yet.
 #
 # The solver's export is converted to content-addressed nodes (tools/lean/lean_nodes.py), and
 # everything but the solver's theorem is planned into batches by dependency depth
@@ -39,7 +42,10 @@ case "${1:-gcd}" in
 	flt4)
 		PROJECT=check/testdata/primes SOLUTION_MODULE=Mathlib.NumberTheory.FLT.Four
 		THEOREM=fermatLastTheoremFour GAS=4500000000 ;;
-	*) echo "usage: $0 [gcd|primes|flt4]" >&2; exit 2 ;;
+	fta)
+		PROJECT=check/testdata/primes SOLUTION_MODULE=Mathlib.Analysis.Complex.Polynomial.Basic
+		THEOREM=Complex.exists_root GAS=4500000000 ;;
+	*) echo "usage: $0 [gcd|primes|flt4|fta]" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 JAMT=${POLKAJAM_DIR:+$POLKAJAM_DIR/}jamt
@@ -49,7 +55,8 @@ POLL=2
 W=$WITNESS_DIR/target/debug/witness
 TMP=$(mktemp -d)
 LOG=$TMP/testnet.log
-CHECK=out/lean-check.jam
+# This run's own copy of the check blob, so another run rebuilding out/ can't change it midway.
+CHECK=$TMP/lean-check.jam
 
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -141,6 +148,10 @@ step "exporting the proof ($THEOREM) and converting it to nodes"
 )
 python3 tools/lean/lean_nodes.py "$TMP/full.ndjson" "$TMP/nodes"
 python3 tools/lean/lean_plan.py "$TMP/nodes" --goal "$THEOREM" >"$TMP/plan.json"
+# Trust only what the kernel touches, and split batches too slow for a refine (lean-host).
+cargo build -q --release -p lean-host
+./target/release/lean-host trace "$TMP/nodes" "$TMP/plan.json" "$TMP/plan-traced.json"
+mv "$TMP/plan-traced.json" "$TMP/plan.json"
 W_DIR=$TMP/w
 BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
 PINS=$(cat "$W_DIR/pins")
@@ -166,6 +177,7 @@ fi
 step "building and deploying"
 (cd "$WITNESS_DIR" && cargo build -q -p witness-cli && cargo jam-build --out-dir out -p witness-service >/dev/null)
 cargo jam-build --out-dir out >/dev/null
+cp out/lean-check.jam "$CHECK"
 before=$("$JAMT" list | wc -l)
 "$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 >/dev/null
 for _ in $(seq 1 40); do [ "$("$JAMT" list | wc -l)" -gt "$before" ] && break; sleep $POLL; done
