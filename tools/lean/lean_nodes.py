@@ -227,14 +227,30 @@ def declared(ex, decl):
     return [v["name"]]
 
 
+def groups(decls):
+    """Declarations, one node's worth at a time. The kernel adds Quot, Quot.mk, Quot.lift and
+    Quot.ind together (and nanoda checks them together), so consecutive quot items share a node."""
+    out = []
+    for d in decls:
+        if out and body(d)[0] == "quot" and body(out[-1][-1])[0] == "quot":
+            out[-1].append(d)
+        else:
+            out.append([d])
+    return out
+
+
 def convert(ex):
     """Yield (names declared, kind, node bytes, imports, proof bytes or None, proof imports)."""
     node_of = {}  # name index -> node hash
-    for decl in ex.decls:
+    for group in groups(ex.decls):
+        decl = group[0]
         k, v = body(decl)
-        own = set(declared(ex, decl))
+        own = {n for d in group for n in declared(ex, d)}
         c = Closure(ex)
-        if k == "inductive":
+        if k == "quot":
+            for d in group:
+                c.info(body(d)[1])
+        elif k == "inductive":
             for part in ("types", "ctors", "recs"):
                 for x in v[part]:
                     c.info(x)
@@ -262,7 +278,8 @@ def convert(ex):
             w.byte(TAG_STATEMENT); w.uvar(names[v["name"]]); w.ints([names[p] for p in v["levelParams"]]); w.uvar(exprs[v["type"]])
             node = header(NODE_MAGIC, imports) + items_bytes(lines) + bytes(w.out)
         else:
-            node = header(NODE_MAGIC, imports) + items_bytes(lines + [remap(decl, names, levels, exprs)])
+            decls = [remap(d, names, levels, exprs) for d in group]
+            node = header(NODE_MAGIC, imports) + items_bytes(lines + decls)
         h = blake2b256(node)
         for nm in own:
             node_of[nm] = h
@@ -279,7 +296,7 @@ def convert(ex):
             w = lean_bin.Writer(); w.out = bytearray()
             w.byte(TAG_PROOF); w.uvar(pexprs[v["value"]])
             proof = PROOF_MAGIC + h + header(b"", proof_imports) + items_bytes(plines) + bytes(w.out)
-        yield [ex.name_str(n) for n in declared(ex, decl)], k, node, imports, proof, proof_imports
+        yield [ex.name_str(n) for d in group for n in declared(ex, d)], k, node, imports, proof, proof_imports
 
 
 def main(path, out_dir):

@@ -1,6 +1,6 @@
 [package]
 name = "lean-host"
-description = "Runs the Lean check natively on layer files, and times it, for sizing layers"
+description = "Runs the Lean check natively on content-addressed nodes, and times it, for sizing batches"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -12,3 +12,4 @@ witness-check.workspace = true
 witness-types = { workspace = true, features = ["std"] }
 nanoda_lib = { path = "../../vendor/nanoda" }
 serde_json = "1"
+blake2b_simd = "1.0.5"

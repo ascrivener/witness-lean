@@ -22,7 +22,6 @@
 //! witness, subjects of attestations).
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::binding::PERMITTED_AXIOMS;
 use crate::env::Declar;
 use crate::expr::Expr;
 use crate::level::Level;
@@ -32,6 +31,9 @@ use core::error::Error;
 use core::ops::Range;
 
 pub type Hash = [u8; 32];
+
+/// The axioms a proof may rely on.
+pub const PERMITTED_AXIOMS: [&str; 3] = ["propext", "Classical.choice", "Quot.sound"];
 
 pub const NODE_MAGIC: &[u8] = b"LEANNOD\x01";
 pub const PROOF_MAGIC: &[u8] = b"LEANPRF\x01";

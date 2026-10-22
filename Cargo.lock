@@ -187,6 +187,7 @@ dependencies = [
 name = "lean-host"
 version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
  "lean-check",
  "nanoda_lib",
  "serde_json",

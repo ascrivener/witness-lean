@@ -9,9 +9,11 @@ check:
   or stdout I/O, parsing from memory (`Config::in_memory`), panics instead of process exits.
 - **A binary export format** (also from the spike, see its `binary_format.md`), detected by its
   magic and about 6× cheaper to parse than lean4export's NDJSON.
-- **Layers** (`src/binding.rs`): an export read as consecutive parts, each continuing the
-  numbering of the ones before, so a caller can type-check only the parts not checked before, and
-  bind a proof to a statement.
+- **Content-addressed nodes** (`src/nodes.rs`, and node mode in `src/parser.rs`): declarations
+  that each number their names, levels and expressions locally and name the nodes they use by
+  hash, loaded into one environment after their imports, with every constant they mention
+  pinned, and the kernel's special names (`Nat.add`, the permitted axioms) pinned to given
+  nodes. See witness-lean's `tools/lean/node_format.md`.
 
 The CLI (`src/main.rs`) was removed: the port is the library only. Upstream's release profiles
 were dropped, since only the workspace root's apply.
