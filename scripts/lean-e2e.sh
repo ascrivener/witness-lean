@@ -55,7 +55,8 @@ POLL=2
 W=$WITNESS_DIR/target/debug/witness
 TMP=$(mktemp -d)
 LOG=$TMP/testnet.log
-CHECK=out/lean-check.jam
+# This run's own copy of the check blob, so another run rebuilding out/ can't change it midway.
+CHECK=$TMP/lean-check.jam
 
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -176,6 +177,7 @@ fi
 step "building and deploying"
 (cd "$WITNESS_DIR" && cargo build -q -p witness-cli && cargo jam-build --out-dir out -p witness-service >/dev/null)
 cargo jam-build --out-dir out >/dev/null
+cp out/lean-check.jam "$CHECK"
 before=$("$JAMT" list | wc -l)
 "$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 >/dev/null
 for _ in $(seq 1 40); do [ "$("$JAMT" list | wc -l)" -gt "$before" ] && break; sleep $POLL; done
