@@ -1,0 +1,267 @@
+//! Loading content-addressed declarations, and binding a proof to a bounty's statement.
+//!
+//! A *node* (see `tools/lean/node_format.md` in witness-lean) holds one declaration (an
+//! inductive block counts as one) with its own tables of names, levels and expressions, and the
+//! hashes of the nodes declaring the constants it mentions: its *imports*. A theorem's node is
+//! its statement; its *proof* is a separate blob naming the statement's hash.
+//!
+//! A [`NodeLoader`] reads nodes into one environment. It must be given each node after its
+//! imports, and checks, as it goes, what makes a node mean the same thing wherever it's loaded:
+//!
+//! - every import has been loaded, and every constant the node (or its proof) mentions is declared
+//!   by the node itself or by one of its imports. A node's hash covers its imports' hashes, so it
+//!   pins everything it mentions, recursively;
+//! - a name is declared once: two nodes declaring the same name can't be loaded together;
+//! - the names the kernel treats specially ([`PINNED_NAMES`]: `Nat.add` and the like, which it
+//!   computes with natively, and the permitted axioms) are declared only by nodes whose hashes the
+//!   caller pins. Otherwise a node could declare its own `Nat.add` (or a `propext : False`), and
+//!   the kernel would trust it by name.
+//!
+//! A theorem statement loaded with its proof becomes a theorem, to be checked. Loaded without one,
+//! it becomes an assumption: the caller must only do that for statements already proven (in
+//! witness, subjects of attestations).
+#[allow(unused_imports)]
+use crate::prelude::*;
+use crate::binding::PERMITTED_AXIOMS;
+use crate::env::Declar;
+use crate::expr::Expr;
+use crate::level::Level;
+use crate::parser::Parser;
+use crate::util::{Config, ExportFile, FxHashMap, NamePtr, new_fx_hash_map};
+use core::error::Error;
+use core::ops::Range;
+
+pub type Hash = [u8; 32];
+
+pub const NODE_MAGIC: &[u8] = b"LEANNOD\x01";
+pub const PROOF_MAGIC: &[u8] = b"LEANPRF\x01";
+
+/// Names that only pinned nodes may declare: those the kernel recognizes by name (see
+/// `LeanDag::mk_name_cache`), and the permitted axioms.
+pub const PINNED_NAMES: [&str; 34] = [
+    "eagerReduce", "Quot", "Quot.mk", "Quot.lift", "Quot.ind", "String", "String.ofList", "Nat",
+    "Nat.zero", "Nat.succ", "Nat.add", "Nat.sub", "Nat.mul", "Nat.pow", "Nat.mod", "Nat.div",
+    "Nat.beq", "Nat.ble", "Nat.gcd", "Nat.xor", "Nat.land", "Nat.lor", "Nat.shiftLeft",
+    "Nat.shiftRight", "Bool.true", "Bool.false", "Char", "Char.ofNat", "List", "List.nil",
+    "List.cons", "propext", "Classical.choice", "Quot.sound",
+];
+
+/// A loaded node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedNode {
+    pub hash: Hash,
+    /// Its declarations, as indices into the export file's declarations.
+    pub declars: Range<usize>,
+    /// A theorem's statement.
+    pub theorem: bool,
+    /// A theorem statement loaded without its proof.
+    pub assumed: bool,
+}
+
+pub struct NodeLoader<'p> {
+    parser: Parser<'p>,
+    pins: Vec<Hash>,
+    declared_by: FxHashMap<NamePtr<'p>, Hash>,
+    nodes: Vec<LoadedNode>,
+    index: FxHashMap<Hash, usize>,
+}
+
+/// Nodes read into one environment, ready to check.
+pub struct Nodes<'p> {
+    pub file: ExportFile<'p>,
+    pub nodes: Vec<LoadedNode>,
+    index: FxHashMap<Hash, usize>,
+}
+
+struct Header<'b> {
+    imports: Vec<Hash>,
+    items: &'b [u8],
+}
+
+fn uvar(bytes: &mut &[u8]) -> Result<u64, Box<dyn Error>> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&b, rest) = bytes.split_first().ok_or("node ends early")?;
+        *bytes = rest;
+        value |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err("varint too long".into())
+}
+
+fn hash_at(bytes: &mut &[u8]) -> Result<Hash, Box<dyn Error>> {
+    let (h, rest) = bytes.split_first_chunk::<32>().ok_or("node ends early")?;
+    *bytes = rest;
+    Ok(*h)
+}
+
+fn header(mut bytes: &[u8]) -> Result<Header<'_>, Box<dyn Error>> {
+    let n = uvar(&mut bytes)?;
+    let imports = (0..n).map(|_| hash_at(&mut bytes)).collect::<Result<_, _>>()?;
+    Ok(Header { imports, items: bytes })
+}
+
+impl<'p> NodeLoader<'p> {
+    /// A loader trusting only nodes in `pins` to declare [`PINNED_NAMES`]. Only
+    /// [`PERMITTED_AXIOMS`] may be declared as axioms.
+    pub fn new(pins: &[Hash]) -> Self {
+        let mut config = Config::in_memory(PERMITTED_AXIOMS.map(String::from).into());
+        config.unpermitted_axiom_hard_error = true;
+        NodeLoader {
+            parser: Parser::new(config),
+            pins: pins.to_vec(),
+            declared_by: new_fx_hash_map(),
+            nodes: Vec::new(),
+            index: new_fx_hash_map(),
+        }
+    }
+
+    pub fn is_loaded(&self, hash: &Hash) -> bool {
+        self.index.contains_key(hash)
+    }
+
+    /// Check that the constants `exprs` mention are declared by `own` names or by `imports`, all
+    /// of which must be loaded.
+    fn check_mentions(&self, exprs: &[u32], own: &[NamePtr<'p>], imports: &[Hash]) -> Result<(), Box<dyn Error>> {
+        if let Some(missing) = imports.iter().find(|h| !self.is_loaded(h)) {
+            return Err(format!("import {missing:02x?} is not loaded (before the node importing it)").into());
+        }
+        for &e in exprs {
+            let name = match self.parser.dag.exprs.get_index(e as usize) {
+                Some(Expr::Const { name, .. }) => *name,
+                Some(Expr::Proj { ty_name, .. }) => *ty_name,
+                _ => continue,
+            };
+            let imported = self.declared_by.get(&name).is_some_and(|h| imports.contains(h));
+            if !own.contains(&name) && !imported {
+                return Err(format!("{} is mentioned but not imported", self.parser.name_to_string(name)).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Load node `node` with hash `hash` (the caller has checked it, or computed it), and the
+    /// statement's proof if it is a theorem and `proof` is given. Returns its index.
+    pub fn add(&mut self, hash: Hash, node: &[u8], proof: Option<&[u8]>) -> Result<usize, Box<dyn Error>> {
+        if self.is_loaded(&hash) {
+            return Err("node loaded twice".into());
+        }
+        let node = header(node.strip_prefix(NODE_MAGIC).ok_or("not a node")?)?;
+        let start = self.parser.declars.len();
+        let exprs = self.parser.go_node(node.items)?;
+        let statement = self.parser.statement.take();
+        if self.parser.proof_value.take().is_some() {
+            return Err("a node holds a proof".into());
+        }
+        if statement.is_some() && self.parser.declars.len() != start {
+            return Err("a theorem's node holds more than its statement".into());
+        }
+        let own: Vec<NamePtr<'p>> = match &statement {
+            Some(info) => vec![info.name],
+            None => self.parser.declars.keys().skip(start).copied().collect(),
+        };
+        if own.is_empty() {
+            return Err("node declares nothing".into());
+        }
+        self.check_mentions(&exprs, &own, &node.imports)?;
+
+        let theorem = statement.is_some();
+        let assumed = theorem && proof.is_none();
+        match (statement, proof) {
+            (Some(info), Some(proof)) => {
+                let proof = proof.strip_prefix(PROOF_MAGIC).ok_or("not a proof")?;
+                let (of, proof) = proof.split_first_chunk::<32>().ok_or("proof ends early")?;
+                if *of != hash {
+                    return Err("proof of another statement".into());
+                }
+                let proof = header(proof)?;
+                let exprs = self.parser.go_node(proof.items)?;
+                if self.parser.statement.take().is_some() {
+                    return Err("a proof holds a statement".into());
+                }
+                if self.parser.declars.len() != start {
+                    return Err("a proof declares something".into());
+                }
+                let val = self.parser.proof_value.take().ok_or("proof without a value")?;
+                self.check_mentions(&exprs, &[], &proof.imports)?;
+                assert!(self.parser.declars.insert(info.name, Declar::Theorem { info, val }).is_none());
+            },
+            (Some(info), None) => {
+                assert!(self.parser.declars.insert(info.name, Declar::Axiom { info }).is_none());
+            },
+            (None, Some(_)) => return Err("a proof for a node that isn't a theorem".into()),
+            (None, None) => {},
+        }
+
+        for name in &own {
+            if PINNED_NAMES.contains(&self.parser.name_to_string(*name).as_str()) && !self.pins.contains(&hash) {
+                return Err(format!("{} is declared by a node that isn't pinned", self.parser.name_to_string(*name)).into());
+            }
+            self.declared_by.insert(*name, hash);
+        }
+        let i = self.nodes.len();
+        self.nodes.push(LoadedNode { hash, declars: start..self.parser.declars.len(), theorem, assumed });
+        self.index.insert(hash, i);
+        Ok(i)
+    }
+
+    pub fn finish(self) -> Nodes<'p> {
+        Nodes { file: crate::parser::finish(self.parser), nodes: self.nodes, index: self.index }
+    }
+}
+
+impl<'p> Nodes<'p> {
+    pub fn find(&self, hash: &Hash) -> Option<usize> {
+        self.index.get(hash).copied()
+    }
+
+    /// Type-check node `i`'s declarations (panics on an error), each against the environment of
+    /// the declarations loaded before it. An assumed statement's type is checked, but nothing
+    /// proves it.
+    pub fn check(&self, i: usize) {
+        for d in self.nodes[i].declars.clone() {
+            self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
+        }
+    }
+
+    /// Check that node `theorem` is a theorem with no universe parameters whose type is exactly
+    /// the constant node `statement` declares, a definition of type `Prop` with no universe
+    /// parameters. Does not type-check anything; see [`Self::check`].
+    pub fn check_binding(&self, statement: usize, theorem: usize) -> Result<(), String> {
+        let declar = |i: usize| -> Result<&Declar<'p>, String> {
+            let node = &self.nodes[i];
+            if node.declars.len() != 1 {
+                return Err("not a single declaration".into());
+            }
+            Ok(self.file.declars.get_index(node.declars.start).unwrap().1)
+        };
+        self.file.with_ctx(|ctx| {
+            let Declar::Definition { info: statement_info, .. } = declar(statement)? else {
+                return Err("the statement is not a definition".into());
+            };
+            if !ctx.read_levels(statement_info.uparams).is_empty() {
+                return Err("the statement has universe parameters".into());
+            }
+            match ctx.read_expr(statement_info.ty) {
+                Expr::Sort { level, .. } if ctx.read_level(level) == Level::Zero => {},
+                _ => return Err("the statement is not a Prop".into()),
+            }
+            let Declar::Theorem { info, .. } = declar(theorem)? else {
+                return Err("not a theorem".into());
+            };
+            if self.nodes[theorem].assumed {
+                return Err("the theorem is assumed, not proven".into());
+            }
+            if !ctx.read_levels(info.uparams).is_empty() {
+                return Err("the theorem has universe parameters".into());
+            }
+            match ctx.read_expr(info.ty) {
+                Expr::Const { name, levels, .. }
+                    if name == statement_info.name && ctx.read_levels(levels).is_empty() => Ok(()),
+                _ => Err("the theorem does not have the statement as its type".into()),
+            }
+        })
+    }
+}

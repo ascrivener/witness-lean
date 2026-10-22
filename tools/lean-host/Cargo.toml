@@ -10,3 +10,5 @@ authors.workspace = true
 lean-check = { path = "../../check" }
 witness-check.workspace = true
 witness-types = { workspace = true, features = ["std"] }
+nanoda_lib = { path = "../../vendor/nanoda" }
+serde_json = "1"

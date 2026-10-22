@@ -176,6 +176,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 name = "lean-check"
 version = "0.1.0"
 dependencies = [
+ "blake2b_simd",
  "nanoda_lib",
  "polkavm-derive",
  "witness-check",
@@ -187,6 +188,8 @@ name = "lean-host"
 version = "0.1.0"
 dependencies = [
  "lean-check",
+ "nanoda_lib",
+ "serde_json",
  "witness-check",
  "witness-types",
 ]
@@ -469,7 +472,7 @@ dependencies = [
 [[package]]
 name = "witness-check"
 version = "0.1.0"
-source = "git+https://github.com/ascrivener/witness?rev=98a9942#98a9942cc8303a53c8f841b4dcc2dfa7d61891b3"
+source = "git+https://github.com/ascrivener/witness?rev=43504dbe#43504dbe76d058de842923f136efe4854c2508e1"
 dependencies = [
  "picoalloc",
  "polkavm-derive",
@@ -478,7 +481,7 @@ dependencies = [
 [[package]]
 name = "witness-types"
 version = "0.1.0"
-source = "git+https://github.com/ascrivener/witness?rev=98a9942#98a9942cc8303a53c8f841b4dcc2dfa7d61891b3"
+source = "git+https://github.com/ascrivener/witness?rev=43504dbe#43504dbe76d058de842923f136efe4854c2508e1"
 dependencies = [
  "blake2b_simd",
  "jam-codec",

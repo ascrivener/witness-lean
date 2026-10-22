@@ -1,98 +1,259 @@
 use super::*;
+use std::vec;
 use witness_types::{CheckBlob, CheckMode, check_args};
 
+/// A fixture: one theorem's closure as nodes, in dependency order (the theorem's statement
+/// last), and their proofs.
+struct Pack {
+	nodes: Vec<&'static [u8]>,
+	proofs: Vec<&'static [u8]>,
+}
+
+macro_rules! pack {
+	($name: literal) => {{
+		let items = parse_witness(include_bytes!(concat!("../testdata/", $name, ".pack"))).unwrap();
+		let (nodes, proofs) = items.into_iter().partition(|i| i.starts_with(NODE_MAGIC));
+		Pack { nodes, proofs }
+	}};
+}
+
+impl Pack {
+	/// The theorem's statement.
+	fn goal(&self) -> &'static [u8] {
+		self.nodes.last().unwrap()
+	}
+
+	/// Everything but the theorem's statement.
+	fn env(&self) -> &[&'static [u8]] {
+		&self.nodes[..self.nodes.len() - 1]
+	}
+
+	fn proof_of(&self, node: &[u8]) -> Option<&'static [u8]> {
+		let h = blake2b256(node);
+		self.proofs.iter().copied().find(|p| p[PROOF_MAGIC.len()..][..32] == h)
+	}
+
+	/// `nodes` with each one's proof, if it has one.
+	fn with_proofs(&self, nodes: &[&'static [u8]]) -> Vec<&'static [u8]> {
+		let mut items = nodes.to_vec();
+		items.extend(nodes.iter().filter_map(|n| self.proof_of(n)));
+		items
+	}
+
+	/// Pins every node, so whichever declares `Nat` and the like is pinned.
+	fn pins(&self) -> Vec<u8> {
+		self.nodes.iter().flat_map(|n| blake2b256(n)).collect()
+	}
+}
+
+fn encode(items: &[&[u8]]) -> Vec<u8> {
+	fn uvar(out: &mut Vec<u8>, mut n: usize) {
+		loop {
+			let b = (n & 0x7f) as u8;
+			n >>= 7;
+			if n == 0 {
+				return out.push(b);
+			}
+			out.push(b | 0x80);
+		}
+	}
+	let mut out = Vec::new();
+	uvar(&mut out, items.len());
+	for item in items {
+		uvar(&mut out, item.len());
+		out.extend_from_slice(item);
+	}
+	out
+}
+
+/// Run the check; blobs get their real hashes, as witness gives them.
 fn run(mode: CheckMode, blobs: &[(bool, &[u8])], params: &[u8], witness: &[u8]) -> bool {
-	let blobs: Vec<_> = blobs.iter().map(|&(trusted, data)| CheckBlob { trusted, hash: [0; 32], data }).collect();
+	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+	let blobs: Vec<_> =
+		blobs.iter().zip(&hashes).map(|(&(trusted, data), h)| CheckBlob { trusted, hash: *h, data }).collect();
 	let args = check_args(mode, &blobs, params, witness);
 	// Type errors panic, which the PVM turns into false.
 	std::panic::catch_unwind(|| check(&Input::parse(&args).unwrap())).unwrap_or(false)
 }
 
-#[test]
-fn reveal_params_name_a_statement_and_a_theorem() {
-	assert_eq!(names(b"Goal\ngoal"), Some(("Goal", "goal")));
-	assert_eq!(names(b"Goal"), None);
-	assert_eq!(names(b"\ngoal"), None);
-	assert_eq!(names(b"Goal\n"), None);
-	assert_eq!(names(b"\xff\ngoal"), None);
+/// Reveal `solver`'s nodes and proofs for the theorem statement `goal`, trusting `trusted`.
+fn reveal(goal: &[u8], pins: &[u8], trusted: &[&[u8]], solver: &[&[u8]]) -> bool {
+	let mut params = blake2b256(goal).to_vec();
+	params.extend_from_slice(pins);
+	let blobs: Vec<(bool, &[u8])> = trusted.iter().map(|n| (true, *n)).collect();
+	run(CheckMode::Reveal, &blobs, &params, &encode(solver))
 }
 
-#[test]
-fn attest_mode_shape() {
-	let empty: &[u8] = include_bytes!("../../vendor/nanoda/test_resources/Empty/export");
-	// An empty layer adds nothing to check, so it attests, as a root or after a trusted chain.
-	assert!(run(CheckMode::Attest, &[(false, empty)], b"", b""));
-	assert!(run(CheckMode::Attest, &[(true, empty), (false, empty)], b"", b""));
-	assert!(!run(CheckMode::Attest, &[(false, empty)], b"params", b""), "params must be empty");
-	assert!(!run(CheckMode::Attest, &[(false, empty), (false, empty)], b"", b""), "an untrusted chain");
-	assert!(!run(CheckMode::Attest, &[], b"", b""), "no subject");
-	assert!(!run(CheckMode::Attest, &[(false, b"not an export")], b"", b""));
-}
-
-macro_rules! fixture {
-	($name: literal) => {
-		include_bytes!(concat!("../testdata/", $name, ".bin")).as_slice()
-	};
-}
-
-/// GoalTwo's environment, in three layers.
-const TWO: [&[u8]; 3] = [fixture!("env-two-layer-0"), fixture!("env-two-layer-1"), fixture!("env-two-layer-2")];
-
-/// Reveal `delta` for `statement` and `theorem` on `layers`, the first `trusted` of them trusted.
-fn reveal_on(layers: &[&[u8]], trusted: usize, names: &str, delta: &[u8]) -> bool {
-	let blobs: Vec<(bool, &[u8])> = layers.iter().enumerate().map(|(i, l)| (i < trusted, *l)).collect();
-	run(CheckMode::Reveal, &blobs, names.as_bytes(), delta)
+/// Attest `subjects` with `proofs`, trusting `trusted`.
+fn attest(pins: &[u8], trusted: &[&[u8]], subjects: &[&[u8]], proofs: &[&[u8]]) -> bool {
+	let blobs: Vec<(bool, &[u8])> =
+		trusted.iter().map(|n| (true, *n)).chain(subjects.iter().map(|n| (false, *n))).collect();
+	run(CheckMode::Attest, &blobs, pins, &encode(proofs))
 }
 
 #[test]
 fn honest_proofs_are_accepted() {
-	for trusted in 0..=3 {
-		assert!(reveal_on(&TWO, trusted, "GoalTwo\ngoal_two", fixture!("delta-goal_two")), "{trusted} trusted");
+	for p in [pack!("two"), pack!("f")] {
+		let solver = p.with_proofs(&[p.goal()]);
+		assert!(reveal(p.goal(), &p.pins(), p.env(), &solver), "on a trusted environment");
+		let everything = p.with_proofs(&p.nodes);
+		assert!(reveal(p.goal(), &p.pins(), &[], &everything), "proving the whole closure");
+		// Nodes come in any order: each is loaded after what it imports.
+		let mut reversed = everything.clone();
+		reversed.reverse();
+		assert!(reveal(p.goal(), &p.pins(), &[], &reversed), "in reverse");
+		let mut env = p.env().to_vec();
+		env.reverse();
+		assert!(reveal(p.goal(), &p.pins(), &env, &solver), "a reversed environment");
 	}
-	assert!(reveal_on(&[fixture!("env-f")], 0, "GoalF\ngoal_f", fixture!("delta-goal_f")));
+}
+
+#[test]
+fn an_attested_theorem_needs_no_proof() {
+	let p = pack!("two");
+	assert!(reveal(p.goal(), &p.pins(), &p.nodes, &[]));
+}
+
+#[test]
+fn the_goal_must_be_a_theorem() {
+	let p = pack!("two");
+	// GoalTwo itself, a definition, named as the goal by mistake.
+	let def = p.env().iter().find(|n| p.proof_of(n).is_none() && imports(n).unwrap().len() > 1).unwrap();
+	assert!(!reveal(def, &p.pins(), &p.nodes, &[]));
+	assert!(!reveal(def, &p.pins(), p.env(), &p.with_proofs(&[p.goal()])));
 }
 
 #[test]
 fn attacks_are_rejected() {
-	let two = |names: &str, delta| reveal_on(&TWO, 3, names, delta);
-	assert!(!two("GoalTwo\ngoal_wrong", fixture!("delta-goal_wrong")), "proves True instead");
-	assert!(!two("GoalTwo\ngoal_def", fixture!("delta-goal_def")), "a def, not a theorem");
-	assert!(!two("GoalTwo\ngoal_two_axiom", fixture!("delta-goal_two_axiom")), "an extra axiom");
-	assert!(!two("GoalTwo\ngoal_two_sorry", fixture!("delta-goal_two_sorry")), "sorry");
-	assert!(!two("GoalTwo\nnonexistent", fixture!("delta-goal_two")), "no such theorem");
-	assert!(!two("Nat.add\ngoal_two", fixture!("delta-goal_two")), "statement not a Prop definition");
-	let f = [fixture!("env-f")];
-	assert!(!reveal_on(&f, 1, "GoalF\ngoal_f", fixture!("delta-redefine")), "redefines myF");
-	assert!(!reveal_on(&f, 1, "GoalF\ngoal_f", fixture!("delta-goal_two")), "a delta for another environment");
-	assert!(!reveal_on(&TWO, 3, "GoalTwo\ngoal_two", b""), "no proof");
+	let two = pack!("two");
+	let others = |p: &Pack| p.with_proofs(&p.nodes);
+	for (p, what) in [
+		(pack!("wrong"), "proves True instead"),
+		(pack!("def"), "a def, not a theorem"),
+		(pack!("axiom"), "an extra axiom"),
+		(pack!("sorry"), "sorry"),
+	] {
+		assert!(!reveal(two.goal(), &two.pins(), two.env(), &others(&p)), "{what}");
+		assert!(!reveal(two.goal(), &[two.pins(), p.pins()].concat(), &[], &others(&p)), "{what}, alone");
+	}
+	// The solver's own myF: loaded with the poster's, it's a second myF; alone, it proves a
+	// statement with another hash.
+	let f = pack!("f");
+	let redefine = pack!("redefine");
+	let pins = [f.pins(), redefine.pins()].concat();
+	assert!(!reveal(f.goal(), &pins, f.env(), &others(&redefine)), "redefines myF");
+	assert!(!reveal(f.goal(), &pins, &[], &others(&redefine)), "redefines myF, alone");
+	assert!(!reveal(two.goal(), &two.pins(), two.env(), &[]), "no proof");
+	assert!(!reveal(two.goal(), &two.pins(), two.env(), &[two.goal()]), "the statement without its proof");
 }
 
 #[test]
 fn proofs_are_type_checked() {
-	// GoalTwo's last layer edited to say 2 + 2 = 5. It's a fine definition, so it attests, but the
-	// honest proof (rfl) of 2 + 2 = 4 no longer type-checks against it, trusted or not.
-	let five = [TWO[0], TWO[1], fixture!("env-five-layer-2")];
-	assert!(run(CheckMode::Attest, &[(true, five[0]), (true, five[1]), (false, five[2])], b"", b""));
-	for trusted in [0, 3] {
-		assert!(!reveal_on(&five, trusted, "GoalTwo\ngoal_two", fixture!("delta-goal_two")), "{trusted} trusted");
+	// GoalTwo edited to say 2 + 2 = 5, with the honest proof (rfl) of 2 + 2 = 4.
+	let five = pack!("five");
+	assert!(!reveal(five.goal(), &five.pins(), five.env(), &five.with_proofs(&[five.goal()])));
+	assert!(!reveal(five.goal(), &five.pins(), &[], &five.with_proofs(&five.nodes)));
+	// Its environment is fine, so it attests.
+	assert!(attest(&five.pins(), &[], five.env(), &five.with_proofs(five.env())[five.env().len()..]));
+}
+
+#[test]
+fn the_kernel_builtins_must_be_pinned() {
+	let two = pack!("two");
+	let solver = two.with_proofs(&[two.goal()]);
+	assert!(!reveal(two.goal(), &[], two.env(), &solver), "nothing pinned");
+	// Pinning just the goal: `Nat`, `Nat.add` and the rest are declared by unpinned nodes.
+	assert!(!reveal(two.goal(), &blake2b256(two.goal()), two.env(), &solver));
+}
+
+#[test]
+fn nodes_load_only_after_their_imports() {
+	let two = pack!("two");
+	let solver = two.with_proofs(&[two.goal()]);
+	for skip in 0..two.env().len() {
+		let mut env = two.env().to_vec();
+		env.remove(skip);
+		// Every node of the closure is imported by something, so dropping any one breaks it.
+		assert!(!reveal(two.goal(), &two.pins(), &env, &solver), "without node {skip}");
 	}
 }
 
 #[test]
-fn layers_attest_one_after_another() {
-	let attest = |layers: &[&[u8]]| {
-		let (subject, chain) = layers.split_last().unwrap();
-		let mut blobs: Vec<(bool, &[u8])> = chain.iter().map(|l| (true, *l)).collect();
-		blobs.push((false, subject));
-		run(CheckMode::Attest, &blobs, b"", b"")
-	};
-	assert!(attest(&TWO[..1]));
-	assert!(attest(&TWO[..2]));
-	assert!(attest(&TWO));
-	// A layer only parses after the layers it was cut from.
-	assert!(!attest(&[TWO[1]]), "without its chain");
-	assert!(!attest(&[TWO[0], TWO[2]]), "a layer skipped");
-	assert!(!attest(&[TWO[1], TWO[0]]), "out of order");
-	// A layer that redeclares an earlier name doesn't parse either.
-	assert!(!attest(&[TWO[0], TWO[1], TWO[2], TWO[2]]));
+fn untrusted_theorems_need_their_proofs() {
+	let two = pack!("two");
+	let f = pack!("f");
+	// The closure of GoalF has theorems; leave their proofs out.
+	let statements: Vec<&[u8]> = f.nodes.clone();
+	let only_goal_proof = [statements.clone(), vec![f.proof_of(f.goal()).unwrap()]].concat();
+	assert!(f.proofs.len() > 1);
+	assert!(!reveal(f.goal(), &f.pins(), &[], &only_goal_proof));
+	// A proof for a trusted node is refused.
+	let extra = [two.goal(), two.proof_of(two.goal()).unwrap(), two.proof_of(two.goal()).unwrap()];
+	assert!(!reveal(two.goal(), &two.pins(), two.env(), &extra), "a proof twice");
+	let trusted_proof = [two.with_proofs(&[two.goal()]), f.proofs[..1].to_vec()].concat();
+	assert!(!reveal(two.goal(), &two.pins(), two.env(), &trusted_proof), "a proof of nothing loaded");
+}
+
+#[test]
+fn attesting_batches() {
+	let f = pack!("f");
+	let pins = f.pins();
+	let proofs_of = |nodes: &[&'static [u8]]| f.with_proofs(nodes)[nodes.len()..].to_vec();
+	// The whole closure as one batch.
+	assert!(attest(&pins, &[], &f.nodes, &proofs_of(&f.nodes)));
+	// In two batches, the second trusting the first.
+	let (first, second) = f.nodes.split_at(f.nodes.len() / 2);
+	assert!(attest(&pins, &[], first, &proofs_of(first)));
+	assert!(attest(&pins, first, second, &proofs_of(second)));
+	assert!(!attest(&pins, &[], second, &proofs_of(second)), "without what it imports");
+	assert!(!attest(&pins, first, second, &[]), "without its proofs");
+	assert!(!attest(&pins, &f.nodes, &[], &[]), "no subjects");
+	assert!(!attest(&pins[1..], &[], &f.nodes, &proofs_of(&f.nodes)), "pins not 32 bytes each");
+	assert!(!attest(&pins, first, second, &[proofs_of(second), vec![second[0]]].concat()), "a node in the proofs");
+	assert!(!attest(&pins, first, &[second, &second[..1]].concat(), &proofs_of(second)), "a node twice");
+}
+
+#[test]
+fn witnesses_parse() {
+	assert_eq!(parse_witness(&encode(&[b"ab", b"", b"c"])), Some(vec![&b"ab"[..], b"", b"c"]));
+	assert_eq!(parse_witness(&[]), None);
+	assert_eq!(parse_witness(&[1, 2, 0]), None, "an item past the end");
+	assert_eq!(parse_witness(&[0, 0]), None, "trailing bytes");
+}
+
+
+/// `node` with its `i`th import left out of its header: a node mentioning a constant it doesn't
+/// import. (Its hash changes too.)
+fn without_import(node: &[u8], i: usize) -> Vec<u8> {
+	let mut rest = &node[NODE_MAGIC.len()..];
+	let n = uvar(&mut rest).unwrap();
+	assert!(n < 128 && i < n);
+	let mut out = NODE_MAGIC.to_vec();
+	out.push((n - 1) as u8);
+	for (j, h) in rest[..32 * n].chunks(32).enumerate() {
+		if j != i {
+			out.extend_from_slice(h);
+		}
+	}
+	out.extend_from_slice(&rest[32 * n..]);
+	out
+}
+
+#[test]
+fn nodes_must_import_what_they_mention() {
+	let two = pack!("two");
+	// The non-theorem with the most imports, trusting the nodes before it, which hold its imports.
+	let k = (0..two.env().len())
+		.filter(|&k| two.proof_of(two.nodes[k]).is_none())
+		.max_by_key(|&k| imports(two.nodes[k]).unwrap().len())
+		.unwrap();
+	let (env, node) = (&two.nodes[..k], two.nodes[k]);
+	let n = imports(node).unwrap().len();
+	assert!(n > 1);
+	assert!(attest(&two.pins(), env, &[node], &[]));
+	for i in 0..n {
+		// Whatever it no longer imports is still loaded, trusted: it's mentioned, not imported.
+		let stripped = without_import(node, i);
+		assert!(!attest(&two.pins(), env, &[&stripped], &[]), "import {i} left out");
+	}
 }

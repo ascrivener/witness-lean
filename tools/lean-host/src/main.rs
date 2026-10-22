@@ -9,8 +9,47 @@
 use std::time::Instant;
 use witness_types::{CheckBlob, CheckMode, check_args};
 
+/// Load every node of a `lean_nodes.py` output directory, in order and with its proof, and
+/// type-check them all.
+fn nodes(dir: &str) -> ! {
+	use nanoda_lib::nodes::{Hash, NodeLoader, PINNED_NAMES};
+	let manifest: serde_json::Value =
+		serde_json::from_slice(&std::fs::read(format!("{dir}/manifest.json")).expect("manifest")).expect("JSON");
+	let entries = manifest.as_array().expect("a list");
+	let hash = |e: &serde_json::Value| -> Hash {
+		let h = e["hash"].as_str().unwrap();
+		std::array::from_fn(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+	};
+	let pins: Vec<Hash> = entries
+		.iter()
+		.filter(|e| e["names"].as_array().unwrap().iter().any(|n| PINNED_NAMES.contains(&n.as_str().unwrap())))
+		.map(hash)
+		.collect();
+	let start = Instant::now();
+	let mut loader = NodeLoader::new(&pins);
+	for e in entries {
+		let h = e["hash"].as_str().unwrap();
+		let node = std::fs::read(format!("{dir}/nodes/{h}")).unwrap();
+		let proof = e.get("proof_size").map(|_| std::fs::read(format!("{dir}/proofs/{h}")).unwrap());
+		if let Err(err) = loader.add(hash(e), &node, proof.as_deref()) {
+			eprintln!("{}: {err}", e["names"][0]);
+			std::process::exit(1);
+		}
+	}
+	let nodes = loader.finish();
+	let loaded = start.elapsed();
+	for i in 0..nodes.nodes.len() {
+		nodes.check(i);
+	}
+	println!("{} nodes ({} pinned) loaded in {loaded:?}, all checked in {:?}", entries.len(), pins.len(), start.elapsed());
+	std::process::exit(0);
+}
+
 fn main() {
 	let args: Vec<String> = std::env::args().skip(1).collect();
+	if let ["nodes", dir] = args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+		nodes(dir);
+	}
 	let read = |p: &String| std::fs::read(p).unwrap_or_else(|e| panic!("cannot read {p}: {e}"));
 	let (mode, blobs, params, witness) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
 		["attest", ref files @ .., _] if !files.is_empty() || args.len() == 2 => {

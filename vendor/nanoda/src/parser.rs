@@ -40,14 +40,27 @@ fn check_semver<'a>(meta: &FileMeta<'a>) -> Result<(), Box<dyn Error>> {
 
 pub struct Parser<'a> {
     line_num: usize,
-    dag: LeanDag<'a>,
-    declars: FxIndexMap<NamePtr<'a>, Declar<'a>>,
+    pub(crate) dag: LeanDag<'a>,
+    pub(crate) declars: FxIndexMap<NamePtr<'a>, Declar<'a>>,
     notations: FxHashMap<NamePtr<'a>, Notation<'a>>,
     config: Config,
     /// Tracks axiom names that were found in the export file, but not white-listed,
     /// for use when `unpermitted_axiom_hard_error: false`
     skipped: Vec<String>,
-    mutual_block_sizes: FxHashMap<NamePtr<'a>, (usize, usize)>
+    mutual_block_sizes: FxHashMap<NamePtr<'a>, (usize, usize)>,
+    /// Reading a content-addressed node: duplicate names, levels and expressions are allowed.
+    node_mode: bool,
+    /// A theorem statement read from a node, waiting for its proof (or to become an assumption).
+    pub(crate) statement: Option<DeclarInfo<'a>>,
+    /// A proof's value, read from a proof blob.
+    pub(crate) proof_value: Option<ExprPtr<'a>>,
+}
+
+/// A node's local indices, mapped to the shared tables'.
+struct LocalMap {
+    names: Vec<u32>,
+    levels: Vec<u32>,
+    exprs: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
@@ -312,6 +325,16 @@ enum ExportJsonVal<'a> {
         #[serde(rename = "isUnsafe")]
         is_unsafe: bool
     },
+    /// A theorem's statement, in a content-addressed node (binary only).
+    #[serde(skip)]
+    Statement {
+        name: u32,
+        uparams: Vec<u32>,
+        ty: u32,
+    },
+    /// A theorem's proof, in a proof blob (binary only).
+    #[serde(skip)]
+    ProofValue(u32),
     #[serde(rename = "thm")]
     Thm {
         name: u32,
@@ -382,7 +405,7 @@ pub(crate) fn parse_export_parts<'p>(
     config: Config,
 ) -> Result<(crate::util::ExportFile<'p>, Vec<String>, Vec<usize>), Box<dyn Error>> {
     let mut parser = Parser::new(config);
-    let mut part_ends = Vec::with_capacity(parts.len());
+    let mut part_ends: Vec<usize> = Vec::with_capacity(parts.len());
     for part in parts {
         if let Some(body) = part.strip_prefix(BINARY_MAGIC) {
             parser.go_binary(body)?;
@@ -412,6 +435,12 @@ pub(crate) fn parse_export_parts<'p>(
         }
     }
     
+    let skipped = core::mem::take(&mut parser.skipped);
+    Ok((finish(parser), skipped, part_ends))
+}
+
+/// Build the export file from everything `parser` has read.
+pub(crate) fn finish<'p>(parser: Parser<'p>) -> crate::util::ExportFile<'p> {
     let name_cache = parser.dag.mk_name_cache();
     // Maps inductive names to exported recursor names. This is later reused in the inductive
     // module to require that the set of derived recursors matches the set of exported recursors,
@@ -445,7 +474,7 @@ pub(crate) fn parse_export_parts<'p>(
         mutual_block_sizes: parser.mutual_block_sizes,
         ind_name_to_recursor_names,
     };
-    Ok((export_file, parser.skipped, part_ends))
+    export_file
 }
 
 impl<'a> Parser<'a> {
@@ -457,7 +486,10 @@ impl<'a> Parser<'a> {
             notations: new_fx_hash_map(),
             config,
             skipped: Vec::new(),
-            mutual_block_sizes: new_fx_hash_map()
+            mutual_block_sizes: new_fx_hash_map(),
+            node_mode: false,
+            statement: None,
+            proof_value: None,
         }
     }
     
@@ -519,7 +551,7 @@ impl<'a> Parser<'a> {
     }
 
     // Used for the axiom whitelist feature.
-    fn name_to_string(&self, n: NamePtr<'a>) -> String {
+    pub(crate) fn name_to_string(&self, n: NamePtr<'a>) -> String {
         match self.dag.names.get_index(n.idx()).copied().unwrap() {
             Name::Anon => String::new(),
             Name::Str(pfx, sfx, _) => {
@@ -541,13 +573,13 @@ impl<'a> Parser<'a> {
 
     fn go1(&mut self, line: &str) -> Result<(), Box<dyn Error>> {
         let ExportJsonObject {val, i: assigned_idx} = serde_json::from_str::<ExportJsonObject>(line)?;
-        self.apply(val, assigned_idx, line)
+        self.apply(val, assigned_idx, line).map(|_| ())
     }
 
     /// Read a binary-format part (after its magic). Indices are implicit: each name, level or
     /// expression gets the next free index of its kind, and a duplicate is still rejected.
     fn go_binary(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
-        let mut r = BinReader { bytes, pos: 0 };
+        let mut r = BinReader { bytes, pos: 0, map: None };
         while r.pos < r.bytes.len() {
             let (val, kind) = r.item()?;
             let idx = |n: usize| u32::try_from(n).map_err(|_| "too many items");
@@ -563,8 +595,35 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Add one decoded export item. `line` is only used in error messages.
-    fn apply(&mut self, val: ExportJsonVal<'_>, assigned_idx: Option<BackRef>, line: &str) -> Result<(), Box<dyn Error>> {
+    /// Read the items of a content-addressed node or proof (see `node_format.md`), which number
+    /// their names, levels and expressions locally, from scratch. Each item is added to the
+    /// shared tables, or found there if an earlier node added it. Returns the global index of
+    /// each local expression.
+    pub(crate) fn go_node(&mut self, bytes: &[u8]) -> Result<Vec<u32>, Box<dyn Error>> {
+        let mut map = LocalMap { names: vec![0], levels: vec![0], exprs: Vec::new() };
+        let mut pos = 0;
+        self.node_mode = true;
+        while pos < bytes.len() {
+            let mut r = BinReader { bytes, pos, map: Some(&map) };
+            let (val, kind) = r.item()?;
+            pos = r.pos;
+            let idx = self.apply(val, None, "<node item>")?;
+            let idx = idx.map(|i| u32::try_from(i)).transpose()?;
+            match (kind, idx) {
+                (ItemKind::Name, Some(i)) => map.names.push(i),
+                (ItemKind::Level, Some(i)) => map.levels.push(i),
+                (ItemKind::Expr, Some(i)) => map.exprs.push(i),
+                (ItemKind::Other, None) => {},
+                _ => return Err("node item of unexpected kind".into()),
+            }
+        }
+        self.node_mode = false;
+        Ok(map.exprs)
+    }
+
+    /// Add one decoded export item, returning its index if it is a name, level or expression.
+    /// `line` is only used in error messages.
+    fn apply(&mut self, val: ExportJsonVal<'_>, assigned_idx: Option<BackRef>, line: &str) -> Result<Option<usize>, Box<dyn Error>> {
         use ExportJsonVal::*;
         match val {
             Metadata(json_val) => {
@@ -581,7 +640,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::name::STR_HASH, pfx, sfx);
                     self.dag.names.insert_full(Name::Str(pfx, sfx, hash))
                 };
-                assigned_idx.unwrap().assert_in(insert_result);
+                return Ok(Some(self.assign_in(assigned_idx, insert_result)));
             }
             NameNum {pre, i} => {
                 let pfx = self.get_name_ptr(pre);
@@ -590,7 +649,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::name::NUM_HASH, pfx, sfx);
                     self.dag.names.insert_full(Name::Num(pfx, sfx, hash))
                 };
-                assigned_idx.unwrap().assert_in(insert_result);
+                return Ok(Some(self.assign_in(assigned_idx, insert_result)));
             }
             NatLit(big_uint) => {
                 if !self.config.nat_extension {
@@ -608,7 +667,7 @@ impl<'a> Parser<'a> {
                         format!("Nat lit extension disallowed by checker execution config, found {:?}", line)
                     ))
                 }
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             StrLit(cow_str) => {
                 if !self.config.string_extension {
@@ -625,7 +684,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::expr::STRING_LIT_HASH, string_ptr);
                     self.dag.exprs.insert_full(Expr::StringLit { ptr: string_ptr, hash })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             LevelSucc(l) => {
                 let l = self.get_level_ptr(l);
@@ -633,7 +692,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::level::SUCC_HASH, l);
                     self.dag.levels.insert_full(Level::Succ(l, hash))
                 };
-                assigned_idx.unwrap().assert_il(insert_result);
+                return Ok(Some(self.assign_il(assigned_idx, insert_result)));
             }
             LevelMax([l, r]) => {
                 let l = self.get_level_ptr(l);
@@ -642,7 +701,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::level::MAX_HASH, l, r);
                     self.dag.levels.insert_full(Level::Max(l, r, hash))
                 };
-                assigned_idx.unwrap().assert_il(insert_result);
+                return Ok(Some(self.assign_il(assigned_idx, insert_result)));
             }
             LevelIMax([l, r]) => {
                 let l = self.get_level_ptr(l);
@@ -651,7 +710,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::level::IMAX_HASH, l, r);
                     self.dag.levels.insert_full(Level::IMax(l, r, hash))
                 };
-                assigned_idx.unwrap().assert_il(insert_result);
+                return Ok(Some(self.assign_il(assigned_idx, insert_result)));
             }
             LevelParam(var_idx) => {
                  let n = self.get_name_ptr(var_idx);
@@ -659,7 +718,7 @@ impl<'a> Parser<'a> {
                      let hash = hash64!(crate::level::PARAM_HASH, n);
                      self.dag.levels.insert_full(Level::Param(n, hash))
                  };
-                assigned_idx.unwrap().assert_il(insert_result);
+                return Ok(Some(self.assign_il(assigned_idx, insert_result)));
             }
             ExprSort(level) => {
                 let level = self.get_level_ptr(level);
@@ -667,7 +726,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::expr::SORT_HASH, level);
                     self.dag.exprs.insert_full(Expr::Sort { level, hash })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprMData {..} => {
                 panic!("Expr.mdata not supported");
@@ -679,7 +738,7 @@ impl<'a> Parser<'a> {
                     let hash = hash64!(crate::expr::CONST_HASH, name, levels);
                     self.dag.exprs.insert_full(Expr::Const { name, levels, hash })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprApp {fun, arg} => {
                 let fun = self.get_expr_ptr(fun);
@@ -690,14 +749,14 @@ impl<'a> Parser<'a> {
                     let locals = self.has_fvars(fun) || self.has_fvars(arg);
                     self.dag.exprs.insert_full(Expr::App { fun, arg, num_loose_bvars: num_bvars, has_fvars: locals, hash })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprBVar(dbj_idx) => {
                 let insert_result = {
                     let hash = hash64!(crate::expr::VAR_HASH, dbj_idx);
                     self.dag.exprs.insert_full(Expr::Var { dbj_idx, hash })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprLambda {binder_name, binder_type, binder_info, body} => {
                 let binder_name = self.get_name_ptr(binder_name);
@@ -717,7 +776,7 @@ impl<'a> Parser<'a> {
                         hash,
                     })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprPi {binder_name, binder_type, binder_info, body} => {
                 let binder_name = self.get_name_ptr(binder_name);
@@ -737,7 +796,7 @@ impl<'a> Parser<'a> {
                         hash,
                     })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprLet {name, ty, value, body, nondep} => {
                 let binder_name = self.get_name_ptr(name);
@@ -761,7 +820,7 @@ impl<'a> Parser<'a> {
                         nondep
                     })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             ExprProj {type_name, idx, structure: struct_} => {
                 let ty_name = self.get_name_ptr(type_name);
@@ -779,7 +838,7 @@ impl<'a> Parser<'a> {
                         hash,
                     })
                 };
-                assigned_idx.unwrap().assert_ie(insert_result);
+                return Ok(Some(self.assign_ie(assigned_idx, insert_result)));
             }
             Axiom {name, ty, uparams, is_unsafe} => {
                 assert!(!is_unsafe);
@@ -902,8 +961,38 @@ impl<'a> Parser<'a> {
                     assert!(self.declars.insert(name, recursor).is_none())
                 }
             }
+            Statement {name, uparams, ty} => {
+                let name = self.get_name_ptr(name);
+                let ty = self.get_expr_ptr(ty);
+                let uparams = self.get_uparams_ptr(&uparams);
+                assert!(self.statement.replace(DeclarInfo { name, ty, uparams }).is_none());
+            }
+            ProofValue(value) => {
+                assert!(self.proof_value.replace(self.get_expr_ptr(value)).is_none());
+            }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    fn assign_in(&self, backref: Option<BackRef>, inserted: (usize, bool)) -> usize {
+        if !self.node_mode {
+            backref.unwrap().assert_in(inserted);
+        }
+        inserted.0
+    }
+
+    fn assign_il(&self, backref: Option<BackRef>, inserted: (usize, bool)) -> usize {
+        if !self.node_mode {
+            backref.unwrap().assert_il(inserted);
+        }
+        inserted.0
+    }
+
+    fn assign_ie(&self, backref: Option<BackRef>, inserted: (usize, bool)) -> usize {
+        if !self.node_mode {
+            backref.unwrap().assert_ie(inserted);
+        }
+        inserted.0
     }
 }
 
@@ -1046,12 +1135,34 @@ pub(crate) const BINARY_MAGIC: &[u8] = b"LEANBIN\x01";
 enum ItemKind { Name, Level, Expr, Other }
 
 /// Reads the binary format described in `binary_format.md`.
-struct BinReader<'a> {
+struct BinReader<'a, 'm> {
     bytes: &'a [u8],
     pos: usize,
+    /// For a node, its local indices so far; indices are read as they are otherwise.
+    map: Option<&'m LocalMap>,
 }
 
-impl<'a> BinReader<'a> {
+impl<'a> BinReader<'a, '_> {
+    /// A name, level or expression reference: local in a node, global otherwise.
+    fn index(&mut self, local: impl Fn(&LocalMap) -> &[u32]) -> Result<u32, Box<dyn Error>> {
+        let i = self.u32()?;
+        match self.map {
+            None => Ok(i),
+            Some(map) => local(map).get(i as usize).copied().ok_or_else(|| "node refers to a later or missing item".into()),
+        }
+    }
+    fn n(&mut self) -> Result<u32, Box<dyn Error>> { self.index(|m| &m.names) }
+    fn l(&mut self) -> Result<u32, Box<dyn Error>> { self.index(|m| &m.levels) }
+    fn e(&mut self) -> Result<u32, Box<dyn Error>> { self.index(|m| &m.exprs) }
+    fn ns(&mut self) -> Result<Vec<u32>, Box<dyn Error>> {
+        let n = self.uvar()?;
+        (0..n).map(|_| self.n()).collect()
+    }
+    fn ls(&mut self) -> Result<Vec<u32>, Box<dyn Error>> {
+        let n = self.uvar()?;
+        (0..n).map(|_| self.l()).collect()
+    }
+
     fn byte(&mut self) -> Result<u8, Box<dyn Error>> {
         let b = *self.bytes.get(self.pos).ok_or("binary export ends early")?;
         self.pos += 1;
@@ -1094,11 +1205,6 @@ impl<'a> BinReader<'a> {
         Ok(Cow::Borrowed(core::str::from_utf8(self.slice()?)?))
     }
 
-    fn u32s(&mut self) -> Result<Vec<u32>, Box<dyn Error>> {
-        let n = self.uvar()?;
-        (0..n).map(|_| self.u32()).collect()
-    }
-
     fn list<T>(&mut self, mut f: impl FnMut(&mut Self) -> Result<T, Box<dyn Error>>) -> Result<Vec<T>, Box<dyn Error>> {
         let n = self.uvar()?;
         (0..n).map(|_| f(self)).collect()
@@ -1124,29 +1230,29 @@ impl<'a> BinReader<'a> {
                 lean: LeanMeta { githash: self.string()?, version: self.string()? },
                 format: FormatMeta { version: self.string()? },
             }), Other),
-            1 => (NameStr { pre: self.u32()?, str: self.string()? }, Name),
-            2 => (NameNum { pre: self.u32()?, i: self.u32()? }, Name),
-            3 => (LevelSucc(self.u32()?), Level),
-            4 => (LevelMax([self.u32()?, self.u32()?]), Level),
-            5 => (LevelIMax([self.u32()?, self.u32()?]), Level),
-            6 => (LevelParam(self.u32()?), Level),
+            1 => (NameStr { pre: self.n()?, str: self.string()? }, Name),
+            2 => (NameNum { pre: self.n()?, i: self.u32()? }, Name),
+            3 => (LevelSucc(self.l()?), Level),
+            4 => (LevelMax([self.l()?, self.l()?]), Level),
+            5 => (LevelIMax([self.l()?, self.l()?]), Level),
+            6 => (LevelParam(self.n()?), Level),
             7 => (NatLit(BigUint::from_bytes_le(self.slice()?)), Expr),
             8 => (StrLit(self.string()?), Expr),
-            9 => (ExprLet { name: self.u32()?, ty: self.u32()?, value: self.u32()?, body: self.u32()?, nondep: self.boolean()? }, Expr),
-            10 => (ExprConst { name: self.u32()?, levels: self.u32s()? }, Expr),
-            11 => (ExprApp { fun: self.u32()?, arg: self.u32()? }, Expr),
-            12 => (ExprPi { binder_name: self.u32()?, binder_type: self.u32()?, body: self.u32()?, binder_info: self.binder()? }, Expr),
-            13 => (ExprLambda { binder_name: self.u32()?, binder_type: self.u32()?, body: self.u32()?, binder_info: self.binder()? }, Expr),
-            14 => (ExprProj { type_name: self.u32()?, idx: usize::try_from(self.uvar()?)?, structure: self.u32()? }, Expr),
-            15 => (ExprSort(self.u32()?), Expr),
+            9 => (ExprLet { name: self.n()?, ty: self.e()?, value: self.e()?, body: self.e()?, nondep: self.boolean()? }, Expr),
+            10 => (ExprConst { name: self.n()?, levels: self.ls()? }, Expr),
+            11 => (ExprApp { fun: self.e()?, arg: self.e()? }, Expr),
+            12 => (ExprPi { binder_name: self.n()?, binder_type: self.e()?, body: self.e()?, binder_info: self.binder()? }, Expr),
+            13 => (ExprLambda { binder_name: self.n()?, binder_type: self.e()?, body: self.e()?, binder_info: self.binder()? }, Expr),
+            14 => (ExprProj { type_name: self.n()?, idx: usize::try_from(self.uvar()?)?, structure: self.e()? }, Expr),
+            15 => (ExprSort(self.l()?), Expr),
             16 => (ExprBVar(self.u16()?), Expr),
-            17 => (Axiom { name: self.u32()?, uparams: self.u32s()?, ty: self.u32()?, is_unsafe: self.boolean()? }, Other),
-            18 => (Thm { name: self.u32()?, uparams: self.u32s()?, ty: self.u32()?, value: self.u32()? }, Other),
+            17 => (Axiom { name: self.n()?, uparams: self.ns()?, ty: self.e()?, is_unsafe: self.boolean()? }, Other),
+            18 => (Thm { name: self.n()?, uparams: self.ns()?, ty: self.e()?, value: self.e()? }, Other),
             19 => (Defn {
-                name: self.u32()?,
-                uparams: self.u32s()?,
-                ty: self.u32()?,
-                value: self.u32()?,
+                name: self.n()?,
+                uparams: self.ns()?,
+                ty: self.e()?,
+                value: self.e()?,
                 hint: match self.byte()? {
                     0 => ReducibilityHint::Opaque,
                     1 => ReducibilityHint::Abbrev,
@@ -1160,11 +1266,11 @@ impl<'a> BinReader<'a> {
                     _ => return Err("bad definition safety".into()),
                 },
             }, Other),
-            20 => (Opaque { name: self.u32()?, uparams: self.u32s()?, ty: self.u32()?, value: self.u32()?, is_unsafe: self.boolean()? }, Other),
+            20 => (Opaque { name: self.n()?, uparams: self.ns()?, ty: self.e()?, value: self.e()?, is_unsafe: self.boolean()? }, Other),
             21 => (Quot {
-                name: self.u32()?,
-                uparams: self.u32s()?,
-                ty: self.u32()?,
+                name: self.n()?,
+                uparams: self.ns()?,
+                ty: self.e()?,
                 kind: match self.byte()? {
                     0 => QuotKind::Ty,
                     1 => QuotKind::Ctor,
@@ -1175,11 +1281,11 @@ impl<'a> BinReader<'a> {
             }, Other),
             22 => (Inductive {
                 ind_vals: self.list(|r| Ok(IndInfo {
-                    name: r.u32()?,
-                    uparams: r.u32s()?,
-                    ty: r.u32()?,
-                    all: r.u32s()?,
-                    ctors: r.u32s()?,
+                    name: r.n()?,
+                    uparams: r.ns()?,
+                    ty: r.e()?,
+                    all: r.ns()?,
+                    ctors: r.ns()?,
                     is_rec: r.boolean()?,
                     is_reflexive: r.boolean()?,
                     num_indices: r.u16()?,
@@ -1188,29 +1294,31 @@ impl<'a> BinReader<'a> {
                     is_unsafe: r.boolean()?,
                 }))?,
                 ctor_vals: self.list(|r| Ok(Constructor {
-                    name: r.u32()?,
-                    uparams: r.u32s()?,
-                    ty: r.u32()?,
+                    name: r.n()?,
+                    uparams: r.ns()?,
+                    ty: r.e()?,
                     is_unsafe: r.boolean()?,
                     cidx: r.u16()?,
                     num_params: r.u16()?,
                     num_fields: r.u16()?,
-                    induct: r.u32()?,
+                    induct: r.n()?,
                 }))?,
                 rec_vals: self.list(|r| Ok(Recursor {
-                    name: r.u32()?,
-                    uparams: r.u32s()?,
-                    ty: r.u32()?,
+                    name: r.n()?,
+                    uparams: r.ns()?,
+                    ty: r.e()?,
                     is_unsafe: r.boolean()?,
                     num_params: r.u16()?,
                     num_indices: r.u16()?,
                     num_motives: r.u16()?,
                     num_minors: r.u16()?,
-                    rules: r.list(|r| Ok(RecursorRule { ctor: r.u32()?, nfields: r.u16()?, rhs: r.u32()? }))?,
-                    all: r.u32s()?,
+                    rules: r.list(|r| Ok(RecursorRule { ctor: r.n()?, nfields: r.u16()?, rhs: r.e()? }))?,
+                    all: r.ns()?,
                     k: r.boolean()?,
                 }))?,
             }, Other),
+            23 => (Statement { name: self.n()?, uparams: self.ns()?, ty: self.e()? }, Other),
+            24 => (ProofValue(self.e()?), Other),
             _ => return Err(format!("unknown binary item tag {tag}").into()),
         })
     }

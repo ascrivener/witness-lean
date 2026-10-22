@@ -19,6 +19,7 @@ pub mod expr;
 pub mod inductive;
 pub mod level;
 pub mod name;
+pub mod nodes;
 pub mod parser;
 pub mod pretty_printer;
 pub mod quot;
