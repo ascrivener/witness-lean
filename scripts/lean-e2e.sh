@@ -22,7 +22,9 @@
 # WITNESS_DIR is a checkout of witness (at the commit Cargo.toml pins), for the service and its CLI.
 # Needs elan, and a lean4export built for the project's lean-toolchain. The primes project fetches
 # Mathlib's build from its cache (`lake exe cache get`), which needs cache.mathlib.org. Like
-# e2e.sh, starts a testnet unless JAM_RPC is set.
+# e2e.sh, starts a testnet unless JAM_RPC is set. With WITNESS_SIM=1 it runs against witness's
+# tools/witness-sim instead: the same ops, rules and check (in PolkaVM, with PolkaJam's gas),
+# natively, in a minute or two. No PolkaJam needed; a testnet stays the judge of what fits.
 set -euo pipefail
 : "${LEAN4EXPORT:?set LEAN4EXPORT to the lean4export binary}"
 : "${WITNESS_DIR:?set WITNESS_DIR to a witness checkout}"
@@ -37,6 +39,8 @@ esac
 cd "$(dirname "$0")/.."
 JAMT=${POLKAJAM_DIR:+$POLKAJAM_DIR/}jamt
 TESTNET=${POLKAJAM_DIR:+$POLKAJAM_DIR/}polkajam-testnet
+# Seconds between polls of the chain.
+POLL=2
 W=$WITNESS_DIR/target/debug/witness
 TMP=$(mktemp -d)
 LOG=$TMP/testnet.log
@@ -45,7 +49,7 @@ CHECK=out/lean-check.jam
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 slot() { "$JAMT" inspect slot; }
-wait_slot() { while [ "$(slot)" -lt "$1" ]; do sleep 2; done; }
+wait_slot() { while [ "$(slot)" -lt "$1" ]; do sleep $POLL; done; }
 storage() {
 	local v
 	v=$("$JAMT" inspect storage --raw "$SVC" "$($W key "$@")" 2>/dev/null || true)
@@ -62,7 +66,7 @@ expect() {
 	for _ in $(seq 1 60); do
 		out=$(show "$@")
 		if grep -qE "$pattern" <<<"$out"; then echo "ok: $what"; return; fi
-		sleep 3
+		sleep $POLL
 	done
 	fail "$what: wanted /$pattern/, got: $out"
 }
@@ -87,7 +91,7 @@ signed() {
 		"$JAMT" item "$SVC" "$payload" >/dev/null
 		for _ in $(seq 1 30); do
 			grep -q "nonce: ${NONCE[$who]}" <<<"$(show account --account "$who")" && return
-			sleep 3
+			sleep $POLL
 		done
 		echo "op $N by $who not applied after attempt $attempt"
 	done
@@ -123,7 +127,13 @@ for ((n = 0; n < BATCHES; n++)); do
 	"$W" bundle --subjects "$(cat "$W_DIR/batch-$n.subjects")" --out "$W_DIR/batch-$n.bundle" >/dev/null
 done
 
-if [ -z "${JAM_RPC:-}" ]; then
+if [ -n "${WITNESS_SIM:-}" ]; then
+	step "using witness-sim (state: $TMP/sim)"
+	(cd "$WITNESS_DIR" && cargo build -q --release -p witness-sim)
+	JAMT=$WITNESS_DIR/target/release/witness-sim POLL=0 JAM_RPC=sim
+	export WITNESS_SIM_DIR=$TMP/sim
+	LOG=$WITNESS_SIM_DIR/log
+elif [ -z "${JAM_RPC:-}" ]; then
 	step "starting testnet (log: $LOG)"
 	"$TESTNET" >"$LOG" 2>&1 &
 	TESTNET_PID=$!
@@ -136,10 +146,10 @@ step "building and deploying"
 cargo jam-build --out-dir out >/dev/null
 before=$("$JAMT" list | wc -l)
 "$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 >/dev/null
-for _ in $(seq 1 40); do [ "$("$JAMT" list | wc -l)" -gt "$before" ] && break; sleep 3; done
+for _ in $(seq 1 40); do [ "$("$JAMT" list | wc -l)" -gt "$before" ] && break; sleep $POLL; done
 SVC=$((16#$("$JAMT" list | tail -1 | cut -f1)))
 echo "service $SVC"
-for _ in $(seq 1 40); do "$JAMT" inspect final service "$SVC" >/dev/null 2>&1 && break; sleep 3; done
+for _ in $(seq 1 40); do "$JAMT" inspect final service "$SVC" >/dev/null 2>&1 && break; sleep $POLL; done
 wait_slot $(( $(slot) + 3 ))
 
 step "a library attester attests the library: $BATCHES batches"
@@ -175,6 +185,6 @@ item "$($W reveal --bounty 0 --check $CHECK --params "$GOAL$PINS" --blobs "$CITE
 expect "bob's proof opens the claim window" 'Revealing' bounty --bounty 0
 
 printf '\nLean end-to-end checks passed (%s)\n' "${1:-gcd}"
-if [ -z "${JAM_RPC:-}" ]; then
+if [ -z "${JAM_RPC:-}" ] || [ -n "${WITNESS_SIM:-}" ]; then
 	grep -h 'check used' "$LOG" | grep -oE 'check used [0-9]+' | sort -u -t' ' -k3 -n | tail -3
 fi
