@@ -5,7 +5,8 @@
 //!     lean-host trace DIR PLAN OUT [MS]
 //!                                  write OUT: PLAN with each batch trusting only what the kernel
 //!                                  looks up while checking it, plus what its nodes import, and
-//!                                  split where a batch takes longer than MS (default 100)
+//!                                  split where a batch takes longer than MS (default 100); print
+//!                                  `over T: NAME` for each declaration that alone takes longer
 //!
 //! DIR is a `lean_nodes.py` output directory. A native millisecond costs about 29M gas in
 //! PolkaJam v0.1.29's recompiler, so a batch should stay well under 150 ms to fit a refine.
@@ -158,6 +159,9 @@ fn trace(dir: &Dir, plan: &str, out: &str, budget: Duration) {
 			}
 			if t > budget {
 				over += 1;
+				// For lean_split.py: a theorem whose proof alone takes too long.
+				let name = dir.manifest.iter().find(|e| e["hash"] == subjects[0].as_str()).map(|e| &e["names"][0]);
+				println!("over {t:?}: {}", name.and_then(Value::as_str).unwrap_or(&subjects[0]));
 			}
 			slowest = slowest.max(t);
 			out_plan.push(serde_json::json!({ "depth": batch["depth"], "subjects": subjects, "trusted": keep }));

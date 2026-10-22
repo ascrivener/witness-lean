@@ -11,17 +11,17 @@
 #   about 1.25×10⁹ gas, so it needs a testnet with the full spec's 5×10⁹ refine gas (see README).
 # - flt4: x⁴ + y⁴ ≠ z⁴, Mathlib's fermatLastTheoremFour, revealed as is (in the primes project):
 #   7,579 nodes in 269 batches over 91 depths. Like primes, it needs the full spec's refine gas.
-# - fta: the fundamental theorem of algebra, Mathlib's Complex.exists_root: 46,201 nodes in about
-#   2,600 batches over 294 depths. One lemma on the way (iteratedFDerivWithin_succ_apply_right)
-#   takes more gas than a refine has, so it doesn't complete yet.
+# - fta: the fundamental theorem of algebra, Mathlib's Complex.exists_root: 46,201 nodes in 2,416
+#   batches over 293 depths. The heaviest (iteratedFDerivWithin_succ_apply_right) uses 4.1×10⁹ gas.
 #
 # The solver's export is converted to content-addressed nodes (tools/lean/lean_nodes.py), and
 # everything but the solver's theorem is planned into batches by dependency depth
 # (lean_plan.py): that's the library, which an attester attests once, batch by batch, each
 # trusting the nodes it needs from earlier batches. The poster's bounty names the theorem's
 # statement node by hash, and cites one attested node so every attestation a reveal uses shares
-# its pins. The solver commits, then reveals the theorem and its proof, trusting the attested
-# nodes it needs. Every attest and the reveal must fit one refine; the node log (target witness)
+# its pins. A theorem whose proof alone is too slow for a batch is split into smaller theorems
+# where that helps (lean_split.py; the statement, and so its hash, stays). The solver commits,
+# then reveals the theorem and its proof, trusting the attested nodes it needs. Every attest and the reveal must fit one refine; the node log (target witness)
 # shows the gas each used.
 #
 # WITNESS_DIR is a checkout of witness (at the commit Cargo.toml pins), for the service and its CLI.
@@ -152,11 +152,26 @@ step "exporting the proof ($THEOREM) and converting it to nodes"
 	lake env "$LEAN4EXPORT" "$SOLUTION_MODULE" -- "$THEOREM" >"$TMP/full.ndjson"
 )
 python3 tools/lean/lean_nodes.py "$TMP/full.ndjson" "$TMP/nodes"
-python3 tools/lean/lean_plan.py "$TMP/nodes" --goal "$THEOREM" >"$TMP/plan.json"
-# Trust only what the kernel touches, and split batches too slow for a refine (lean-host).
+# Plan; then trust only what the kernel touches, and split batches too slow for a refine
+# (lean-host trace, at TRACE_MS native milliseconds a batch).
+plan() {
+	python3 tools/lean/lean_plan.py "$TMP/nodes" --goal "$THEOREM" >"$TMP/plan.json"
+	./target/release/lean-host trace "$TMP/nodes" "$TMP/plan.json" "$TMP/plan-traced.json" "${TRACE_MS:-100}" \
+		| tee "$TMP/trace.log"
+	mv "$TMP/plan-traced.json" "$TMP/plan.json"
+}
 cargo build -q --release -p lean-host
-./target/release/lean-host trace "$TMP/nodes" "$TMP/plan.json" "$TMP/plan-traced.json"
-mv "$TMP/plan-traced.json" "$TMP/plan.json"
+plan
+# A theorem slower than that on its own: split its proof into smaller theorems where that helps
+# (lean_split.py), and plan again.
+mapfile -t OVER < <(sed -n 's/^over [^:]*: //p' "$TMP/trace.log")
+if [ ${#OVER[@]} -gt 0 ]; then
+	SPLIT=$(LEAN4EXPORT=$LEAN4EXPORT python3 tools/lean/lean_split.py "$PROJECT" "$SOLUTION_MODULE" "$TMP/nodes" "${OVER[@]}")
+	if [ -n "$SPLIT" ]; then
+		echo "split: $SPLIT" | tr '\n' ' '; echo
+		plan
+	fi
+fi
 W_DIR=$TMP/w
 BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
 PINS=$(cat "$W_DIR/pins")
