@@ -7,6 +7,8 @@
 #![deny(clippy::cast_possible_truncation)]
 
 extern crate alloc;
+#[cfg(feature = "trace")]
+extern crate std;
 
 pub(crate) mod prelude {
     pub use alloc::{borrow::ToOwned, boxed::Box, format, string::{String, ToString}, vec, vec::Vec};

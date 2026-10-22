@@ -105,41 +105,48 @@ fn import_list(mut bytes: &[u8]) -> Option<Vec<Hash>> {
 		.collect()
 }
 
-/// Load `entries`, each after what it and its proof import, then type-check every untrusted one. Returns the
-/// loaded nodes, or `None` if they don't load or an untrusted theorem has no proof. Type errors
-/// panic.
+/// Load `entries`, then type-check every untrusted one. Returns the loaded nodes, or `None` if
+/// they don't load or an untrusted theorem has no proof. Type errors panic.
+///
+/// Trusted nodes load first, so every untrusted one is checked against all of them (nanoda checks
+/// a declaration against those loaded before it). Each node loads after the ones it (and its
+/// proof) imports; a trusted node's imports needn't be there (see `nanoda_lib::nodes`), an
+/// untrusted one's must.
 fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
 	let mut loader = NodeLoader::new(pins);
-	// Depth-first, imports before the node, iteratively: the import DAG can be deep.
-	for root in entries.keys() {
-		let mut stack = alloc::vec![(*root, false)];
-		while let Some((hash, imports_done)) = stack.pop() {
-			if loader.is_loaded(&hash) {
-				continue;
-			}
-			let entry = entries.get(&hash)?;
-			if imports_done {
-				loader.add(hash, entry.node, entry.proof).ok()?;
-			} else {
+	for trusted_phase in [true, false] {
+		for (root, _) in entries.iter().filter(|(_, e)| e.trusted == trusted_phase) {
+			// Depth-first, imports before the node, iteratively: the import DAG can be deep.
+			let mut stack = alloc::vec![(*root, false)];
+			while let Some((hash, imports_done)) = stack.pop() {
+				if loader.is_loaded(&hash) {
+					continue;
+				}
+				let entry = entries.get(&hash)?;
+				if imports_done {
+					loader.add(hash, entry.node, entry.proof, entry.trusted).ok()?;
+					continue;
+				}
 				stack.push((hash, true));
 				let mut deps = imports(entry.node)?;
 				if let Some(proof) = entry.proof {
 					deps.extend(proof_imports(proof)?);
 				}
 				for import in deps {
-					if !loader.is_loaded(&import) {
-						// An import cycle can't happen (a node's hash covers its imports'), but
-						// a node revisited here would mean one: refuse rather than loop.
-						if stack.iter().any(|(h, done)| *h == import && *done) {
-							return None;
-						}
-						stack.push((import, false));
+					if loader.is_loaded(&import) || (entry.trusted && !entries.contains_key(&import)) {
+						continue;
 					}
+					// An import cycle can't happen (a node's hash covers its imports'), but a node
+					// revisited here would mean one: refuse rather than loop.
+					if stack.iter().any(|(h, done)| *h == import && *done) {
+						return None;
+					}
+					stack.push((import, false));
 				}
 			}
 		}
 	}
-	let nodes = loader.finish();
+	let nodes = loader.finish().ok()?;
 	for (i, node) in nodes.nodes.iter().enumerate() {
 		let entry = &entries[&node.hash];
 		if !entry.trusted {

@@ -169,15 +169,40 @@ fn the_kernel_builtins_must_be_pinned() {
 }
 
 #[test]
-fn nodes_load_only_after_their_imports() {
+fn checked_nodes_need_their_imports() {
 	let two = pack!("two");
 	let solver = two.with_proofs(&[two.goal()]);
-	for skip in 0..two.env().len() {
-		let mut env = two.env().to_vec();
-		env.remove(skip);
-		// Every node of the closure is imported by something, so dropping any one breaks it.
-		assert!(!reveal(two.goal(), &two.pins(), &env, &solver), "without node {skip}");
+	let imported: Vec<Hash> = imports(two.goal()).unwrap();
+	for skip in two.env().iter().filter(|n| imported.contains(&blake2b256(n))) {
+		let env: Vec<&[u8]> = two.env().iter().copied().filter(|n| n != skip).collect();
+		assert!(!reveal(two.goal(), &two.pins(), &env, &solver), "without one of the goal's imports");
 	}
+	// Trusted nodes needn't come with their own imports: only what the kernel touches.
+	assert!(reveal(two.goal(), &two.pins(), two.env(), &solver));
+}
+
+#[test]
+fn trusted_nodes_are_read_only_against_their_imports() {
+	let f = pack!("f");
+	let redefine = pack!("redefine");
+	let hashes = |p: &Pack| p.nodes.iter().map(|n| blake2b256(n)).collect::<Vec<_>>();
+	let (f_hashes, redefine_hashes) = (hashes(&f), hashes(&redefine));
+	let node = |p: &Pack, h: &Hash| *p.nodes.iter().find(|n| blake2b256(n) == *h).unwrap();
+	// GoalF mentions myF; each pack has its own myF, the one its GoalF imports.
+	let goal_f = node(&f, &imports(f.goal()).unwrap()[0]);
+	let their_goal_f = node(&redefine, &imports(redefine.goal()).unwrap()[0]);
+	let my_f = imports(goal_f).unwrap().into_iter().find(|h| !redefine_hashes.contains(h)).unwrap();
+	let their_my_f = imports(their_goal_f).unwrap().into_iter().find(|h| !f_hashes.contains(h)).unwrap();
+	let load = |nodes: &[&[u8]]| {
+		let mut loader = NodeLoader::new(&[]);
+		for n in nodes {
+			loader.add(blake2b256(n), n, None, true).unwrap();
+		}
+		loader.finish().is_ok()
+	};
+	assert!(load(&[goal_f, node(&f, &my_f)]), "GoalF with its own myF");
+	assert!(load(&[goal_f]), "GoalF without myF: nothing to misread");
+	assert!(!load(&[goal_f, node(&redefine, &their_my_f)]), "GoalF with another myF");
 }
 
 #[test]

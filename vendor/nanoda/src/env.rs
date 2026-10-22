@@ -271,6 +271,8 @@ impl<'x, 'a: 'x> Env<'x, 'a> {
     pub fn get_old_declar(&self, n: &NamePtr<'a>) -> Option<&Declar<'a>> { 
         let (idx, _, v) = self.declars.get_full(n)?;
         if idx < self.cutoff {
+            #[cfg(feature = "trace")]
+            crate::nodes::trace::record(idx);
             Some(v)
         } else {
             None

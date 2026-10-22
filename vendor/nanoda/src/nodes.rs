@@ -8,9 +8,16 @@
 //! A [`NodeLoader`] reads nodes into one environment. It must be given each node after its
 //! imports, and checks, as it goes, what makes a node mean the same thing wherever it's loaded:
 //!
-//! - every import has been loaded, and every constant the node (or its proof) mentions is declared
-//!   by the node itself or by one of its imports. A node's hash covers its imports' hashes, so it
-//!   pins everything it mentions, recursively;
+//! - for a node to be checked: every import has been loaded, and every constant the node (or its
+//!   proof) mentions is declared by the node itself or by one of its imports. A node's hash covers
+//!   its imports' hashes, so it pins everything it mentions, recursively;
+//! - for a *trusted* node (one already checked, whose declarations are only used): its imports
+//!   needn't be loaded, but any constant it mentions that is loaded must be declared by one of its
+//!   imports ([`NodeLoader::finish`] checks that, once everything is loaded). So a trusted node is
+//!   never read against another declaration of a name it uses, and leaving its imports out only
+//!   leaves the kernel less to look up: a lookup that finds nothing fails the check, it never
+//!   passes it. A check then loads only the trusted nodes the kernel touches, not their imports'
+//!   closure;
 //! - a name is declared once: two nodes declaring the same name can't be loaded together;
 //! - the names the kernel treats specially ([`PINNED_NAMES`]: `Nat.add` and the like, which it
 //!   computes with natively, and the permitted axioms) are declared only by nodes whose hashes the
@@ -66,6 +73,8 @@ pub struct NodeLoader<'p> {
     declared_by: FxHashMap<NamePtr<'p>, Hash>,
     nodes: Vec<LoadedNode>,
     index: FxHashMap<Hash, usize>,
+    /// Trusted nodes' names, imports and mentions, to check once everything is loaded.
+    deferred: Vec<(Vec<NamePtr<'p>>, Vec<Hash>, Vec<NamePtr<'p>>)>,
 }
 
 /// Nodes read into one environment, ready to check.
@@ -117,11 +126,24 @@ impl<'p> NodeLoader<'p> {
             declared_by: new_fx_hash_map(),
             nodes: Vec::new(),
             index: new_fx_hash_map(),
+            deferred: Vec::new(),
         }
     }
 
     pub fn is_loaded(&self, hash: &Hash) -> bool {
         self.index.contains_key(hash)
+    }
+
+    /// The constants `exprs` mention.
+    fn mentions(&self, exprs: &[u32]) -> Vec<NamePtr<'p>> {
+        exprs
+            .iter()
+            .filter_map(|&e| match self.parser.dag.exprs.get_index(e as usize) {
+                Some(Expr::Const { name, .. }) => Some(*name),
+                Some(Expr::Proj { ty_name, .. }) => Some(*ty_name),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Check that the constants `exprs` mention are declared by `own` names or by `imports`, all
@@ -130,12 +152,7 @@ impl<'p> NodeLoader<'p> {
         if let Some(missing) = imports.iter().find(|h| !self.is_loaded(h)) {
             return Err(format!("import {missing:02x?} is not loaded (before the node importing it)").into());
         }
-        for &e in exprs {
-            let name = match self.parser.dag.exprs.get_index(e as usize) {
-                Some(Expr::Const { name, .. }) => *name,
-                Some(Expr::Proj { ty_name, .. }) => *ty_name,
-                _ => continue,
-            };
+        for name in self.mentions(exprs) {
             let imported = self.declared_by.get(&name).is_some_and(|h| imports.contains(h));
             if !own.contains(&name) && !imported {
                 return Err(format!("{} is mentioned but not imported", self.parser.name_to_string(name)).into());
@@ -145,8 +162,9 @@ impl<'p> NodeLoader<'p> {
     }
 
     /// Load node `node` with hash `hash` (the caller has checked it, or computed it), and the
-    /// statement's proof if it is a theorem and `proof` is given. Returns its index.
-    pub fn add(&mut self, hash: Hash, node: &[u8], proof: Option<&[u8]>) -> Result<usize, Box<dyn Error>> {
+    /// statement's proof if it is a theorem and `proof` is given. A `trusted` node's imports
+    /// needn't be loaded (see the module docs). Returns its index.
+    pub fn add(&mut self, hash: Hash, node: &[u8], proof: Option<&[u8]>, trusted: bool) -> Result<usize, Box<dyn Error>> {
         if self.is_loaded(&hash) {
             return Err("node loaded twice".into());
         }
@@ -167,7 +185,14 @@ impl<'p> NodeLoader<'p> {
         if own.is_empty() {
             return Err("node declares nothing".into());
         }
-        self.check_mentions(&exprs, &own, &node.imports)?;
+        if trusted {
+            if proof.is_some() {
+                return Err("a proof for a trusted node".into());
+            }
+            self.deferred.push((own.clone(), node.imports.clone(), self.mentions(&exprs)));
+        } else {
+            self.check_mentions(&exprs, &own, &node.imports)?;
+        }
 
         let theorem = statement.is_some();
         let assumed = theorem && proof.is_none();
@@ -209,8 +234,18 @@ impl<'p> NodeLoader<'p> {
         Ok(i)
     }
 
-    pub fn finish(self) -> Nodes<'p> {
-        Nodes { file: crate::parser::finish(self.parser), nodes: self.nodes, index: self.index }
+    /// Check that every constant a trusted node mentions, if it is loaded, is declared by one of
+    /// its imports, and build the environment.
+    pub fn finish(self) -> Result<Nodes<'p>, Box<dyn Error>> {
+        for (own, imports, mentions) in &self.deferred {
+            for name in mentions {
+                let elsewhere = self.declared_by.get(name).is_some_and(|h| !imports.contains(h));
+                if !own.contains(name) && elsewhere {
+                    return Err(format!("{} is loaded, but not from the node a trusted node imports", self.parser.name_to_string(*name)).into());
+                }
+            }
+        }
+        Ok(Nodes { file: crate::parser::finish(self.parser), nodes: self.nodes, index: self.index })
     }
 }
 
@@ -265,5 +300,39 @@ impl<'p> Nodes<'p> {
                 _ => Err("the theorem does not have the statement as its type".into()),
             }
         })
+    }
+}
+
+/// Which declarations the kernel looks up, by index into the export file's declarations, for
+/// planning what a check needs to trust.
+#[cfg(feature = "trace")]
+pub mod trace {
+    use std::{
+        collections::BTreeSet,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static LOOKUPS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+    pub(crate) fn record(declar: usize) {
+        if ON.load(Ordering::Relaxed) {
+            LOOKUPS.lock().unwrap().insert(declar);
+        }
+    }
+
+    /// Start recording.
+    pub fn start() {
+        LOOKUPS.lock().unwrap().clear();
+        ON.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop recording, and return what was looked up.
+    pub fn stop() -> BTreeSet<usize> {
+        ON.store(false, Ordering::Relaxed);
+        core::mem::take(&mut *LOOKUPS.lock().unwrap())
     }
 }
