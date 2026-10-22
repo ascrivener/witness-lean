@@ -77,8 +77,25 @@ expect() {
 }
 item() { [ -n "$1" ] || fail "no payload"; "$JAMT" item "$SVC" "$1" >/dev/null; wait_slot $(( $(slot) + 1 )); }
 # Provide preimages, then wait until refine can look them up. Big ones take a few slots to land,
-# and refine reads the chain as of an anchor that trails the best block.
-provide() { for f in "$@"; do "$JAMT" provide "$SVC" "$f" >/dev/null; done; wait_slot $(( $(slot) + 6 )); }
+# and refine reads the chain as of an anchor that trails the best block. The testnet sometimes
+# drops a provide that jamt reports as done, so check each one landed, and provide it again if not.
+provide() {
+	for f in "$@"; do "$JAMT" provide "$SVC" "$f" >/dev/null; done
+	if [ -z "${WITNESS_SIM:-}" ]; then
+		for f in "$@"; do
+			local h; h=$($W hash --check "$f")
+			for attempt in 1 2 3 4 5; do
+				"$JAMT" inspect preimage "$SVC" "$h" >/dev/null 2>&1 && break
+				[ $attempt = 5 ] && fail "preimage $(basename "$f") never landed"
+				wait_slot $(( $(slot) + 3 ))
+				"$JAMT" inspect preimage "$SVC" "$h" >/dev/null 2>&1 && break
+				echo "providing $(basename "$f") again"
+				"$JAMT" provide "$SVC" "$f" >/dev/null
+			done
+		done
+	fi
+	wait_slot $(( $(slot) + 6 ))
+}
 join() { local IFS=,; echo "$*"; }
 
 # Account nonces, so the script can send each account's signed ops in turn.
