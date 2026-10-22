@@ -79,36 +79,34 @@ WITNESS_DIR=../witness LEAN4EXPORT=../lean4export/.lake/build/bin/lean4export \
 
 ## Numbers
 
-Each attestation and the reveal must fit one refine, including parsing every layer before it.
-`tools/lean-host` runs the check natively and times it: on PolkaJam v0.1.29 a native millisecond
-costs about 29 M gas.
+Each attestation and the reveal must fit one refine. `tools/lean-host` runs the check natively
+and times it (on PolkaJam v0.1.29 a native millisecond costs about 29 M gas), and
+`scripts/lean-e2e.sh` with `WITNESS_SIM=1` runs the whole flow against witness's simulator, which
+charges checks the gas PolkaJam does.
 
-**gcd a b = gcd b a** (Lean core). Checked in one refine it needs about 1.4×10⁹ gas, more than
-PolkaJam's tiny 10⁹ limit. In layers:
+**gcd a b = gcd b a** (Lean core): 437 nodes in 33 batches over 33 depths. The heaviest
+attestation uses 1.9×10⁸ gas, so it fits PolkaJam's tiny 10⁹ limit.
 
-| Step | Gas |
-|---|---|
-| Attest the statement environment (52 KB) | 522 M |
-| Attest the solver's first library layer (26 KB) | 373 M |
-| Attest the second (25 KB) | 326 M |
-| Reveal the last layer (24 KB), all else trusted | 399 M |
+**There are infinitely many primes** (`Nat.exists_infinite_primes`, Mathlib): 2,942 nodes
+(1.8 MB of statements, 2.3 MB of proofs) in 112 batches over 73 depths, then the reveal.
 
-**There are infinitely many primes** (`Nat.exists_infinite_primes`, Mathlib). The proof's
-dependency closure is 2,945 declarations, 1.5 MB in the binary format, cut into 66 layers: 3 for
-the statement environment and 63 for the proof. On a testnet with the full spec's 5×10⁹ refine
-limit, the heaviest attestation used 1.9×10⁹ gas, the median about 8×10⁸, and the reveal 1.1×10⁹.
-The run takes about 40 minutes, two slots per signed op. It doesn't fit the tiny 10⁹ limit: the
-last layers spend about 1.5×10⁹ gas just parsing the 1.5 MB before them.
+| | Content-addressed | The positional format before it |
+|---|---|---|
+| Attestations | 112 batches, 73 rounds | 66 layers, one after another |
+| Heaviest attestation | 1.25×10⁹ gas | 1.9×10⁹ gas |
+| Median attestation | 2.9×10⁸ gas | 8×10⁸ gas |
+| Reveal | 7.8×10⁷ gas | 1.1×10⁹ gas |
+
+The reveal loads only the 220 statements the theorem needs. The heaviest batch trusts 796 nodes
+(412 KB) from 76 earlier batches. Batches of one depth are independent, so with enough cores the
+library attests in 73 rounds.
 
 ## Limits and next steps
 
-Parsing the chain is the limit of this format. A refine of at most 4.5×10⁹ gas can parse about
-4 MB of chain, roughly 8,000 declarations, whatever the layer sizes; theorem proofs are about
-two thirds of that. Mathlib is perhaps 50 times bigger.
-
-The plan is a content-addressed format: each declaration names the declarations it uses by hash,
-an attestation covers a batch of declarations given the attested statements they use, and a
-refine loads only those statements. Attestations then form a DAG, so independent lemmas attest in
-parallel, on different cores. Measured on the infinite-primes closure (3,321 declarations), the
-statements a declaration needs, closed over the definitions it might unfold, are a median of 41
-declarations (31 KB of NDJSON) and at most 684 (1.1 MB), and the dependency DAG is 75 deep.
+- **Ops are capped at about 64 KB** while they travel as a hex command-line argument to `jamt
+  item` (Linux caps one argument at 128 KiB), so a batch's proofs are kept under 36 KB.
+- **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
+  and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
+  them; a bounty must cite a node attested under the same pins (see How it works).
+- **Next:** FLT for n = 4 (8,328 declarations), which the positional format couldn't fit at all,
+  then batches attested in parallel.
