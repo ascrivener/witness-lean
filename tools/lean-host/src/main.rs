@@ -237,6 +237,21 @@ impl<'d> Tracer<'d> {
 	}
 }
 
+/// Write the arguments the check gets for batch `n` of `plan`, for running it in PolkaVM with
+/// witness's `witness-sim check` to measure its gas.
+fn write_args(dir: &Dir, plan: &str, n: usize, out: &str) {
+	let plan: Vec<Value> = serde_json::from_slice(&std::fs::read(plan).expect("plan")).expect("JSON");
+	let hashes = |k: &str| plan[n][k].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect::<Vec<_>>();
+	let (trusted, subjects) = (hashes("trusted"), hashes("subjects"));
+	let blobs: Vec<(bool, Vec<u8>)> =
+		trusted.iter().map(|h| (true, dir.node(h))).chain(subjects.iter().map(|h| (false, dir.node(h)))).collect();
+	let proofs: Vec<Vec<u8>> = subjects.iter().filter_map(|h| dir.proof(h)).collect();
+	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+	let check_blobs: Vec<CheckBlob> =
+		blobs.iter().zip(&hashes).map(|((trusted, data), h)| CheckBlob { trusted: *trusted, hash: *h, data }).collect();
+	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &dir.pins().concat(), &encode(&proofs))).unwrap();
+}
+
 fn main() {
 	// Type errors panic, which counts as false, as on the PVM.
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
@@ -244,6 +259,14 @@ fn main() {
 	match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
 		["nodes", dir] => nodes(&Dir::open(dir)),
 		["plan", dir, p] => plan(&Dir::open(dir), p),
+		["run", args] => {
+			let args = std::fs::read(args).expect("arguments");
+			let input = witness_check::Input::parse(&args).expect("well-formed arguments");
+			let start = Instant::now();
+			let ok = std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false);
+			println!("{ok} in {:?}", start.elapsed());
+		},
+		["args", dir, p, n, out] => write_args(&Dir::open(dir), p, n.parse().expect("batch number"), out),
 		["trace", dir, p, out] => trace(&Dir::open(dir), p, out, Duration::from_millis(100)),
 		["trace", dir, p, out, ms] => trace(&Dir::open(dir), p, out, Duration::from_millis(ms.parse().expect("milliseconds"))),
 		_ => {
