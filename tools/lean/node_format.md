@@ -23,6 +23,12 @@ node := "LEANNOD\x01" ++ u(n) ++ import^n ++ item*
   declaration. Indices are local: names count from 1 (0 is anonymous), levels from 1 (0 is
   zero), expressions from 0, each in the order the node lists them. So a node holds every name,
   level and expression it uses, and means the same thing wherever it's loaded.
+- **Canonical form:** each table lists its entries in the order a depth-first walk from the
+  declaration first finishes them (an expression after its children, function before argument;
+  a name after its prefix). Binders are anonymous, with default binder info, and lets have
+  `nondep` false: the kernel ignores these, and lean4export shares expressions up to them, so
+  which ones an export keeps depends on what else it exports. In this form a declaration's node,
+  and so its hash, is the same whichever export it came from.
 - A theorem's node ends with a **statement** item instead of a declaration (tag 23: name `u32`,
   level params `[u32]`, type `u32`).
 
