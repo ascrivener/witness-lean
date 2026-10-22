@@ -8,6 +8,7 @@
 //!
 //! - **Attest mode:** the subjects are a batch of nodes, the trusted blobs are attested nodes
 //!   holding everything the batch imports (recursively), and the witness is the batch's proofs.
+//!   A batch whose proofs would make the op too big may carry them among its subjects instead.
 //!   Params are the pins: the hashes of the nodes allowed to declare `Nat`, `Nat.add`, the
 //!   permitted axioms and the like, 32 bytes each. Every subject is type-checked, each theorem
 //!   with its proof. A library is attested this way in batches, each once.
@@ -176,14 +177,20 @@ fn attest(input: &Input) -> Option<()> {
 	let pins = pins(input.params)?;
 	let mut entries = BTreeMap::new();
 	let mut subjects = 0;
+	let mut proofs = parse_witness(input.witness)?;
 	for blob in input.blobs() {
+		// A batch too big for an op carries its proofs among its subjects instead.
+		if !blob.trusted && blob.data.starts_with(PROOF_MAGIC) {
+			proofs.push(blob.data);
+			continue;
+		}
 		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
 		subjects += usize::from(!blob.trusted);
 	}
 	if subjects == 0 {
 		return None;
 	}
-	attach(&mut entries, &parse_witness(input.witness)?)?;
+	attach(&mut entries, &proofs)?;
 	load_and_check(&pins, &entries).map(|_| ())
 }
 
