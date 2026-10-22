@@ -64,7 +64,12 @@ slot() { "$JAMT" inspect slot; }
 wait_slot() { while [ "$(slot)" -lt "$1" ]; do sleep $POLL; done; }
 storage() {
 	local v
-	v=$("$JAMT" inspect storage --raw "$SVC" "$($W key "$@")" 2>/dev/null || true)
+	# jamt cuts values over 1 KiB short; witness-sim doesn't.
+	if [ "${JAM_RPC:-}" = sim ]; then
+		v=$("$JAMT" inspect storage --raw "$SVC" "$($W key "$@")" 2>/dev/null || true)
+	else
+		v=$(python3 "$WITNESS_DIR/scripts/jam-storage.py" "$SVC" "$($W key "$@")" 2>/dev/null || true)
+	fi
 	case $v in 0x*) echo "$v" ;; *) echo "" ;; esac
 }
 show() {

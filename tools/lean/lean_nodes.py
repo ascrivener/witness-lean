@@ -65,40 +65,53 @@ class Export:
 
 
 class Closure:
-    """The names, levels and expressions some roots reach, and the constants they mention."""
+    """The names, levels and expressions some roots reach, and the constants they mention.
+
+    Each table lists its entries in the order a depth-first walk from the roots first finishes
+    them (an entry after everything it uses), so a node's bytes depend only on its declaration,
+    not on where it sat in the export."""
 
     def __init__(self, ex):
         self.ex = ex
-        self.names, self.levels, self.exprs = set(), set(), set()
+        self.names, self.levels, self.exprs = {}, {}, {}  # export index -> None, in order
         self.consts = set()  # name indices of constants mentioned
 
     def name(self, i):
+        chain = []
         while i and i not in self.names:
-            self.names.add(i)
+            chain.append(i)
             i = body(self.ex.names[i])[1]["pre"]
+        for i in reversed(chain):
+            self.names[i] = None
 
     def level(self, i):
-        stack = [i]
+        stack = [(i, False)]
         while stack:
-            i = stack.pop()
+            i, done = stack.pop()
             if i == 0 or i in self.levels:
                 continue
-            self.levels.add(i)
+            if done:
+                self.levels[i] = None
+                continue
+            stack.append((i, True))
             k, v = body(self.ex.levels[i])
             if k == "succ":
-                stack.append(v)
+                stack.append((v, False))
             elif k in ("max", "imax"):
-                stack.extend(v)
+                stack += [(x, False) for x in reversed(v)]
             elif k == "param":
                 self.name(v)
 
     def expr(self, i):
-        stack = [i]
+        stack = [(i, False)]
         while stack:
-            i = stack.pop()
+            i, done = stack.pop()
             if i in self.exprs:
                 continue
-            self.exprs.add(i)
+            if done:
+                self.exprs[i] = None
+                continue
+            stack.append((i, True))
             k, v = body(self.ex.exprs[i])
             if k in ("bvar", "natVal", "strVal"):
                 continue
@@ -109,13 +122,13 @@ class Closure:
                 for u in v["us"]:
                     self.level(u)
             elif k == "app":
-                stack += [v["fn"], v["arg"]]
+                stack += [(v["arg"], False), (v["fn"], False)]
             elif k in ("forallE", "lam"):
-                self.name(v["name"]); stack += [v["type"], v["body"]]
+                stack += [(v["body"], False), (v["type"], False)]
             elif k == "letE":
-                self.name(v["name"]); stack += [v["type"], v["value"], v["body"]]
+                stack += [(v["body"], False), (v["value"], False), (v["type"], False)]
             elif k == "proj":
-                self.name(v["typeName"]); self.consts.add(v["typeName"]); stack.append(v["struct"])
+                self.name(v["typeName"]); self.consts.add(v["typeName"]); stack.append((v["struct"], False))
             else:
                 raise ValueError(f"unknown expression {k}")
 
@@ -123,8 +136,7 @@ class Closure:
         self.name(d["name"])
         for p in d["levelParams"]:
             self.name(p)
-            # lean4export exports each universe parameter's level before the declaration.
-            self.levels.add(self.param_level(p))
+            self.level(self.param_level(p))
         self.expr(d["type"])
 
     def param_level(self, name):
@@ -134,7 +146,9 @@ class Closure:
 
 
 def remap(item, names, levels, exprs):
-    """`item` with every index replaced by its local one."""
+    """`item` with every index replaced by its local one. Binders lose their names and
+    annotations (and lets their nondep flag): the kernel ignores them, and lean4export shares
+    expressions up to them, so which ones an export keeps depends on what else it exports."""
     k, v = body(item)
     n, l, e = names.__getitem__, levels.__getitem__, exprs.__getitem__
     ns = lambda xs: [n(x) for x in xs]
@@ -157,9 +171,9 @@ def remap(item, names, levels, exprs):
     if k == "app":
         return {k: {"fn": e(v["fn"]), "arg": e(v["arg"])}}
     if k in ("forallE", "lam"):
-        return {k: {"name": n(v["name"]), "type": e(v["type"]), "body": e(v["body"]), "binderInfo": v["binderInfo"]}}
+        return {k: {"name": 0, "type": e(v["type"]), "body": e(v["body"]), "binderInfo": "default"}}
     if k == "letE":
-        return {k: {"name": n(v["name"]), "type": e(v["type"]), "value": e(v["value"]), "body": e(v["body"]), "nondep": v["nondep"]}}
+        return {k: {"name": 0, "type": e(v["type"]), "value": e(v["value"]), "body": e(v["body"]), "nondep": False}}
     if k == "proj":
         return {k: {"typeName": n(v["typeName"]), "idx": v["idx"], "struct": e(v["struct"])}}
     if k == "inductive":
@@ -186,23 +200,22 @@ def remap(item, names, levels, exprs):
 
 
 def tables(ex, closure):
-    """Local numbering and the items defining it, in an order where each comes after what it
-    uses. Export indices already have that order."""
+    """Local numbering and the items defining it, in the closure's order."""
     names = {0: 0}
     levels = {0: 0}
     exprs = {}
-    for i in sorted(closure.names):
+    for i in closure.names:
         names[i] = len(names)
-    for i in sorted(closure.levels):
+    for i in closure.levels:
         levels[i] = len(levels)
-    for i in sorted(closure.exprs):
+    for i in closure.exprs:
         exprs[i] = len(exprs)
     lines = []
-    for i in sorted(closure.names):
+    for i in closure.names:
         lines.append(dict(remap(ex.names[i], names, levels, exprs), **{"in": names[i]}))
-    for i in sorted(closure.levels):
+    for i in closure.levels:
         lines.append(dict(remap(ex.levels[i], names, levels, exprs), **{"il": levels[i]}))
-    for i in sorted(closure.exprs):
+    for i in closure.exprs:
         lines.append(dict(remap(ex.exprs[i], names, levels, exprs), **{"ie": exprs[i]}))
     return names, levels, exprs, lines
 
@@ -289,7 +302,7 @@ def convert(ex):
             pc = Closure(ex)
             pc.expr(v["value"])
             for p in v["levelParams"]:
-                pc.name(p); pc.levels.add(pc.param_level(p))
+                pc.name(p); pc.level(pc.param_level(p))
             # A proof can't mention its own theorem, so everything it mentions is imported.
             proof_imports = imports_of(pc, set())
             pnames, plevels, pexprs, plines = tables(ex, pc)
