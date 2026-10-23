@@ -180,16 +180,21 @@ step "building and deploying"
 cargo jam-build --out-dir out >/dev/null
 cp out/lean-check.jam "$CHECK"
 before=$("$JAMT" list | wc -l)
-"$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 >/dev/null
+# The memo gas is witness_types::DEPOSIT_GAS, what a deposit into witness must carry.
+"$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 --min-memo-gas 300000 >/dev/null
 for _ in $(seq 1 40); do [ "$("$JAMT" list | wc -l)" -gt "$before" ] && break; sleep $POLL; done
 SVC=$((16#$("$JAMT" list | tail -1 | cut -f1)))
 echo "service $SVC"
 for _ in $(seq 1 40); do "$JAMT" inspect final service "$SVC" >/dev/null 2>&1 && break; sleep $POLL; done
 wait_slot $(( $(slot) + 3 ))
+# The first configuration, by the test build's admin, applies at once: deposits in the faucet's
+# test asset.
+item "$($W propose --service "$SVC" --nonce 0 --fee-asset test --commit-deposit 10 --attest-deposit 10)"
+expect "witness configured" 'fee_asset: Some' config --config
 
 step "a library attester attests the library: $BATCHES batches"
 for who in alice pat bob; do item "$($W mint --to $who --amount 1000000)"; done
-expect "pat has points" 'balance: 1000000' account --account pat
+expect "pat has the test asset" '^1000000$' balance --balance pat --asset test
 for ((n = 0; n < BATCHES; n++)); do
 	take pat
 	trust=$(cat "$W_DIR/batch-$n.trust")
