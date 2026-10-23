@@ -139,17 +139,34 @@ python3 tools/lean/lean_nodes.py "$TMP/full.ndjson" "$TMP/nodes"
 # (lean-host trace, at TRACE_MS native milliseconds a batch).
 plan() {
 	python3 tools/lean/lean_plan.py "$TMP/nodes" --goal "$THEOREM" >"$TMP/plan.json"
-	./target/release/lean-host trace "$TMP/nodes" "$TMP/plan.json" "$TMP/plan-traced.json" "${TRACE_MS:-100}" \
+	[ -n "${TRACE_MS:-}" ] || calibrate
+	./target/release/lean-host trace "$TMP/nodes" "$TMP/plan.json" "$TMP/plan-traced.json" "$TRACE_MS" \
 		| tee "$TMP/trace.log"
 	mv "$TMP/plan-traced.json" "$TMP/plan.json"
 }
+# A batch may use TRACE_GAS (by default about what 100 ms was where these budgets were first set),
+# and a theorem split off a proof STMT_GAS to check its statement (lean_split.py --stmt-ms). Both
+# are budgeted in native time, so turn them into milliseconds on this machine: gas_per_ms.py
+# checks a few batches natively and in witness-sim. TRACE_MS and STMT_MS set the times directly.
+calibrate() {
+	local rate
+	rate=$(python3 tools/lean/gas_per_ms.py ./target/release/lean-host "$WITNESS_DIR/target/release/witness-sim" \
+		"$CHECK" "$TMP/nodes" "$TMP/plan.json")
+	TRACE_MS=$(( ${TRACE_GAS:-2900000000} / rate ))
+	STMT_MS=${STMT_MS:-$(( (${STMT_GAS:-290000000} + rate - 1) / rate ))}
+	echo "$(( rate / 1000000 ))M gas per native ms: batches up to $TRACE_MS ms, split-off statements up to $STMT_MS ms"
+}
 cargo build -q --release -p lean-host
+cargo jam-build --out-dir out >/dev/null
+cp out/lean-check.jam "$CHECK"
+(cd "$WITNESS_DIR" && cargo build -q --release -p witness-sim)
 plan
 # A theorem slower than that on its own: split its proof into smaller theorems where that helps
 # (lean_split.py), and plan again.
 mapfile -t OVER < <(sed -n 's/^over [^:]*: //p' "$TMP/trace.log")
 if [ ${#OVER[@]} -gt 0 ]; then
-	SPLIT=$(LEAN4EXPORT=$LEAN4EXPORT python3 tools/lean/lean_split.py "$PROJECT" "$SOLUTION_MODULE" "$TMP/nodes" "${OVER[@]}")
+	SPLIT=$(LEAN4EXPORT=$LEAN4EXPORT python3 tools/lean/lean_split.py "$PROJECT" "$SOLUTION_MODULE" "$TMP/nodes" "${OVER[@]}" \
+		--stmt-ms "${STMT_MS:-10}")
 	if [ -n "$SPLIT" ]; then
 		echo "split: $SPLIT" | tr '\n' ' '; echo
 		plan
@@ -162,7 +179,6 @@ GOAL=$(cat "$W_DIR/goal.hash")
 
 if [ -n "${WITNESS_SIM:-}" ]; then
 	step "using witness-sim (state: $TMP/sim)"
-	(cd "$WITNESS_DIR" && cargo build -q --release -p witness-sim)
 	JAMT=$WITNESS_DIR/target/release/witness-sim POLL=0 JAM_RPC=sim
 	submit() { "$JAMT" item "$@"; }
 	export WITNESS_SIM_DIR=$TMP/sim
@@ -177,8 +193,6 @@ fi
 
 step "building and deploying"
 (cd "$WITNESS_DIR" && cargo build -q -p witness-cli && cargo jam-build --out-dir out -p witness-service >/dev/null)
-cargo jam-build --out-dir out >/dev/null
-cp out/lean-check.jam "$CHECK"
 before=$("$JAMT" list | wc -l)
 # The memo gas is witness_types::DEPOSIT_GAS, what a deposit into witness must carry.
 "$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 --min-memo-gas 300000 >/dev/null
