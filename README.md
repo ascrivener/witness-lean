@@ -80,9 +80,10 @@ WITNESS_DIR=../witness LEAN4EXPORT=../lean4export/.lake/build/bin/lean4export \
 ## Numbers
 
 Each attestation and the reveal must fit one refine. `tools/lean-host` runs the check natively
-and times it (on PolkaJam v0.1.29 a native millisecond costs about 29 M gas), and
-`scripts/lean-e2e.sh` with `WITNESS_SIM=1` runs the whole flow against witness's simulator, which
-charges checks the gas PolkaJam does.
+and times it. What a native millisecond costs in PolkaJam v0.1.29's gas depends on the machine
+(about 29 M on one, 77 M on an M3), so `scripts/lean-e2e.sh` measures it first
+(`tools/lean/gas_per_ms.py`) and budgets batches in gas. With `WITNESS_SIM=1` it runs the whole
+flow against witness's simulator, which charges checks the gas PolkaJam does.
 
 **gcd a b = gcd b a** (Lean core): 437 nodes in 33 batches over 33 depths. The heaviest
 attestation uses 1.9×10⁸ gas, so it fits PolkaJam's tiny 10⁹ limit. It runs end to end on a local

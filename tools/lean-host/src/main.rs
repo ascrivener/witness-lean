@@ -16,8 +16,9 @@
 //!                                  split where a batch takes longer than MS (default 100); print
 //!                                  `over T: NAME` for each declaration that alone takes longer
 //!
-//! DIR is a `lean_nodes.py` output directory. A native millisecond costs about 29M gas in
-//! PolkaJam v0.1.29's recompiler, so a batch should stay well under 150 ms to fit a refine.
+//! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
+//! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
+//! milliseconds come from gas budgets measured there (`tools/lean/gas_per_ms.py`).
 
 mod convert;
 mod pack;
