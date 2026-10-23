@@ -85,7 +85,8 @@ and times it (on PolkaJam v0.1.29 a native millisecond costs about 29 M gas), an
 charges checks the gas PolkaJam does.
 
 **gcd a b = gcd b a** (Lean core): 437 nodes in 33 batches over 33 depths. The heaviest
-attestation uses 1.9×10⁸ gas, so it fits PolkaJam's tiny 10⁹ limit.
+attestation uses 1.9×10⁸ gas, so it fits PolkaJam's tiny 10⁹ limit. It runs end to end on a local
+PolkaJam v0.1.29 testnet with every blob carried as an extrinsic, so the chain holds only records.
 
 **There are infinitely many primes** (`Nat.exists_infinite_primes`, Mathlib): 2,942 nodes
 (1.8 MB of statements, 2.3 MB of proofs) in 112 batches over 73 depths, then the reveal.
@@ -104,9 +105,8 @@ library attests in 73 rounds.
 **x⁴ + y⁴ ≠ z⁴** (`fermatLastTheoremFour`, Mathlib), which the positional format couldn't fit at
 all (its last layers alone would parse 4.6 MB): 7,579 nodes (5.5 MB of statements, 7.7 MB of
 proofs) in 269 batches over 90 depths. The heaviest attestation uses 2.6×10⁹ gas, the median
-4.7×10⁸, and the reveal 2.6×10⁸; 1.4×10¹¹ in all. Eight batches, with proofs of up to 45 KB and
-up to 168 earlier batches cited, would make ops too big for `jamt item`, so they carry their
-proofs in their bundles. Against witness's simulator the whole flow takes under three minutes.
+4.7×10⁸, and the reveal 2.6×10⁸; 1.4×10¹¹ in all. Against witness's simulator the whole flow
+takes under three minutes.
 
 **The fundamental theorem of algebra** (`Complex.exists_root`, Mathlib): 46,201 nodes (52 MB of
 statements, 81 MB of proofs) in 2,584 batches over 294 depths. A batch trusts only the nodes the
@@ -118,9 +118,11 @@ more gas to check than a refine has (about 6.5×10⁹), and everything downstrea
 
 ## Limits and next steps
 
-- **Ops are capped at about 64 KB** while they travel as a hex command-line argument to `jamt
-  item` (Linux caps one argument at 128 KiB), so a batch's proofs are kept under 36 KB, and a
-  batch whose op would still be too big carries its proofs in its bundle, stored on chain.
+- **Blobs travel with the ops, as extrinsics.** Every attest and reveal carries the check, its
+  batch's nodes and the nodes it trusts (each with a Merkle path into its attestation), so the
+  chain holds only records: no node is stored on chain. A package carries at most about 13.8 MB;
+  Mathlib's batches trust at most about 3 MB. A batch's proofs, the check's witness, are capped
+  at witness's 64 KiB `MAX_WITNESS_LEN`; a batch with more carries them among its subjects.
 - **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
   and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
   them; a bounty must cite a node attested under the same pins (see How it works).

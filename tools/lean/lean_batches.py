@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Lay out a lean_plan.py plan as files for attesting with the witness CLI.
 
-    lean_batches.py DIR PLAN WORK [MAX_OP_BYTES]
+    lean_batches.py DIR PLAN WORK [MAX_WITNESS_BYTES]
 
 For each batch N, in WORK: batch-N.subjects (comma-separated paths of its nodes, for `witness
-bundle`), batch-N.trust (comma-separated CLAIM:ENTRY references to the nodes it trusts, CLAIM
+attest --subjects`), batch-N.trust (comma-separated CLAIM:ENTRY references to the nodes it trusts, CLAIM
 being batch-M.claim, the claim file `witness attest --claim-out` writes for batch M) and
-batch-N.proofs (its proofs, packed as the check's witness). A batch whose op would pass
-MAX_OP_BYTES (default 60000: an op travels as a hex command-line argument to `jamt item`, which
-Linux caps at 128 KiB) carries its proofs among its subjects instead, and gets an empty witness.
+batch-N.proofs (its proofs, packed as the check's witness). A batch whose packed proofs would pass
+MAX_WITNESS_BYTES (default 60000, under witness's MAX_WITNESS_LEN of 64 KiB) carries its proofs
+among its subjects instead, and gets an empty witness.
 For a plan with a goal: goal.trust,
 goal.pack (the goal's node and proof, the reveal's witness), goal.hash (its hash, hex), and
 goal.cite (one CLAIM:ENTRY the bounty cites, to fix the pins: a node the goal imports). Also
@@ -31,7 +31,7 @@ PINNED = {
 }  # nanoda_lib::nodes::PINNED_NAMES
 
 
-def main(d, plan_path, work, max_op=60000):
+def main(d, plan_path, work, max_witness=60000):
     manifest = json.load(open(f"{d}/manifest.json"))
     by_hash = {e["hash"]: e for e in manifest}
     plan = json.load(open(plan_path))
@@ -59,11 +59,8 @@ def main(d, plan_path, work, max_op=60000):
             write("goal.cite", refs(by_hash[g]["imports"][:1]))
             continue
         proven = [h for h in b["subjects"] if "proof_size" in by_hash[h]]
-        cited = len({home[h][0] for h in b["trusted"]})
-        # Claims, trusted references and proofs, roughly as the op encodes them.
-        op = 200 + 132 * cited + 7 * len(b["trusted"]) + sum(by_hash[h]["proof_size"] + 3 for h in proven)
         subjects = [f"{d}/nodes/{h}" for h in b["subjects"]]
-        if op > max_op:
+        if len(pack([proof(h) for h in proven])) > max_witness:
             subjects += [f"{d}/proofs/{h}" for h in proven]
             proven = []
             bundled += 1
@@ -72,7 +69,7 @@ def main(d, plan_path, work, max_op=60000):
         write(f"batch-{n}.proofs", pack([proof(h) for h in proven]))
     write("pins", "".join(e["hash"] for e in manifest if PINNED & set(e["names"])))
     if bundled:
-        print(f"{bundled} batches carry their proofs in their bundles", file=sys.stderr)
+        print(f"{bundled} batches carry their proofs among their subjects", file=sys.stderr)
     print(sum("subjects" in b for b in plan))
 
 
