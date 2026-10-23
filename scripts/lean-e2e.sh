@@ -21,8 +21,10 @@
 # statement node by hash, and cites one attested node so every attestation a reveal uses shares
 # its pins. A theorem whose proof alone is too slow for a batch is split into smaller theorems
 # where that helps (lean_split.py; the statement, and so its hash, stays). The solver commits,
-# then reveals the theorem and its proof, trusting the attested nodes it needs. Every attest and the reveal must fit one refine; the node log (target witness)
-# shows the gas each used.
+# then reveals the theorem and its proof, trusting the attested nodes it needs. Every attest and
+# the reveal must fit one refine; the node log (target witness) shows the gas each used. Each op
+# carries the blobs it uses (the check, a batch's nodes, the trusted nodes) as extrinsics, so on a
+# testnet items go through witness's scripts/jam-submit.py, and the chain holds only records.
 #
 # WITNESS_DIR is a checkout of witness (at the commit Cargo.toml pins), for the service and its CLI.
 # Needs elan, and a lean4export built for the project's lean-toolchain. The primes project fetches
@@ -53,10 +55,14 @@ TESTNET=${POLKAJAM_DIR:+$POLKAJAM_DIR/}polkajam-testnet
 # Seconds between polls of the chain.
 POLL=2
 W=$WITNESS_DIR/target/debug/witness
+submit() { python3 "$WITNESS_DIR/scripts/jam-submit.py" "$@"; }
 TMP=$(mktemp -d)
 LOG=$TMP/testnet.log
 # This run's own copy of the check blob, so another run rebuilding out/ can't change it midway.
 CHECK=$TMP/lean-check.jam
+# Where the CLI writes an op's extrinsics, and where an op waits to be submitted: an op that
+# trusts many nodes, each with its Merkle path, can pass what one command-line argument may hold.
+X=$TMP/extrinsics OP=$TMP/op.hex
 
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -87,26 +93,13 @@ expect() {
 	done
 	fail "$what: wanted /$pattern/, got: $out"
 }
-item() { [ -n "$1" ] || fail "no payload"; "$JAMT" item "$SVC" "$1" >/dev/null; wait_slot $(( $(slot) + 1 )); }
-# Provide preimages, then wait until refine can look them up. Big ones take a few slots to land,
-# and refine reads the chain as of an anchor that trails the best block. The testnet sometimes
-# drops a provide that jamt reports as done, so check each one landed, and provide it again if not.
-provide() {
-	for f in "$@"; do "$JAMT" provide "$SVC" "$f" >/dev/null; done
-	if [ -z "${WITNESS_SIM:-}" ]; then
-		for f in "$@"; do
-			local h; h=$($W hash --check "$f")
-			for attempt in 1 2 3 4 5; do
-				"$JAMT" inspect preimage "$SVC" "$h" >/dev/null 2>&1 && break
-				[ $attempt = 5 ] && fail "preimage $(basename "$f") never landed"
-				wait_slot $(( $(slot) + 3 ))
-				"$JAMT" inspect preimage "$SVC" "$h" >/dev/null 2>&1 && break
-				echo "providing $(basename "$f") again"
-				"$JAMT" provide "$SVC" "$f" >/dev/null
-			done
-		done
-	fi
-	wait_slot $(( $(slot) + 6 ))
+# Submit PAYLOAD with the extrinsics the CLI last wrote, if any.
+item() {
+	[ -n "$1" ] || fail "no payload"
+	printf '%s' "$1" >"$OP"
+	submit "$SVC" "@$OP" $(ls "$X"/* 2>/dev/null) >/dev/null
+	rm -rf "$X"
+	wait_slot $(( $(slot) + 1 ))
 }
 join() { local IFS=,; echo "$*"; }
 
@@ -121,27 +114,17 @@ take() { N=${NONCE[$1]}; NONCE[$1]=$((N + 1)); }
 signed() {
 	local who=$1 payload=$2
 	[ -n "$payload" ] || fail "no payload"
+	local extrinsics=($(ls "$X"/* 2>/dev/null))
+	printf '%s' "$payload" >"$OP"
 	for attempt in 1 2 3; do
-		"$JAMT" item "$SVC" "$payload" >/dev/null
+		submit "$SVC" "@$OP" "${extrinsics[@]}" >/dev/null
 		for _ in $(seq 1 30); do
-			grep -q "nonce: ${NONCE[$who]}" <<<"$(show account --account "$who")" && return
+			grep -q "nonce: ${NONCE[$who]}" <<<"$(show account --account "$who")" && { rm -rf "$X"; return; }
 			sleep $POLL
 		done
 		echo "op $N by $who not applied after attempt $attempt"
 	done
 	fail "op $N by $who never applied"
-}
-
-# Pin FILES as WHO, MAX_PINS (64) at a time, then provide them.
-pin() {
-	local who=$1; shift
-	local files=("$@")
-	for ((i = 0; i < ${#files[@]}; i += 64)); do
-		take "$who"
-		signed "$who" "$($W pin --service "$SVC" --owner "$who" --nonce $N --blobs "$(join "${files[@]:i:64}")")"
-	done
-	expect "$who pinned ${#files[@]} blobs" "nonce: ${NONCE[$who]}" account --account "$who"
-	provide "$@"
 }
 
 step "exporting the proof ($THEOREM) and converting it to nodes"
@@ -176,14 +159,12 @@ W_DIR=$TMP/w
 BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
 PINS=$(cat "$W_DIR/pins")
 GOAL=$(cat "$W_DIR/goal.hash")
-for ((n = 0; n < BATCHES; n++)); do
-	"$W" bundle --subjects "$(cat "$W_DIR/batch-$n.subjects")" --out "$W_DIR/batch-$n.bundle" >/dev/null
-done
 
 if [ -n "${WITNESS_SIM:-}" ]; then
 	step "using witness-sim (state: $TMP/sim)"
 	(cd "$WITNESS_DIR" && cargo build -q --release -p witness-sim)
 	JAMT=$WITNESS_DIR/target/release/witness-sim POLL=0 JAM_RPC=sim
+	submit() { "$JAMT" item "$@"; }
 	export WITNESS_SIM_DIR=$TMP/sim
 	LOG=$WITNESS_SIM_DIR/log
 elif [ -z "${JAM_RPC:-}" ]; then
@@ -209,16 +190,13 @@ wait_slot $(( $(slot) + 3 ))
 step "a library attester attests the library: $BATCHES batches"
 for who in alice pat bob; do item "$($W mint --to $who --amount 1000000)"; done
 expect "pat has points" 'balance: 1000000' account --account pat
-BUNDLES=()
-for ((n = 0; n < BATCHES; n++)); do BUNDLES+=("$W_DIR/batch-$n.bundle"); done
-pin pat $CHECK "${BUNDLES[@]}"
 for ((n = 0; n < BATCHES; n++)); do
 	take pat
 	trust=$(cat "$W_DIR/batch-$n.trust")
 	signed pat "$($W attest --service "$SVC" --attester pat --nonce $N --check $CHECK --params "$PINS" \
-		--subjects "$W_DIR/batch-$n.bundle" ${trust:+--trust "$trust"} --witness-file "$W_DIR/batch-$n.proofs" \
-		--check-gas $GAS --claim-out "$W_DIR/batch-$n.claim" 2>/dev/null)"
-	expect "batch $n attested" 'Attestation \{ claim' attestation --attestation "$W_DIR/batch-$n.claim"
+		--subjects "$(cat "$W_DIR/batch-$n.subjects")" ${trust:+--trust "$trust"} --witness-file "$W_DIR/batch-$n.proofs" \
+		--check-gas $GAS --claim-out "$W_DIR/batch-$n.claim" --extrinsics "$X" 2>/dev/null)"
+	expect "batch $n attested" 'Attestation \{ check_hash' attestation --attestation "$W_DIR/batch-$n.claim"
 done
 
 step "alice posts the bounty: a proof of the statement node $GOAL"
@@ -235,7 +213,7 @@ signed bob "$($W commit --service "$SVC" --bounty 0 --hunter bob --nonce $N --sa
 expect "bob committed" "nonce: ${NONCE[bob]}" account --account bob
 wait_slot $(( $(slot) + 2 ))
 item "$($W reveal --bounty 0 --check $CHECK --params "$GOAL$PINS" --blobs "$CITE" --trust "$(cat "$W_DIR/goal.trust")" \
-	--check-gas $GAS --hunter bob --salt 0x0b0b --witness-file "$W_DIR/goal.pack")"
+	--check-gas $GAS --hunter bob --salt 0x0b0b --witness-file "$W_DIR/goal.pack" --extrinsics "$X")"
 expect "bob's proof opens the claim window" 'Revealing' bounty --bounty 0
 
 printf '\nLean end-to-end checks passed (%s)\n' "${1:-gcd}"
