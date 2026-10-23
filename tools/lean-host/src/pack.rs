@@ -22,6 +22,8 @@ pub struct Pack {
 	readers: [File; 2],
 	writers: Option<([BufWriter<File>; 2], BufWriter<File>)>,
 	lens: [u64; 2],
+	/// Record hashes only, writing no bytes (for comparing exports by hash, where disk is short).
+	pub no_data: bool,
 }
 
 pub fn exists(dir: &str) -> bool {
@@ -52,7 +54,7 @@ impl Pack {
 			let w = |name: &str| BufWriter::with_capacity(1 << 20, open(name));
 			([w(FILES[0]), w(FILES[1])], w("pack.idx"))
 		});
-		Pack { index, readers, writers, lens }
+		Pack { index, readers, writers, lens, no_data: false }
 	}
 
 	pub fn contains(&self, kind: u8, h: &Hash) -> bool {
@@ -73,6 +75,7 @@ impl Pack {
 		}
 		let (files, idx) = self.writers.as_mut().expect("pack opened for writing");
 		let off = self.lens[kind as usize];
+		let data = if self.no_data { &[][..] } else { data };
 		files[kind as usize].write_all(data).unwrap();
 		self.lens[kind as usize] += data.len() as u64;
 		let mut r = Vec::with_capacity(45);
