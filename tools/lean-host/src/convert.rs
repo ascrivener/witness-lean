@@ -463,7 +463,7 @@ fn header(magic: &[u8], imports: &[Hash]) -> Writer {
 }
 
 impl Converter {
-	pub fn new(out: &str, pack: bool) -> Converter {
+	pub fn new(out: &str, pack: bool, no_data: bool) -> Converter {
 		std::fs::create_dir_all(format!("{out}/nodes")).unwrap();
 		std::fs::create_dir_all(format!("{out}/proofs")).unwrap();
 		let mut manifest = std::io::BufWriter::new(std::fs::File::create(format!("{out}/manifest.json")).unwrap());
@@ -471,7 +471,11 @@ impl Converter {
 		Converter {
 			ex: Export::new(),
 			out: out.to_string(),
-			pack: pack.then(|| crate::pack::Pack::open(out, true)),
+			pack: pack.then(|| {
+				let mut p = crate::pack::Pack::open(out, true);
+				p.no_data = no_data;
+				p
+			}),
 			node_of: HashMap::new(),
 			quots: Vec::new(),
 			manifest,
@@ -752,14 +756,14 @@ impl Converter {
 }
 
 /// Convert the export at `path` ("-" for stdin) into `out`, as lean_nodes.py does (or into its
-/// pack, if `pack`).
-pub fn convert(path: &str, out: &str, pack: bool) {
+/// pack, if `pack`; with `no_data`, recording only which nodes it has).
+pub fn convert(path: &str, out: &str, pack: bool, no_data: bool) {
 	let input: Box<dyn BufRead> = if path == "-" {
 		Box::new(std::io::BufReader::with_capacity(1 << 20, std::io::stdin()))
 	} else {
 		Box::new(std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path).expect("export")))
 	};
-	let mut c = Converter::new(out, pack);
+	let mut c = Converter::new(out, pack, no_data);
 	for line in input.lines() {
 		c.line(&line.expect("export line"));
 	}

@@ -1,9 +1,10 @@
 //! Runs the Lean check natively, as refine would, and reports how long it takes.
 //!
-//!     lean-host convert EXPORT OUT [--pack]
+//!     lean-host convert EXPORT OUT [--pack [--no-data]]
 //!                                  write OUT as lean_nodes.py would from EXPORT ("-": stdin), in
 //!                                  far less memory, for exports the size of all of Mathlib; with
-//!                                  --pack, into OUT's pack (see pack.rs) instead of a file a node
+//!                                  --pack, into OUT's pack (see pack.rs) instead of a file a node;
+//!                                  with --no-data, recording hashes only (to compare exports)
 //!     lean-host pack DIR           move DIR's node and proof files into its pack
 //!     lean-host profile DIR OUT    check every node of DIR's pack once, recording each one's time
 //!                                  and lookups (see profile.rs)
@@ -280,8 +281,9 @@ fn main() {
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-		["convert", export, out] => convert::convert(export, out, false),
-		["convert", export, out, "--pack"] => convert::convert(export, out, true),
+		["convert", export, out] => convert::convert(export, out, false, false),
+		["convert", export, out, "--pack"] => convert::convert(export, out, true, false),
+		["convert", export, out, "--pack", "--no-data"] => convert::convert(export, out, true, true),
 		["pack", dir] => pack::pack_dir(dir),
 		["profile", dir, out] => profile::profile(dir, out),
 		["nodes", dir] => nodes(&Dir::open(dir)),
