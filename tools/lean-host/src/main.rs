@@ -14,7 +14,8 @@
 //!                                  write OUT: PLAN with each batch trusting only what the kernel
 //!                                  looks up while checking it, plus what its nodes import, and
 //!                                  split where a batch takes longer than MS (default 100); print
-//!                                  `over T: NAME` for each declaration that alone takes longer
+//!                                  `over T: NAME` for each declaration that alone takes longer;
+//!                                  each batch in OUT records how long it took (`ms`)
 //!
 //! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
 //! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
@@ -164,7 +165,7 @@ fn trace(dir: &Dir, plan: &str, out: &str, budget: Duration) {
 		if let Some(goal) = batch["goal"].as_str() {
 			let (keep, t) = tracer.trace(&[goal.to_string()], &strs(&batch["trusted"]));
 			slowest = slowest.max(t);
-			out_plan.push(serde_json::json!({ "goal": goal, "trusted": keep }));
+			out_plan.push(serde_json::json!({ "goal": goal, "trusted": keep, "ms": t.as_secs_f64() * 1e3 }));
 			continue;
 		}
 		let mut queue = vec![(strs(&batch["subjects"]), strs(&batch["trusted"]))];
@@ -185,7 +186,12 @@ fn trace(dir: &Dir, plan: &str, out: &str, budget: Duration) {
 				println!("over {t:?}: {}", name.and_then(Value::as_str).unwrap_or(&subjects[0]));
 			}
 			slowest = slowest.max(t);
-			out_plan.push(serde_json::json!({ "depth": batch["depth"], "subjects": subjects, "trusted": keep }));
+			out_plan.push(serde_json::json!({
+				"depth": batch["depth"],
+				"subjects": subjects,
+				"trusted": keep,
+				"ms": t.as_secs_f64() * 1e3,
+			}));
 		}
 	}
 	std::fs::write(out, serde_json::to_vec(&out_plan).unwrap()).unwrap();
