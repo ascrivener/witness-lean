@@ -1,5 +1,12 @@
 //! Runs the Lean check natively, as refine would, and reports how long it takes.
 //!
+//!     lean-host convert EXPORT OUT [--pack]
+//!                                  write OUT as lean_nodes.py would from EXPORT ("-": stdin), in
+//!                                  far less memory, for exports the size of all of Mathlib; with
+//!                                  --pack, into OUT's pack (see pack.rs) instead of a file a node
+//!     lean-host pack DIR           move DIR's node and proof files into its pack
+//!     lean-host profile DIR OUT    check every node of DIR's pack once, recording each one's time
+//!                                  and lookups (see profile.rs)
 //!     lean-host nodes DIR          load and check every node of DIR, in order, with its proof
 //!     lean-host plan DIR PLAN      attest each batch of PLAN (from lean_plan.py), timing each
 //!     lean-host trace DIR PLAN OUT [MS]
@@ -10,6 +17,10 @@
 //!
 //! DIR is a `lean_nodes.py` output directory. A native millisecond costs about 29M gas in
 //! PolkaJam v0.1.29's recompiler, so a batch should stay well under 150 ms to fit a refine.
+
+mod convert;
+mod pack;
+mod profile;
 
 use nanoda_lib::nodes::{Hash, NodeLoader, PINNED_NAMES};
 use serde_json::Value;
@@ -29,18 +40,26 @@ fn blake2b256(data: &[u8]) -> Hash {
 struct Dir {
 	path: String,
 	manifest: Vec<Value>,
+	pack: Option<pack::Pack>,
 }
 
 impl Dir {
 	fn open(path: &str) -> Dir {
 		let manifest = serde_json::from_slice(&std::fs::read(format!("{path}/manifest.json")).expect("manifest"));
-		Dir { path: path.to_string(), manifest: manifest.expect("JSON") }
+		let pack = pack::exists(path).then(|| pack::Pack::open(path, false));
+		Dir { path: path.to_string(), manifest: manifest.expect("JSON"), pack }
 	}
 	fn node(&self, h: &str) -> Vec<u8> {
-		std::fs::read(format!("{}/nodes/{h}", self.path)).unwrap()
+		match &self.pack {
+			Some(p) => p.get(pack::NODE, &hex(h)).unwrap_or_else(|| panic!("no node {h}")),
+			None => std::fs::read(format!("{}/nodes/{h}", self.path)).unwrap(),
+		}
 	}
 	fn proof(&self, h: &str) -> Option<Vec<u8>> {
-		std::fs::read(format!("{}/proofs/{h}", self.path)).ok()
+		match &self.pack {
+			Some(p) => p.get(pack::PROOF, &hex(h)),
+			None => std::fs::read(format!("{}/proofs/{h}", self.path)).ok(),
+		}
 	}
 	/// The nodes declaring the names the kernel treats specially.
 	fn pins(&self) -> Vec<Hash> {
@@ -261,6 +280,10 @@ fn main() {
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+		["convert", export, out] => convert::convert(export, out, false),
+		["convert", export, out, "--pack"] => convert::convert(export, out, true),
+		["pack", dir] => pack::pack_dir(dir),
+		["profile", dir, out] => profile::profile(dir, out),
 		["nodes", dir] => nodes(&Dir::open(dir)),
 		["plan", dir, p] => plan(&Dir::open(dir), p),
 		["run", args] => {
@@ -274,7 +297,7 @@ fn main() {
 		["trace", dir, p, out] => trace(&Dir::open(dir), p, out, Duration::from_millis(100)),
 		["trace", dir, p, out, ms] => trace(&Dir::open(dir), p, out, Duration::from_millis(ms.parse().expect("milliseconds"))),
 		_ => {
-			eprintln!("usage: lean-host nodes DIR | lean-host plan DIR PLAN | lean-host trace DIR PLAN OUT [MS]");
+			eprintln!("usage: lean-host convert EXPORT OUT | lean-host nodes DIR | lean-host plan DIR PLAN | lean-host trace DIR PLAN OUT [MS]");
 			std::process::exit(2);
 		},
 	}
