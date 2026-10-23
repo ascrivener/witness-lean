@@ -13,8 +13,8 @@ authors = ["Adam Scrivener <adam@oneoff.world>"]
 
 [workspace.dependencies]
 # The check interface and the types it's encoded with, from witness (pinned).
-witness-check = { git = "https://github.com/ascrivener/witness", rev = "43504dbe" }
-witness-types = { git = "https://github.com/ascrivener/witness", rev = "43504dbe", default-features = false }
+witness-check = { git = "https://github.com/ascrivener/witness", rev = "a569c36a" }
+witness-types = { git = "https://github.com/ascrivener/witness", rev = "a569c36a", default-features = false }
 polkavm-derive = { version = "0.37.0", default-features = false }
 
 # `cargo jam-build` builds PVM blobs with this profile.

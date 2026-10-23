@@ -473,7 +473,7 @@ dependencies = [
 [[package]]
 name = "witness-check"
 version = "0.1.0"
-source = "git+https://github.com/ascrivener/witness?rev=43504dbe#43504dbe76d058de842923f136efe4854c2508e1"
+source = "git+https://github.com/ascrivener/witness?rev=a569c36a#a569c36abffe262b60205dfe7ccfbcc601fe1569"
 dependencies = [
  "picoalloc",
  "polkavm-derive",
@@ -482,7 +482,7 @@ dependencies = [
 [[package]]
 name = "witness-types"
 version = "0.1.0"
-source = "git+https://github.com/ascrivener/witness?rev=43504dbe#43504dbe76d058de842923f136efe4854c2508e1"
+source = "git+https://github.com/ascrivener/witness?rev=a569c36a#a569c36abffe262b60205dfe7ccfbcc601fe1569"
 dependencies = [
  "blake2b_simd",
  "jam-codec",
