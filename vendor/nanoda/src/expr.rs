@@ -484,13 +484,11 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
         fun
     }
 
-    pub(crate) fn abstr_pis<I>(&mut self, mut binders: I, mut body: ExprPtr<'t>) -> ExprPtr<'t>
+    pub(crate) fn abstr_pis<I>(&mut self, binders: I, body: ExprPtr<'t>) -> ExprPtr<'t>
     where
         I: Iterator<Item = ExprPtr<'t>> + DoubleEndedIterator, {
-        while let Some(local) = binders.next_back() {
-            body = self.abstr_pi(local, body)
-        }
-        body
+        let binders: Vec<ExprPtr<'t>> = binders.collect();
+        self.abstr_pi_telescope(&binders, body)
     }
 
     pub(crate) fn abstr_pi(&mut self, binder: ExprPtr<'t>, body: ExprPtr<'t>) -> ExprPtr<'t> {
