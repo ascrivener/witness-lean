@@ -31,8 +31,20 @@ top 60 (70,788 declarations, 85 s, `lean-host profile`):
 | `PresheafOfModules.freeObj._proof_2` | 4 ms | 15.2 s |
 
 57 of the 60 need more than one refine under nanoda; the median needs about four. The tail is
-mostly sheaf cohomology, Mayer–Vietoris and algebraic geometry. How many declarations nanoda finds
-heavy across all of Mathlib is still unmeasured: that needs `lean-host profile` over all of it.
+mostly sheaf cohomology, Mayer–Vietoris and algebraic geometry.
+
+**All of Mathlib under nanoda** (`lean-host profile`, every node checked once in one environment):
+
+| | |
+|---|---|
+| Nodes | 717,117: 717,116 check, none fail; 1 left out (`sorryAx`, which nothing uses) |
+| Checking | 645 s, about 5.2×10¹³ gas |
+| Over one refine (> 56 ms) | 618 nodes, 76 s between them: 551 theorems, 62 definitions, 5 inductives |
+| Over 0.5 s | 5 nodes; the heaviest, `Proj.awayι_comp_map`, 2.1 s (about 37 refines) |
+
+The tail is unfolding, not computation: 129 of the 618 are in algebraic geometry, 75 in algebra,
+62 in category theory. The 5 inductives are 56–151 ms (at most 2.7 refines): a 104-name mutual
+inductive in core's `grind`, and four Riemannian bundle structures.
 
 ## What doesn't work
 
@@ -175,6 +187,27 @@ check takes 2.09 s here against 1.3 s plain):
 So the work doesn't grow, and the rounds are few. The cost is the number of units, which have to
 be grouped into work items (below).
 
+**Mathlib's heaviest.** The same, on the six heaviest theorems, two that look computational and a
+definition (instrumented times):
+
+| Declaration | Whole check | Units | Rounds | Largest unit |
+|---|---|---|---|---|
+| `Proj.awayι_comp_map` | 3.4 s | 71,689 | 14 | 48.4 ms* |
+| `WeierstrassCurve…sym2x_add_sub_eq_addSubMap_sym2x._proof_1_8` | 2.9 s | 40,598 | 25 | 47.1 ms* |
+| `Sheaf.H.longSequence_exact` | 1.5 s | 30,910 | 18 | 29.5 ms |
+| `MayerVietorisSquare.biprodAddEquiv_symm…` | 1.0 s | 19,489 | 14 | 29.2 ms |
+| `Ideal.comap_fiberIsoOfBijectiveResidueField_symm` | 0.92 s | 12,764 | 13 | 29.9 ms |
+| `CoalgCat.MonoidalCategoryAux.comul_tensorObj_tensorObj_right` | 0.64 s | 10,583 | 13 | 28.9 ms |
+| `String.fromUTF8Lossy_surrogate_append._proof_1_10` | 0.39 s | 415 | 7 | 29.5 ms |
+| `alternatingGroup.normalClosure_swap_mul_swap_five` | 0.47 s | 1,677 | 9 | 29.9 ms |
+| `QuadraticModuleCat.instMonoidalCategoryStruct` (a def) | 0.54 s | 9,773 | 11 | 25.5 ms |
+
+All decompose, and none into long chains: the computational ones are the shallowest. *The two
+units over the 30 ms budget are single calls that spent about 48 ms in themselves inside the whole
+check, but run alone in PolkaVM, with their facts and the traced environment, each costs at most
+7.8×10⁸ gas in all (2.0×10⁸ for the Weierstrass one): they paid for growing nanoda's global term
+table, a cost of the one big process, not of the step.
+
 ## Design: trusted facts
 
 The prototype seeds a piece's caches with facts as given. On chain, a check may seed only facts
@@ -268,7 +301,9 @@ few times its own check in gas.
    names, and that refine's hashing of what it cites is cheap beside that. Both need measuring
    in PolkaVM.
 2. **Lazy delta steps.** A cache for them, or recomputing them (see above).
-3. **More than one declaration.** Measured on `instIsIsoIndCoimageImageComparison` only.
+3. **Inductives.** Five are over a refine (at most 151 ms), and judgments don't reach inductive
+   declarations, which nanoda checks by other code with the same caches. Either judgments for
+   inductive checks, or a cheaper inductive check.
 4. **Chains.** Long reductions (`decide`, big computations) are chains rather than trees. The same
    mechanism attests them link by link (`a ≡ a₁ ≡ a₂ …`) if the intermediate terms stay small.
    None of the heavy tail measured so far is of this kind.
