@@ -2,7 +2,8 @@
 //! ```ignore
 //! Doc comment example
 //! ```
-#![no_std]
+// no_std for the PVM; the tests (upstream's, unported) use std.
+#![cfg_attr(not(test), no_std)]
 #![allow(clippy::too_many_arguments)]
 #![deny(clippy::cast_possible_truncation)]
 

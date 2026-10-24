@@ -2,7 +2,7 @@ use crate::util::{Config, CowStr, ExportFile, ExprPtr, LevelPtr, TcCtx};
 use rand::distr::Alphanumeric;
 use rand::rngs::ThreadRng;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) fn test_export_file<A>(
     config_path: Option<&Path>,
@@ -13,27 +13,27 @@ pub(crate) fn test_export_file<A>(
 }
 
 pub(crate) fn test_get_export_file<'p>(config_path: Option<&Path>) -> Result<(ExportFile<'p>, Vec<String>), Box<dyn Error>> {
-    let config_file = match config_path {
+    // The port parses exports from memory: read the file a test config names (relative to the
+    // crate, where tests run), or the empty export.
+    let config = match config_path {
         None => Config {
-            export_file_path: Some(PathBuf::from("test_resources/Empty/export")),
-            use_stdin: false,
+            export_file_path: Some(String::from("test_resources/Empty/export")),
             permitted_axioms: Some(Vec::new()),
             unpermitted_axiom_hard_error: true,
             nat_extension: false,
             string_extension: false,
-            pp_declars: None,
-            pp_options: crate::pretty_printer::PpOptions::default(),
             unknown_pp_declar_hard_error: true,
-            pp_output_path: None,
-            pp_to_stdout: false,
-            num_threads: 1,
-            print_success_message: true,
-            print_axioms: true,
-            unsafe_permit_all_axioms: false
+            ..Config::in_memory(Vec::new())
         },
-        Some(config_path) => Config::try_from(config_path)?,
+        Some(config_path) => config_from(config_path)?,
     };
-    config_file.to_export_file()
+    let export = std::fs::read(config.export_file_path.as_deref().ok_or("the config names no export file")?)?;
+    config.parse_export_bytes(&export)
+}
+
+/// A config file, as upstream's `Config::try_from(&Path)` read it.
+fn config_from(path: &Path) -> Result<Config, Box<dyn Error>> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
 }
 
 #[allow(dead_code)]
@@ -103,7 +103,7 @@ fn check_proj_from_prop() {
 
 #[test]
 fn config_invalid_json_returns_error() {
-    let error = Config::try_from(Path::new("test_resources/Config/invalid_json.json")).unwrap_err();
+    let error = config_from(Path::new("test_resources/Config/invalid_json.json")).unwrap_err();
     let json_error = error.downcast_ref::<serde_json::Error>().expect("JSON parsing error");
     assert!(json_error.is_eof());
     assert!(json_error.line() > 0);
@@ -111,7 +111,7 @@ fn config_invalid_json_returns_error() {
 
 #[test]
 fn config_invalid_option_type_returns_error() {
-    let error = Config::try_from(Path::new("test_resources/Config/invalid_option_type.json")).unwrap_err();
+    let error = config_from(Path::new("test_resources/Config/invalid_option_type.json")).unwrap_err();
     let json_error = error.downcast_ref::<serde_json::Error>().expect("JSON parsing error");
     assert!(json_error.is_data());
     assert!(json_error.line() > 0);
@@ -120,7 +120,7 @@ fn config_invalid_option_type_returns_error() {
 
 #[test]
 fn config_valid_json_is_loaded() -> Result<(), Box<dyn Error>> {
-    let config = Config::try_from(Path::new("test_resources/Config/valid.json"))?;
+    let config = config_from(Path::new("test_resources/Config/valid.json"))?;
     assert!(config.use_stdin);
     assert!(config.export_file_path.is_none());
     assert_eq!(config.num_threads, 2);
