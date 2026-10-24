@@ -43,6 +43,14 @@
 //!                                  unit's replay time as OUT/costs.json; count ops over 45 native
 //!                                  ms (about 4.2e9 gas)
 //!
+//!     lean-host split-inductive ARGS OUT [MS]
+//!                                  split the inductive block the attest op ARGS attests (its one
+//!                                  untrusted node) into ops of at most MS native milliseconds
+//!                                  (default 40): each declaration whole, or an inductive type by
+//!                                  phase when it's over, packed into ops; write each op's arguments
+//!                                  as OUT/part-N.args, then the node's own, citing them, as
+//!                                  OUT/final.args, and check them all natively
+//!
 //! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
 //! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
 //! milliseconds come from gas budgets measured there (`tools/lean/gas_per_ms.py`).
@@ -115,6 +123,31 @@ fn nodes(dir: &Dir) {
 		nodes.check(i);
 	}
 	println!("{} nodes ({} pinned) loaded in {loaded:?}, all checked in {:?}", dir.manifest.len(), pins.len(), start.elapsed());
+}
+
+/// An unsigned LEB128 varint.
+fn uvar(out: &mut Vec<u8>, mut n: usize) {
+	loop {
+		let b = (n & 0x7f) as u8;
+		n >>= 7;
+		if n == 0 {
+			return out.push(b);
+		}
+		out.push(b | 0x80);
+	}
+}
+
+/// A declarations blob for `node`'s `parts` (positions and phases; see the check's
+/// DECLARATIONS_MAGIC).
+fn declarations_blob(node: &[u8], parts: &[(usize, u8)]) -> Vec<u8> {
+	let mut out = lean_check::DECLARATIONS_MAGIC.to_vec();
+	out.extend_from_slice(&blake2b256(node));
+	uvar(&mut out, parts.len());
+	for &(k, p) in parts {
+		uvar(&mut out, k);
+		out.push(p);
+	}
+	out
 }
 
 /// The check's witness encoding: a count, then each item's length and bytes, LEB128.
@@ -315,19 +348,14 @@ fn declarations_args(args: &str, positions: &str, out: &str) {
 	let args = std::fs::read(args).expect("arguments");
 	let input = witness_check::Input::parse(&args).expect("well-formed arguments");
 	let node = input.blobs().find(|b| !b.trusted).expect("a subject").data.to_vec();
-	let parts: Vec<(u8, u8)> = positions
+	let parts: Vec<(usize, u8)> = positions
 		.split(',')
 		.map(|kp| match kp.split_once(':') {
 			Some((k, p)) => (k.parse().expect("a position"), p.parse().expect("a phase")),
 			None => (kp.parse().expect("a position"), 0),
 		})
 		.collect();
-	let mut subject = lean_check::DECLARATIONS_MAGIC.to_vec();
-	subject.extend_from_slice(&blake2b256(&node));
-	subject.push(parts.len() as u8);
-	for (k, p) in parts {
-		subject.extend_from_slice(&[k, p]);
-	}
+	let subject = declarations_blob(&node, &parts);
 	let mut blobs: Vec<(bool, Vec<u8>)> = input.blobs().filter(|b| b.trusted).map(|b| (true, b.data.to_vec())).collect();
 	blobs.push((false, subject));
 	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
@@ -505,6 +533,69 @@ fn judgments_check(full: &str, out: &str) {
 	}
 }
 
+/// Split the inductive block that `args` attests into ops of at most `budget` native time.
+fn split_inductive(args: &str, out: &str, budget: Duration) {
+	use nanoda_lib::env::Phase;
+	let bytes = std::fs::read(args).expect("arguments");
+	let input = witness_check::Input::parse(&bytes).expect("well-formed arguments");
+	let trusted: Vec<(bool, Vec<u8>)> = input.blobs().filter(|b| b.trusted).map(|b| (true, b.data.to_vec())).collect();
+	let node = input.blobs().find(|b| !b.trusted).expect("a node").data.to_vec();
+	let nodes = lean_check::load_attest(&input).expect("nodes load");
+	let i = nodes.find(&blake2b256(&node)).expect("the node");
+	assert!(nodes.is_inductive_block(i), "not an inductive block");
+	let time = |k: usize, phase: Phase| {
+		let t0 = Instant::now();
+		nodes.check_parts(i, |j| if j == k { vec![phase] } else { vec![] });
+		t0.elapsed()
+	};
+	// Each declaration whole, or, if over budget and an inductive type, its two phases.
+	let mut parts: Vec<((usize, u8), Duration)> = Vec::new();
+	for k in 0..nodes.declaration_count(i) {
+		let whole = time(k, Phase::Whole);
+		if whole > budget && nodes.is_inductive_type(i, k) {
+			parts.push(((k, 1), time(k, Phase::Constructors)));
+			parts.push(((k, 2), time(k, Phase::Recursors)));
+		} else {
+			parts.push(((k, 0), whole));
+		}
+	}
+	// Pack them into ops in order, each up to the budget.
+	let mut ops: Vec<Vec<(usize, u8)>> = vec![Vec::new()];
+	let mut used = Duration::ZERO;
+	for (part, t) in parts {
+		if used + t > budget && !ops.last().unwrap().is_empty() {
+			ops.push(Vec::new());
+			used = Duration::ZERO;
+		}
+		ops.last_mut().unwrap().push(part);
+		used += t;
+	}
+	std::fs::create_dir_all(out).unwrap();
+	let write = |blobs: &[(bool, Vec<u8>)], witness: &[u8], name: &str| -> (bool, Duration) {
+		let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+		let check_blobs: Vec<CheckBlob> = blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
+		let a = check_args(CheckMode::Attest, &check_blobs, &[], witness);
+		std::fs::write(format!("{out}/{name}.args"), &a).unwrap();
+		let input = witness_check::Input::parse(&a).unwrap();
+		let t0 = Instant::now();
+		(std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false), t0.elapsed())
+	};
+	let mut cited = Vec::new();
+	for (n, op) in ops.iter().enumerate() {
+		let subject = declarations_blob(&node, op);
+		let mut blobs = trusted.clone();
+		blobs.push((false, subject.clone()));
+		let (ok, t) = write(&blobs, &encode(std::slice::from_ref(&node)), &format!("part-{n}"));
+		println!("part {n}: {:?} {ok} in {t:?}", op);
+		cited.push(subject);
+	}
+	let mut blobs = trusted.clone();
+	blobs.extend(cited.into_iter().map(|c| (true, c)));
+	blobs.push((false, node.clone()));
+	let (ok, t) = write(&blobs, &encode(&[]), "final");
+	println!("{} ops; the node's own: {ok} in {t:?}", ops.len());
+}
+
 fn main() {
 	// Type errors panic, which counts as false, as on the PVM.
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
@@ -529,6 +620,8 @@ fn main() {
 		["judgments", args, out, ms] => judgments(args, out, ms.parse().expect("milliseconds"), None),
 		["judgments", args, out, ms, costs] => judgments(args, out, ms.parse().expect("milliseconds"), Some(costs)),
 		["judgments-check", full, out] => judgments_check(full, out),
+		["split-inductive", args, out] => split_inductive(args, out, Duration::from_millis(40)),
+		["split-inductive", args, out, ms] => split_inductive(args, out, Duration::from_millis(ms.parse().expect("milliseconds"))),
 		["args", dir, p, n, out] => write_args(&Dir::open(dir), p, n.parse().expect("batch number"), out),
 		["trace", dir, p, out] => trace(&Dir::open(dir), p, out, Duration::from_millis(100)),
 		["trace", dir, p, out, ms] => trace(&Dir::open(dir), p, out, Duration::from_millis(ms.parse().expect("milliseconds"))),
