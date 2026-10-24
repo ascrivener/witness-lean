@@ -43,6 +43,11 @@ pub struct PlanConfig {
     /// Most judgments an op may cite, and their most bytes.
     pub max_cites: usize,
     pub max_cited_bytes: usize,
+    /// Most bytes an op's calls blob may have: it's the op's witness, with the declaration's
+    /// node, and an attest op's witness is at most witness's `MAX_WITNESS_LEN` (64 KiB).
+    pub max_calls_bytes: usize,
+    /// An op citing more judgment bytes than this cites relays instead (see `plan`).
+    pub relay_bytes: usize,
     /// Each unit's measured replay time (by its call's index in the record), in nanoseconds,
     /// from checking an earlier plan's ops: a unit's replay doesn't depend on its op.
     pub unit_costs: Option<std::collections::HashMap<usize, u64>>,
@@ -66,6 +71,8 @@ impl Default for PlanConfig {
             op_gas: 4.0e9,
             max_cites: 3000,
             max_cited_bytes: 12_000_000,
+            max_calls_bytes: 55_000,
+            relay_bytes: 3_000_000,
             unit_costs: None,
             op_ns: 40_000_000,
             fixed_ns: 4_000_000,
@@ -307,47 +314,110 @@ pub(crate) fn plan<'t, 'p>(
                      blob_bytes: &mut Vec<usize>,
                      entry_index: &mut Vec<FxHashMap<Entry<'t>, usize>>|
          -> Result<(), std::boxed::Box<dyn core::error::Error>> {
-            if cur.is_empty() {
-                return Ok(());
+            // Write `cur` as one op, or, where its calls would be more than an op's witness may
+            // hold, as two or more, splitting it in halves.
+            let first = core::mem::take(cur);
+            let mut queue: std::collections::VecDeque<Vec<usize>> = Default::default();
+            if !first.is_empty() {
+                queue.push_back(first);
             }
-            let mut cites: Vec<usize> = cites.drain().collect();
-            cites.sort_unstable();
-            let position: FxHashMap<usize, usize> = cites.iter().enumerate().map(|(j, &g)| (g, j)).collect();
-            // Each unit's call, seeded just before it with what it needs (once in the op).
-            let mut seeded: FxHashSet<Entry<'t>> = new_fx_hash_set();
-            let mut calls: Vec<judgment::CallItem<'t>> = Vec::new();
-            for &u in cur.iter() {
-                let mut seeds = Vec::new();
-                for e in &need_entries[&u] {
-                    if seeded.insert(*e) {
+            while let Some(units) = queue.pop_front() {
+                // The entries each unit seeds, each once in the op, and the group that made each.
+                let mut seeded: FxHashSet<Entry<'t>> = new_fx_hash_set();
+                let unit_seeds: Vec<Vec<Entry<'t>>> = units
+                    .iter()
+                    .map(|u| need_entries[u].iter().copied().filter(|e| seeded.insert(*e)).collect())
+                    .collect();
+                let mut source: FxHashMap<Entry<'t>, (usize, usize)> = seeded
+                    .iter()
+                    .map(|e| {
                         let g = group_of[&maker_unit(e)];
-                        seeds.push((position[&g], entry_index[g][e]));
-                    }
+                        (*e, (g, entry_index[g][e]))
+                    })
+                    .collect();
+                let write = |cs: &[usize], source: &FxHashMap<Entry<'t>, (usize, usize)>| {
+                    let position: FxHashMap<usize, usize> = cs.iter().enumerate().map(|(j, &g)| (g, j)).collect();
+                    let calls: Vec<judgment::CallItem<'t>> = units
+                        .iter()
+                        .zip(&unit_seeds)
+                        .map(|(&u, es)| {
+                            let seeds = es.iter().map(|e| (position[&source[e].0], source[e].1)).collect();
+                            (rec.calls[u].depth, rec.calls[u].eager, rec.calls[u].call.unwrap(), seeds)
+                        })
+                        .collect();
+                    judgment::write_calls(tc, &calls)
+                };
+                let mut cs: Vec<usize> = source.values().map(|&(g, _)| g).collect::<FxHashSet<_>>().into_iter().collect();
+                cs.sort_unstable();
+                if write(&cs, &source).len() > cfg.max_calls_bytes && units.len() > 1 {
+                    let (a, b) = units.split_at(units.len() / 2);
+                    queue.push_front(b.to_vec());
+                    queue.push_front(a.to_vec());
+                    continue;
                 }
-                calls.push((rec.calls[u].depth, rec.calls[u].eager, rec.calls[u].call.unwrap(), seeds));
+                // Citing a lot for a few entries: relays, each citing some of those groups and
+                // re-attesting just the entries this op needs from them, are cited instead.
+                if cs.iter().map(|&g| blob_bytes[g]).sum::<usize>() > cfg.relay_bytes && cs.len() > 1 {
+                    let mut chunks: Vec<Vec<usize>> = vec![Vec::new()];
+                    let mut size = 0;
+                    for &g in &cs {
+                        if size + blob_bytes[g] > cfg.relay_bytes && !chunks.last().unwrap().is_empty() {
+                            chunks.push(Vec::new());
+                            size = 0;
+                        }
+                        chunks.last_mut().unwrap().push(g);
+                        size += blob_bytes[g];
+                    }
+                    let mut direct = Vec::new();
+                    for chunk in chunks {
+                        if chunk.len() == 1 {
+                            direct.push(chunk[0]);
+                            continue;
+                        }
+                        let mut ents: Vec<Entry<'t>> = source.iter().filter(|(_, (g, _))| chunk.contains(g)).map(|(e, _)| *e).collect();
+                        ents.sort_by_key(|e| (source[e].0, source[e].1));
+                        let position: FxHashMap<usize, usize> = chunk.iter().enumerate().map(|(j, &g)| (g, j)).collect();
+                        let seeds = ents.iter().map(|e| (position[&source[e].0], source[e].1)).collect();
+                        let calls = judgment::write_calls(tc, &[(0, false, Call::Seed, seeds)]);
+                        let imp = imports(tc, &ents).ok_or("a judgment mentions a constant not declared by a loaded node")?;
+                        let relay = judgment::write_judgment(tc, declaration, &imp, &ents);
+                        let rg = groups.len();
+                        entry_index.push(ents.iter().enumerate().map(|(k, e)| (*e, k)).collect());
+                        let cited_bytes: usize = chunk.iter().map(|&c| blob_bytes[c]).sum();
+                        let est_ns = cfg.fixed_ns as f64 + (cfg.env_bytes + relay.len() + calls.len()) as f64 * cfg.ns_per_byte + cited_bytes as f64 * cfg.ns_per_cited_byte;
+                        blob_bytes.push(relay.len());
+                        groups.push(Group { round: r, calls, judgment: relay, cites: chunk, units: 0, gas: est_ns * cfg.gas_per_ns, unit_ns: Vec::new() });
+                        for (k, e) in ents.iter().enumerate() {
+                            source.insert(*e, (rg, k));
+                        }
+                    }
+                    cs = source.values().map(|&(g, _)| g).collect::<FxHashSet<_>>().into_iter().collect();
+                    cs.sort_unstable();
+                    let _ = direct;
+                }
+                let calls = write(&cs, &source);
+                let mut entries: Vec<Entry<'t>> = units.iter().flat_map(|u| publish[u].iter().copied()).collect();
+                entries.sort_by_key(|e| match e {
+                    Entry::Infer(a, _) | Entry::InferOnly(a, _) | Entry::Whnf(a, _) | Entry::WhnfCore(a, _) => a.get_hash(),
+                    Entry::DefEqFail(a, _, _) | Entry::DefEq(a, _) | Entry::CongrFail(a, _) => a.get_hash(),
+                });
+                let imp = imports(tc, &entries).ok_or("a judgment mentions a constant not declared by a loaded node")?;
+                let judgment = judgment::write_judgment(tc, declaration, &imp, &entries);
+                let g = groups.len();
+                entry_index.push(entries.iter().enumerate().map(|(k, e)| (*e, k)).collect());
+                for &u in &units {
+                    group_of.insert(u, g);
+                }
+                let cited_bytes: usize = cs.iter().map(|&c| blob_bytes[c]).sum();
+                let est_ns = cfg.fixed_ns as f64
+                    + (cfg.env_bytes + judgment.len() + calls.len()) as f64 * cfg.ns_per_byte
+                    + cited_bytes as f64 * cfg.ns_per_cited_byte
+                    + units.iter().map(|&u| cost(u)).sum::<u64>() as f64;
+                blob_bytes.push(judgment.len());
+                let unit_ns = units.iter().map(|&u| (u, ns[u], own[u])).collect();
+                groups.push(Group { round: r, calls, judgment, cites: cs, units: units.len(), gas: est_ns * cfg.gas_per_ns, unit_ns });
             }
-            let mut entries: Vec<Entry<'t>> = cur.iter().flat_map(|u| publish[u].iter().copied()).collect();
-            entries.sort_by_key(|e| match e {
-                Entry::Infer(a, _) | Entry::InferOnly(a, _) | Entry::Whnf(a, _) | Entry::WhnfCore(a, _) => a.get_hash(),
-                Entry::DefEqFail(a, _, _) | Entry::DefEq(a, _) | Entry::CongrFail(a, _) => a.get_hash(),
-            });
-            let imp = imports(tc, &entries).ok_or("a judgment mentions a constant not declared by a loaded node")?;
-            let judgment = judgment::write_judgment(tc, declaration, &imp, &entries);
-            let calls = judgment::write_calls(tc, &calls);
-            let g = groups.len();
-            entry_index.push(entries.iter().enumerate().map(|(k, e)| (*e, k)).collect());
-            for &u in cur.iter() {
-                group_of.insert(u, g);
-            }
-            let est_ns = cfg.fixed_ns as f64
-                + (cfg.env_bytes + judgment.len() + calls.len()) as f64 * cfg.ns_per_byte
-                + *cited as f64 * cfg.ns_per_cited_byte
-                + *work as f64;
-            let gas = est_ns * cfg.gas_per_ns;
-            blob_bytes.push(judgment.len());
-            let unit_ns = cur.iter().map(|&u| (u, ns[u], own[u])).collect();
-            groups.push(Group { round: r, calls, judgment, cites, units: cur.len(), gas, unit_ns });
-            cur.clear();
+            cites.clear();
             *work = 0;
             *cited = 0;
             Ok(())

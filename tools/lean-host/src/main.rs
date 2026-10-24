@@ -375,7 +375,15 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 		let v: Value = serde_json::from_slice(&std::fs::read(c).expect("costs")).expect("JSON");
 		v.as_object().unwrap().iter().map(|(k, ns)| (k.parse().unwrap(), ns.as_u64().unwrap())).collect()
 	});
-	let cfg = nanoda_lib::plan::PlanConfig { budget_ns: (budget_ms * 1e6) as u64, unit_costs, ..Default::default() };
+	// The op's witness is the theorem's node and the calls: at most 64 KiB (witness's
+	// MAX_WITNESS_LEN), with room for its encoding.
+	let node_len = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).map_or(0, |b| b.data.len());
+	let cfg = nanoda_lib::plan::PlanConfig {
+		budget_ns: (budget_ms * 1e6) as u64,
+		unit_costs,
+		max_calls_bytes: 64 * 1024 - 1024 - node_len,
+		..Default::default()
+	};
 	let plan = nodes.plan_judgments(i, &cfg).expect("planned");
 	std::fs::create_dir_all(out).unwrap();
 	let mut groups = Vec::new();

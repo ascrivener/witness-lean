@@ -38,7 +38,7 @@
 //! | 33 | an entry (judgments only) | cache byte, then its key and value |
 //!
 //! Call kinds: 0 infer (checking), 1 infer (inferring only), 2 whnf, each one input; 3 def_eq, 4
-//! lazy delta step, two. Entry caches, as `TcCache`'s fields: 0 `infer_cache_check`, 1
+//! lazy delta step, two; 5 none, only its seeds (an op re-attesting entries it cites: a relay). Entry caches, as `TcCache`'s fields: 0 `infer_cache_check`, 1
 //! `infer_cache_no_check`, 2 `whnf_cache`, 3 `whnf_no_unfolding_cache`, each a key and a value; 4
 //! `defeq_fail_cache`, two expressions and the eager-mode byte; 5 `eq_cache`, 6
 //! `congr_fail_cache`, two expressions.
@@ -113,6 +113,8 @@ pub enum Call<'t> {
     Whnf(ExprPtr<'t>),
     DefEq(ExprPtr<'t>, ExprPtr<'t>),
     LazyDelta(ExprPtr<'t>, ExprPtr<'t>),
+    /// No call: only seeding, for an op re-attesting entries it cites (a relay).
+    Seed,
 }
 
 impl<'t> Call<'t> {
@@ -120,6 +122,7 @@ impl<'t> Call<'t> {
         match *self {
             Call::Infer(e, _) | Call::Whnf(e) => vec![e],
             Call::DefEq(x, y) | Call::LazyDelta(x, y) => vec![x, y],
+            Call::Seed => vec![],
         }
     }
 }
@@ -312,6 +315,7 @@ fn read<'t>(
                     2 => Call::Whnf(get(&mut r, &exprs)?),
                     3 => Call::DefEq(get(&mut r, &exprs)?, get(&mut r, &exprs)?),
                     4 => Call::LazyDelta(get(&mut r, &exprs)?, get(&mut r, &exprs)?),
+                    5 => Call::Seed,
                     _ => return Err("bad call kind".into()),
                 };
                 let k = r.idx()?;
@@ -831,6 +835,7 @@ pub fn run_memo<'t>(
         Call::Infer(e, check) => Outcome::Expr(tc.infer(e, if check { InferFlag::Check } else { InferFlag::InferOnly })),
         Call::Whnf(e) => Outcome::Expr(tc.whnf(e)),
         Call::DefEq(x, y) => Outcome::Bool(tc.def_eq(x, y)),
+        Call::Seed => Outcome::Bool(true),
         Call::LazyDelta(x, y) => match tc.lazy_delta_step(x, y) {
             DeltaResult::FoundEqResult(b) => Outcome::Bool(b),
             DeltaResult::Exhausted(a, b) => Outcome::Exhausted(a, b),
@@ -1069,6 +1074,7 @@ pub fn write_calls<'t>(tc: &TypeChecker<'_, 't, '_>, calls: &[CallItem<'t>]) -> 
             Call::Whnf(_) => 2,
             Call::DefEq(..) => 3,
             Call::LazyDelta(..) => 4,
+            Call::Seed => 5,
         };
         w.out.extend_from_slice(&[32, kind | if eager { 0x80 } else { 0 }]);
         uvar(&mut w.out, u64::from(depth));
