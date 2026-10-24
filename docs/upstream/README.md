@@ -5,7 +5,7 @@ Contributions to send upstream, not yet posted: two nanoda_lib PRs (the kernel s
 
 ## 1. nanoda_lib PR
 
-**Repo:** https://github.com/ammkrn/nanoda_lib (fork it, then branch from `master`, at 998e0a8 as of 2026-10-22)
+**Repo:** https://github.com/ammkrn/nanoda_lib (fork it, then branch from `master`, at a3ef25a as of 2026-10-23)
 
 **Patch:** `nanoda-whnf-no-rebuild.patch` (next to this file). Apply it with `git apply nanoda-whnf-no-rebuild.patch`.
 
@@ -30,7 +30,7 @@ Contributions to send upstream, not yet posted: two nanoda_lib PRs (the kernel s
 
 ## 1b. nanoda_lib PR: telescopes in one pass
 
-**Patch:** `nanoda-telescope.patch` (next to this file, against `master` at 998e0a8, independent of 1). Apply it with `git apply nanoda-telescope.patch`.
+**Patch:** `nanoda-telescope.patch` (next to this file, against `master` at a3ef25a, independent of 1). Apply it with `git apply nanoda-telescope.patch`.
 
 **Title:** `Abstract a telescope's binders in one pass`
 
