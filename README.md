@@ -130,6 +130,10 @@ more gas to check than a refine has (about 6.5×10⁹), and everything downstrea
 - **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
   and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
   them, built in for its Lean toolchain (see How it works). A new toolchain needs a new check.
-- **A single declaration can be too heavy for a refine:** one lemma of FTA's 46,201 is. A faster
-  kernel (allocation and hash-consing dominate) is the next step.
-- **Next:** that, and attesting batches of one depth in parallel.
+- **A single declaration can be too heavy for a refine.** FTA's heaviest fits (since witness
+  allows a check 5×10⁹ gas), but 57 of Lean's 60 heaviest Mathlib theorems need several refines
+  under nanoda, the worst about 60. They don't split at the proof level, and checkpointing the
+  check's VM would have to carry 40–75 MiB a step. [docs/design/heavy-declarations.md](docs/design/heavy-declarations.md)
+  measures why, and proposes attested memoization: split at kernel judgments, and attest the
+  results the pieces share.
+- **Next:** the open questions in the heavy-declarations design (the fact DAG's work and depth, shipping facts with sharing), and a nanoda profile of all of Mathlib to count its heavy tail.
