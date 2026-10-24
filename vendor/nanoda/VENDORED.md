@@ -14,6 +14,11 @@ field-count validation, #63 and #65), with changes for running as a witness chec
   hash, loaded into one environment after their imports, with every constant they mention
   pinned, and the kernel's special names (`Nat.add`, the permitted axioms) pinned to given
   nodes. See witness-lean's `tools/lean/node_format.md`.
+- **Mutual inductive blocks checked once** (`check_inductive_declar` in `src/inductive.rs`):
+  upstream checks a block in full from each of its members; here from the first, with each
+  later member checking its own type and that it gives the same universe parameters, parameter
+  count and member list. And `Nodes::check_some` and `Nodes::is_inductive_block`, for checking an
+  inductive block's declarations in separate ops (see witness-lean's `check/src/lib.rs`).
 
 The crate is `no_std` except under test: upstream's tests run with std (and `rand`, a
 dev-dependency), reading their exports through `Config::in_memory`'s parser (`src/tests/util.rs`).
