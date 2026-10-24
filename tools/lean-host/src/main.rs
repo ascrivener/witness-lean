@@ -684,6 +684,41 @@ fn pack_args(dir: &str, list: &str, out: &str) {
 	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &witness)).unwrap();
 }
 
+/// The check arguments of batch `n` of a mathlib_work.py layout in `work`: its subjects untrusted,
+/// what it trusts (other batches' subjects, by claim entry) trusted, and its witness.
+fn batch_args(work: &str, n: usize, out: &str) {
+	let read = |f: String| std::fs::read_to_string(format!("{work}/{f}")).unwrap();
+	let list = |s: String| s.split(',').filter(|p| !p.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+	let mut blobs: Vec<(bool, Vec<u8>)> = Vec::new();
+	for r in list(read(format!("batch-{n}.trust"))) {
+		let (claim, entry) = r.rsplit_once(':').expect("CLAIM:ENTRY");
+		let m = claim.trim_start_matches("batch-").trim_end_matches(".claim");
+		let subject = &list(read(format!("batch-{m}.subjects")))[entry.parse::<usize>().unwrap()];
+		blobs.push((true, std::fs::read(format!("{work}/{subject}")).unwrap()));
+	}
+	// ONLY=K: subject K alone untrusted, the batch's other nodes trusted (for finding what fails).
+	let only: Option<usize> = std::env::var("ONLY").ok().map(|k| k.parse().unwrap());
+	let mut node = None;
+	for (k, f) in list(read(format!("batch-{n}.subjects"))).into_iter().enumerate() {
+		let d = std::fs::read(format!("{work}/{f}")).unwrap();
+		match only {
+			Some(o) if o == k => node = Some(blake2b256(&d)),
+			Some(_) if !d.starts_with(nanoda_lib::nodes::NODE_MAGIC) => continue,
+			_ => {},
+		}
+		blobs.push((only.is_some_and(|o| o != k), d));
+	}
+	let mut witness = std::fs::read(format!("{work}/batch-{n}.witness")).unwrap();
+	if let Some(node) = node {
+		let mine = |d: &&[u8]| d.starts_with(nanoda_lib::nodes::PROOF_MAGIC) && d[nanoda_lib::nodes::PROOF_MAGIC.len()..][..32] == node;
+		let proofs: Vec<Vec<u8>> = lean_check::parse_witness(&witness).unwrap().into_iter().filter(mine).map(<[u8]>::to_vec).collect();
+		witness = encode(&proofs);
+	}
+	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+	let check_blobs: Vec<CheckBlob> = blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
+	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &witness)).unwrap();
+}
+
 fn hex_of(h: &Hash) -> String {
 	h.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -840,6 +875,7 @@ fn main() {
 		["judgments-check", full, out] => judgments_check(full, out),
 		["judgments-ops", full, out] => judgments_ops(full, out),
 		["pack-args", dir, list, out] => pack_args(dir, list, out),
+		["batch-args", work, n, out] => batch_args(work, n.parse().expect("batch number"), out),
 		["split-inductive", args, out] => split_inductive(args, out, Duration::from_millis(40)),
 		["split-inductive", args, out, ms] => split_inductive(args, out, Duration::from_millis(ms.parse().expect("milliseconds"))),
 		["args", dir, p, n, out] => write_args(&Dir::open(dir), p, n.parse().expect("batch number"), out),

@@ -31,6 +31,7 @@ from lean_pack import pack  # noqa: E402
 import plan_profile  # noqa: E402
 
 MAX_WITNESS = 60000  # under witness's MAX_WITNESS_LEN of 64 KiB, as lean_batches.py
+PINS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../check/pins.txt")
 GAS_PER_MS = 80e6  # this machine (tools/lean/gas_per_ms.py)
 
 
@@ -162,6 +163,19 @@ def main():
         open(f"{a.work}/batch-{n}.gas", "w").write(str(int(gas)))
 
     rel = lambda f: os.path.relpath(f, a.work)
+    # The kernel's built-in constants (the check's pins) and what they import: a literal's
+    # expansion uses them without naming them, so neither a node's imports nor the profile's
+    # lookups have them. Every batch trusts those attested at a lower depth than its own.
+    pins = [l.split()[0] for l in open(PINS) if l.strip() and not l.startswith("#")]
+    index = {h: i for i, h in enumerate(hashes)}
+    builtins, stack = set(), [index[h] for h in pins]
+    while stack:
+        i = stack.pop()
+        if i not in builtins:
+            builtins.add(i)
+            stack.extend(int(j) for j in imports[i])
+    level_of = {i: b[0] for b in batches for i in b[1]}
+    below = lambda level, mine: sorted(hashes[i] for i in builtins if level_of[i] < level and i not in mine)
     heavy_set = set(heavy)
     total = len(batches)
     ops_written = 0
@@ -176,7 +190,8 @@ def main():
             number = {}
             for op in o["ops"]:
                 number[op["name"]] = total
-                refs = node_refs(op["trust_nodes"]) + [f"{claim(number[c])}:0" for c in op["trust_ops"]]
+                nodes = sorted(set(op["trust_nodes"]) | set(below(level, ())))
+                refs = node_refs(nodes) + [f"{claim(number[c])}:0" for c in op["trust_ops"]]
                 with open(f"{d}/{op['witness']}", "rb") as f:
                     w = f.read()
                 open(f"{a.work}/batch-{total}.subjects", "w").write(rel(f"{d}/{op['subject']}"))
@@ -185,10 +200,12 @@ def main():
                 open(f"{a.work}/batch-{total}.gas", "w").write(str(int(4e9)))
                 total += 1
                 ops_written += 1
-            refs = node_refs(o["final"]["trust_nodes"]) + [f"{claim(number[c])}:0" for c in o["final"]["trust_ops"]]
+            nodes = sorted(set(o["final"]["trust_nodes"]) | set(below(level, subjects)))
+            refs = node_refs(nodes) + [f"{claim(number[c])}:0" for c in o["final"]["trust_ops"]]
             write(n, files, refs, proofs, 4e9)
             continue
-        write(n, files, node_refs(hashes[i] for i in trusted), proofs, ms * GAS_PER_MS)
+        nodes = sorted(set(hashes[i] for i in trusted) | set(below(level, subjects)))
+        write(n, files, node_refs(nodes), proofs, ms * GAS_PER_MS)
     print(f"{len(batches)} batches and {ops_written} heavy ops", file=sys.stderr)
     print(total)
 
