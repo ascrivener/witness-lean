@@ -16,8 +16,10 @@
 #
 # The solver's export is converted to content-addressed nodes (tools/lean/lean_nodes.py), and
 # everything but the solver's theorem is planned into batches by dependency depth
-# (lean_plan.py): that's the library, which an attester attests once, batch by batch, each
-# trusting the nodes it needs from earlier batches. The poster's bounty names the theorem's
+# (lean_plan.py): that's the library, attested once, batch by batch, each trusting the nodes it
+# needs from earlier batches. Batches that don't depend on each other go in parallel: several
+# attesters (ATTESTERS), each filling a work package of its own with several batches a round
+# (witness's scripts/attest-batches.py). The poster's bounty names the theorem's
 # statement node by hash, and cites one attested node so every attestation a reveal uses shares
 # its pins. A theorem whose proof alone is too slow for a batch is split into smaller theorems
 # where that helps (lean_split.py; the statement, and so its hash, stays). The solver commits,
@@ -54,7 +56,7 @@ JAMT=${POLKAJAM_DIR:+$POLKAJAM_DIR/}jamt
 TESTNET=${POLKAJAM_DIR:+$POLKAJAM_DIR/}polkajam-testnet
 # Seconds between polls of the chain.
 POLL=2
-W=$WITNESS_DIR/target/debug/witness
+W=$WITNESS_DIR/target/release/witness
 submit() { python3 "$WITNESS_DIR/scripts/jam-submit.py" "$@"; }
 TMP=$(mktemp -d)
 LOG=$TMP/testnet.log
@@ -104,7 +106,7 @@ item() {
 join() { local IFS=,; echo "$*"; }
 
 # Account nonces, so the script can send each account's signed ops in turn.
-declare -A NONCE=([alice]=0 [pat]=0 [bob]=0)
+declare -A NONCE=([alice]=0 [bob]=0)
 # Set N to WHO's next nonce, and count it as used (in this shell: not in a $(...) subshell).
 take() { N=${NONCE[$1]}; NONCE[$1]=$((N + 1)); }
 
@@ -139,7 +141,7 @@ python3 tools/lean/lean_nodes.py "$TMP/full.ndjson" "$TMP/nodes"
 # (lean-host trace, at TRACE_MS native milliseconds a batch).
 plan() {
 	python3 tools/lean/lean_plan.py "$TMP/nodes" --goal "$THEOREM" >"$TMP/plan.json"
-	[ -n "${TRACE_MS:-}" ] || calibrate
+	[ -n "${GAS_PER_MS:-}" ] || calibrate
 	./target/release/lean-host trace "$TMP/nodes" "$TMP/plan.json" "$TMP/plan-traced.json" "$TRACE_MS" \
 		| tee "$TMP/trace.log"
 	mv "$TMP/plan-traced.json" "$TMP/plan.json"
@@ -148,13 +150,14 @@ plan() {
 # and a theorem split off a proof STMT_GAS to check its statement (lean_split.py --stmt-ms). Both
 # are budgeted in native time, so turn them into milliseconds on this machine: gas_per_ms.py
 # checks a few batches natively and in witness-sim. TRACE_MS and STMT_MS set the times directly.
+# The rate also turns each batch's traced time into the gas its check is estimated to use, which
+# attesting budgets packages by.
 calibrate() {
-	local rate
-	rate=$(python3 tools/lean/gas_per_ms.py ./target/release/lean-host "$WITNESS_DIR/target/release/witness-sim" \
+	GAS_PER_MS=$(python3 tools/lean/gas_per_ms.py ./target/release/lean-host "$WITNESS_DIR/target/release/witness-sim" \
 		"$CHECK" "$TMP/nodes" "$TMP/plan.json")
-	TRACE_MS=$(( ${TRACE_GAS:-2900000000} / rate ))
-	STMT_MS=${STMT_MS:-$(( (${STMT_GAS:-290000000} + rate - 1) / rate ))}
-	echo "$(( rate / 1000000 ))M gas per native ms: batches up to $TRACE_MS ms, split-off statements up to $STMT_MS ms"
+	TRACE_MS=${TRACE_MS:-$(( ${TRACE_GAS:-2900000000} / GAS_PER_MS ))}
+	STMT_MS=${STMT_MS:-$(( (${STMT_GAS:-290000000} + GAS_PER_MS - 1) / GAS_PER_MS ))}
+	echo "$(( GAS_PER_MS / 1000000 ))M gas per native ms: batches up to $TRACE_MS ms, split-off statements up to $STMT_MS ms"
 }
 cargo build -q --release -p lean-host
 cargo jam-build --out-dir out >/dev/null
@@ -173,7 +176,7 @@ if [ ${#OVER[@]} -gt 0 ]; then
 	fi
 fi
 W_DIR=$TMP/w
-BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
+BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR" --gas-per-ms "$GAS_PER_MS")
 PINS=$(cat "$W_DIR/pins")
 GOAL=$(cat "$W_DIR/goal.hash")
 
@@ -192,7 +195,7 @@ elif [ -z "${JAM_RPC:-}" ]; then
 fi
 
 step "building and deploying"
-(cd "$WITNESS_DIR" && cargo build -q -p witness-cli && cargo jam-build --out-dir out -p witness-service >/dev/null)
+(cd "$WITNESS_DIR" && cargo build -q --release -p witness-cli && cargo jam-build --out-dir out -p witness-service >/dev/null)
 before=$("$JAMT" list | wc -l)
 # The memo gas is witness_types::DEPOSIT_GAS, what a deposit into witness must carry.
 "$JAMT" create-service "$WITNESS_DIR/out/witness-service.jam" 10000000000 --min-memo-gas 300000 >/dev/null
@@ -206,17 +209,18 @@ wait_slot $(( $(slot) + 3 ))
 item "$($W propose --service "$SVC" --nonce 0 --fee-asset test --commit-deposit 10 --attest-deposit 10)"
 expect "witness configured" 'fee_asset: Some' config --config
 
-step "a library attester attests the library: $BATCHES batches"
-for who in alice pat bob; do item "$($W mint --to $who --amount 1000000)"; done
-expect "pat has the test asset" '^1000000$' balance --balance pat --asset test
-for ((n = 0; n < BATCHES; n++)); do
-	take pat
-	trust=$(cat "$W_DIR/batch-$n.trust")
-	signed pat "$($W attest --service "$SVC" --attester pat --nonce $N --check $CHECK --params "$PINS" \
-		--subjects "$(cat "$W_DIR/batch-$n.subjects")" ${trust:+--trust "$trust"} --witness-file "$W_DIR/batch-$n.proofs" \
-		--check-gas $GAS --claim-out "$W_DIR/batch-$n.claim" --extrinsics "$X" 2>/dev/null)"
-	expect "batch $n attested" 'Attestation \{ check_hash' attestation --attestation "$W_DIR/batch-$n.claim"
-done
+# Library attesters, each with its own nonces and core (attest-batches.py): by default as many as the
+# testnet has cores. PACKAGE_GAS caps the refine gas in a package: a local testnet's validators
+# share one machine, which drops packages it can't refine in time; SETTLE_SLOTS waits after each
+# round lands, while they audit it.
+ATTESTERS=${ATTESTERS:-pat,quinn}
+step "library attesters ($ATTESTERS) attest the library: $BATCHES batches"
+for who in alice bob ${ATTESTERS//,/ }; do item "$($W mint --to "$who" --amount 1000000)"; done
+expect "${ATTESTERS%%,*} has the test asset" '^1000000$' balance --balance "${ATTESTERS%%,*}" --asset test
+if [ "${JAM_RPC:-}" = sim ]; then CHAIN=(--sim "$JAMT"); else CHAIN=(); fi
+python3 "$WITNESS_DIR/scripts/attest-batches.py" "$W_DIR" --witness "$W" --service "$SVC" --check "$CHECK" \
+	--params "$PINS" --check-gas $GAS --attesters "$ATTESTERS" \
+	${PACKAGE_GAS:+--package-gas "$PACKAGE_GAS"} ${SETTLE_SLOTS:+--settle "$SETTLE_SLOTS"} "${CHAIN[@]}"
 
 step "alice posts the bounty: a proof of the statement node $GOAL"
 CITE=$(cat "$W_DIR/goal.cite")
