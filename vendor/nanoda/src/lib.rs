@@ -19,6 +19,7 @@ pub mod debug_printer;
 pub mod env;
 pub mod expr;
 pub mod inductive;
+pub mod judgment;
 pub mod level;
 pub mod name;
 pub mod nodes;

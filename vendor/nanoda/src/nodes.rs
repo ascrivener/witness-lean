@@ -33,6 +33,8 @@ use crate::env::Declar;
 use crate::expr::Expr;
 use crate::level::Level;
 use crate::parser::Parser;
+use crate::judgment::{self, Entry};
+use crate::tc::{InferFlag, TypeChecker};
 use crate::util::{Config, ExportFile, FxHashMap, NamePtr, new_fx_hash_map};
 use core::error::Error;
 use core::ops::Range;
@@ -82,6 +84,8 @@ pub struct Nodes<'p> {
     pub file: ExportFile<'p>,
     pub nodes: Vec<LoadedNode>,
     index: FxHashMap<Hash, usize>,
+    /// The node declaring each loaded name.
+    declared_by: FxHashMap<NamePtr<'p>, Hash>,
 }
 
 struct Header<'b> {
@@ -245,7 +249,7 @@ impl<'p> NodeLoader<'p> {
                 }
             }
         }
-        Ok(Nodes { file: crate::parser::finish(self.parser), nodes: self.nodes, index: self.index })
+        Ok(Nodes { file: crate::parser::finish(self.parser), nodes: self.nodes, index: self.index, declared_by: self.declared_by })
     }
 }
 
@@ -261,6 +265,107 @@ impl<'p> Nodes<'p> {
         for d in self.nodes[i].declars.clone() {
             self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
         }
+    }
+
+    /// The node declaring `name`, if one is loaded.
+    pub fn declared_by(&self, name: NamePtr<'_>) -> Option<Hash> {
+        self.declared_by.iter().find(|(n, _)| n.get_hash() == name.get_hash()).map(|(_, h)| *h)
+    }
+
+    /// Check that every constant `entries` mention is declared, here, by one of `imports`: then
+    /// each means here what it meant where the entries were made (see [`crate::judgment`]).
+    fn check_imports<'t>(&self, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>], imports: &[Hash]) -> Result<(), Box<dyn Error>> {
+        // Names compare by pointer; these are the environment's, before the checker's lifetime.
+        let declared_by: FxHashMap<u64, Hash> = self.declared_by.iter().map(|(n, h)| (n.get_hash(), *h)).collect();
+        for name in judgment::mentions(tc, entries) {
+            if !declared_by.get(&name.get_hash()).is_some_and(|h| imports.contains(h)) {
+                return Err("a judgment mentions a constant not declared by one of its imports".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The imports a judgment of `entries` needs here: the nodes declaring what they mention.
+    /// `None` if one isn't declared by a loaded node.
+    pub fn judgment_imports<'t>(&self, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>]) -> Option<Vec<Hash>> {
+        let mut out: Vec<Hash> = judgment::mentions(tc, entries).into_iter().map(|n| self.declared_by(n)).collect::<Option<_>>()?;
+        out.sort();
+        out.dedup();
+        Some(out)
+    }
+
+    /// Seed `tc`, a checker for node `declaration`, with the entries of `cited`: judgments the
+    /// caller vouches were attested. Each must be for `declaration`, and import what it mentions.
+    fn seed<'t>(&self, tc: &mut TypeChecker<'_, 't, 'p>, declaration: &Hash, cited: &[&[u8]]) -> Result<(), Box<dyn Error>> {
+        for blob in cited {
+            let header = judgment::header(blob)?;
+            if header.declaration != *declaration {
+                return Err("a judgment for another declaration".into());
+            }
+            let entries = judgment::entries(tc, &header)?;
+            self.check_imports(tc, &entries, &header.imports)?;
+            judgment::seed(tc, &entries);
+        }
+        Ok(())
+    }
+
+    /// Node `i`'s single declaration.
+    fn single(&self, i: usize) -> Result<&Declar<'p>, Box<dyn Error>> {
+        let node = &self.nodes[i];
+        if node.declars.len() != 1 {
+            return Err("judgments for a node of several declarations".into());
+        }
+        Ok(self.file.declars.get_index(node.declars.start).unwrap().1)
+    }
+
+    /// [`Self::check`] node `i`, its checker seeded first with the judgments `cited` (attested,
+    /// as the caller vouches; see [`crate::judgment`]). Type errors panic; a judgment that doesn't
+    /// belong is an error.
+    pub fn check_with(&self, i: usize, cited: &[&[u8]]) -> Result<(), Box<dyn Error>> {
+        if cited.is_empty() {
+            self.check(i);
+            return Ok(());
+        }
+        let d = self.single(i)?;
+        let val = match d {
+            Declar::Theorem { val, .. } | Declar::Definition { val, .. } | Declar::Opaque { val, .. } => *val,
+            _ => return Err("judgments for a declaration without a value".into()),
+        };
+        let hash = self.nodes[i].hash;
+        self.file.with_tc_and_declar(*d.info(), |tc| {
+            self.seed(tc, &hash, cited)?;
+            // As `check_declar` does for a declaration with a value.
+            tc.check_declar_info(d).unwrap();
+            let inferred_type = tc.infer(val, InferFlag::Check);
+            tc.assert_def_eq(inferred_type, d.info().ty);
+            Ok(())
+        })
+    }
+
+    /// Attest the judgments `subjects`, for node `declaration`: in a checker for it, seeded with
+    /// the judgments `cited`, run the calls in `calls`; then every entry of every subject must be
+    /// in its caches. Type errors panic.
+    pub fn attest_judgments(&self, declaration: usize, cited: &[&[u8]], calls: &[u8], subjects: &[&[u8]]) -> Result<(), Box<dyn Error>> {
+        let d = self.single(declaration)?;
+        let hash = self.nodes[declaration].hash;
+        self.file.with_tc_and_declar(*d.info(), |tc| {
+            self.seed(tc, &hash, cited)?;
+            for (depth, call) in judgment::calls(tc, calls)? {
+                judgment::run(tc, depth, call)?;
+            }
+            for blob in subjects {
+                let header = judgment::header(blob)?;
+                if header.declaration != hash {
+                    return Err("a judgment for another declaration".into());
+                }
+                let entries = judgment::entries(tc, &header)?;
+                self.check_imports(tc, &entries, &header.imports)?;
+                if !entries.iter().all(|e| judgment::holds(tc, e)) {
+                    return Err("an entry the calls didn't make".into());
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Check that node `theorem` is a theorem with no universe parameters whose type is exactly

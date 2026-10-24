@@ -26,6 +26,21 @@
 //! witness lets a reveal trust attested subjects only if its bounty cites one (or the hunter
 //! would pick the attestations' params), so a bounty cites an attested node, its `Goal` say.
 //!
+//! **Judgments** (`nanoda_lib::judgment`) let a declaration too heavy for one check be checked in
+//! pieces. A judgment is a blob of kernel cache entries made while checking one declaration's
+//! node, importing the nodes that declare what it mentions:
+//!
+//! - **Attesting judgments:** the subjects are judgments, all for one declaration; the witness
+//!   is that declaration's node and a calls blob. The check runs the calls in a checker for the
+//!   declaration, seeded with the judgments it cites, and accepts if every subject's entries are
+//!   then in the checker's caches. The node is loaded only to set the checker up, not checked.
+//! - **Using them:** an attest or reveal op may cite judgments. Each untrusted node is checked
+//!   with the cited judgments for it seeded into its checker; a cited judgment for anything else,
+//!   or mentioning a constant not declared by one of its imports, fails the op.
+//!
+//! By induction, every cited entry is a judgment the kernel made, about terms that mean the same
+//! here: witness only passes attested subjects as trusted, and only ones attested by this check.
+//!
 //! Only `propext`, `Classical.choice` and `Quot.sound` may be declared as axioms. Type errors
 //! panic, which counts as false.
 
@@ -34,6 +49,7 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, vec::Vec};
+use nanoda_lib::judgment::{self, CALLS_MAGIC, JUDGMENT_MAGIC};
 use nanoda_lib::nodes::{Hash, NODE_MAGIC, NodeLoader, PROOF_MAGIC};
 use witness_check::{Input, Mode};
 
@@ -119,7 +135,40 @@ fn import_list(mut bytes: &[u8]) -> Option<Vec<Hash>> {
 /// a declaration against those loaded before it). Each node loads after the ones it (and its
 /// proof) imports; a trusted node's imports needn't be there (see `nanoda_lib::nodes`), an
 /// untrusted one's must.
-fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+///
+/// Each untrusted node is checked seeded with the judgments in `cited` made for it (attested:
+/// witness passes only attested subjects as trusted); a cited judgment for anything else is
+/// refused.
+fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>, cited: &[&[u8]]) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+	let nodes = load(pins, entries)?;
+	let mut seeded = 0;
+	for (i, node) in nodes.nodes.iter().enumerate() {
+		let entry = &entries[&node.hash];
+		if !entry.trusted {
+			if node.assumed {
+				return None;
+			}
+			let mine = judgments_for(cited, &node.hash)?;
+			seeded += mine.len();
+			nodes.check_with(i, &mine).ok()?;
+		}
+	}
+	(seeded == cited.len()).then_some(nodes)
+}
+
+/// The judgments of `cited` made for node `node`.
+fn judgments_for<'a>(cited: &[&'a [u8]], node: &Hash) -> Option<Vec<&'a [u8]>> {
+	let mut out = Vec::new();
+	for &j in cited {
+		if judgment::header(j).ok()?.declaration == *node {
+			out.push(j);
+		}
+	}
+	Some(out)
+}
+
+/// Load `entries`, trusted ones first, each after its imports.
+fn load<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
 	let mut loader = NodeLoader::new(pins);
 	for trusted_phase in [true, false] {
 		for (root, _) in entries.iter().filter(|(_, e)| e.trusted == trusted_phase) {
@@ -153,17 +202,7 @@ fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Opt
 			}
 		}
 	}
-	let nodes = loader.finish().ok()?;
-	for (i, node) in nodes.nodes.iter().enumerate() {
-		let entry = &entries[&node.hash];
-		if !entry.trusted {
-			if node.assumed {
-				return None;
-			}
-			nodes.check(i);
-		}
-	}
-	Some(nodes)
+	loader.finish().ok()
 }
 
 /// Add `node` to `entries`. The same trusted node may come twice (an op may cite a subject
@@ -192,28 +231,69 @@ fn attest(input: &Input, pins: &[Hash]) -> Option<()> {
 		return None;
 	}
 	let mut entries = BTreeMap::new();
+	let (mut cited, mut judgments) = (Vec::new(), Vec::new());
 	let mut subjects = 0;
-	let mut proofs = parse_witness(input.witness)?;
+	let mut witness = parse_witness(input.witness)?;
 	for blob in input.blobs() {
+		if blob.data.starts_with(JUDGMENT_MAGIC) {
+			if blob.trusted { cited.push(blob.data) } else { judgments.push(blob.data) }
+			continue;
+		}
 		// A batch too big for an op carries its proofs among its subjects instead.
 		if !blob.trusted && blob.data.starts_with(PROOF_MAGIC) {
-			proofs.push(blob.data);
+			witness.push(blob.data);
 			continue;
 		}
 		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
 		subjects += usize::from(!blob.trusted);
 	}
+	if !judgments.is_empty() {
+		// A judgment op attests judgments only.
+		if subjects != 0 {
+			return None;
+		}
+		return attest_judgments(pins, entries, &cited, &judgments, &witness);
+	}
 	if subjects == 0 {
 		return None;
 	}
-	attach(&mut entries, &proofs)?;
-	load_and_check(pins, &entries).map(|_| ())
+	attach(&mut entries, &witness)?;
+	load_and_check(pins, &entries, &cited).map(|_| ())
+}
+
+/// Attest `judgments`, all for one declaration, whose node is in the witness with the calls that
+/// make them: run the calls in a checker for it, seeded with the judgments `cited`, then every
+/// entry of every judgment must be in its caches.
+fn attest_judgments<'a>(
+	pins: &[Hash],
+	mut entries: BTreeMap<Hash, Entry<'a>>,
+	cited: &[&[u8]],
+	judgments: &[&[u8]],
+	witness: &[&'a [u8]],
+) -> Option<()> {
+	let &[a, b] = witness else { return None };
+	let (node, calls) = if a.starts_with(NODE_MAGIC) { (a, b) } else { (b, a) };
+	if !node.starts_with(NODE_MAGIC) || !calls.starts_with(CALLS_MAGIC) {
+		return None;
+	}
+	let declaration = blake2b256(node);
+	// Loaded as trusted, unchecked: it fixes the checker's environment (what's declared before it)
+	// and universe parameters, and nothing here relies on it being true. Its judgments are only
+	// ever seeded into a check of this same node.
+	insert(&mut entries, declaration, node, true)?;
+	let nodes = load(pins, &entries)?;
+	nodes.attest_judgments(nodes.find(&declaration)?, cited, calls, judgments).ok()
 }
 
 fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {
 	let goal: &Hash = input.params.try_into().ok()?;
 	let mut entries = BTreeMap::new();
+	let mut cited = Vec::new();
 	for blob in input.blobs() {
+		if blob.trusted && blob.data.starts_with(JUDGMENT_MAGIC) {
+			cited.push(blob.data);
+			continue;
+		}
 		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
 	}
 	let (nodes, proofs): (Vec<&[u8]>, Vec<&[u8]>) =
@@ -222,7 +302,7 @@ fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {
 		insert(&mut entries, blake2b256(node), node, false)?;
 	}
 	attach(&mut entries, &proofs)?;
-	let loaded = load_and_check(pins, &entries)?;
+	let loaded = load_and_check(pins, &entries, &cited)?;
 	// Untrusted theorems were proven above, and trusted ones were when they were attested.
 	loaded.nodes[loaded.find(goal)?].theorem.then_some(())
 }
