@@ -21,6 +21,15 @@ field-count validation, #63 and #65), with changes for running as a witness chec
   starting depth above its inputs' locals. See witness-lean's
   `docs/design/heavy-declarations.md`. `lazy_delta_step` is `pub(crate)` for running it as a
   call, and `SortedPair`'s fields for writing its entries.
+- **Mutual inductive blocks checked once** (`check_inductive_declar` in `src/inductive.rs`):
+  upstream checks a block in full from each of its members; here from the first, with each
+  later member checking its own type and that it gives the same universe parameters, parameter
+  count and member list. A block is remembered only when checked whole.
+- **Checking an inductive block in parts** (`Nodes::check_parts`, `Nodes::is_inductive_block`,
+  `ExportFile::check_declar_phase` and `env::Phase`): some of a block's declarations, or one of
+  the two phases of an inductive type's check after its type and specs (its constructors, or its
+  recursors), for checking a block too big for one op in several (see witness-lean's
+  `check/src/lib.rs`).
 
 The crate is `no_std` except under test: upstream's tests run with std (and `rand`, a
 dev-dependency), reading their exports through `Config::in_memory`'s parser (`src/tests/util.rs`).

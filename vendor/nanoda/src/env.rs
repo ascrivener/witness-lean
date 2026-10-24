@@ -52,6 +52,15 @@ pub struct RecRule<'a> {
     pub val: ExprPtr<'a>,
 }
 
+/// How much of a declaration's check to run: all of it, or (for an inductive type) one of the two
+/// phases after its type and specs: its constructors, or its recursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Whole,
+    Constructors,
+    Recursors,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Declar<'a> {
     Axiom { info: DeclarInfo<'a> },

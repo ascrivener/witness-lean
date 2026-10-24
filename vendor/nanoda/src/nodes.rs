@@ -29,7 +29,7 @@
 //! witness, subjects of attestations).
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::env::Declar;
+use crate::env::{Declar, Phase};
 use crate::expr::Expr;
 use crate::level::Level;
 use crate::parser::Parser;
@@ -262,9 +262,40 @@ impl<'p> Nodes<'p> {
     /// the declarations loaded before it. An assumed statement's type is checked, but nothing
     /// proves it.
     pub fn check(&self, i: usize) {
-        for d in self.nodes[i].declars.clone() {
-            self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
+        self.check_parts(i, |_| vec![Phase::Whole]);
+    }
+
+    /// [`Self::check`] the parts of node `i`'s declarations that `parts` picks, by each one's
+    /// position within the node: the phases of its check to run (see [`Phase`]), none to skip it.
+    /// Panics if it names phases of a declaration that isn't an inductive type.
+    pub fn check_parts(&self, i: usize, parts: impl Fn(usize) -> Vec<Phase>) {
+        for (k, d) in self.nodes[i].declars.clone().enumerate() {
+            let d = self.file.declars.get_index(d).unwrap().1;
+            for phase in parts(k) {
+                self.file.check_declar_phase(d, phase);
+            }
         }
+    }
+
+    /// Whether node `i`'s declaration at position `k` is an inductive type (so its check has
+    /// phases).
+    pub fn is_inductive_type(&self, i: usize, k: usize) -> bool {
+        let d = self.nodes[i].declars.start + k;
+        k < self.nodes[i].declars.len() && matches!(self.file.declars.get_index(d).unwrap().1, Declar::Inductive(..))
+    }
+
+    /// How many declarations node `i` holds.
+    pub fn declaration_count(&self, i: usize) -> usize {
+        self.nodes[i].declars.len()
+    }
+
+    /// Whether node `i` is an inductive block: inductive types, their constructors and recursors.
+    /// Only such a node's declarations may be checked apart (each is checked alone the same way
+    /// whichever op it's in; a theorem's node can't be split from its proof).
+    pub fn is_inductive_block(&self, i: usize) -> bool {
+        self.nodes[i].declars.clone().all(|d| {
+            matches!(self.file.declars.get_index(d).unwrap().1, Declar::Inductive(..) | Declar::Constructor(..) | Declar::Recursor(..))
+        })
     }
 
     /// The node declaring `name`, if one is loaded.

@@ -81,6 +81,16 @@ pub struct TypeChecker<'x, 't, 'p> {
 
 impl<'p> ExportFile<'p> {
     /// The entry point for checking a declaration `d`.
+    /// [`Self::check_declar`], or one phase of an inductive type's check (see
+    /// [`crate::env::Phase`]); any other declaration only whole.
+    pub fn check_declar_phase(&self, d: &Declar<'p>, phase: crate::env::Phase) {
+        match (d, phase) {
+            (_, crate::env::Phase::Whole) => self.check_declar(d),
+            (Declar::Inductive(..), _) => self.check_inductive_phase(d, phase),
+            _ => panic!("only an inductive type's check has phases"),
+        }
+    }
+
     pub fn check_declar(&self, d: &Declar<'p>) {
         use Declar::*;
         match d {

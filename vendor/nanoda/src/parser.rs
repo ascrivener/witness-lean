@@ -473,6 +473,7 @@ pub(crate) fn finish<'p>(parser: Parser<'p>) -> crate::util::ExportFile<'p> {
         config: parser.config,
         mutual_block_sizes: parser.mutual_block_sizes,
         ind_name_to_recursor_names,
+        checked_blocks: core::cell::RefCell::new(new_fx_hash_map()),
     };
     export_file
 }

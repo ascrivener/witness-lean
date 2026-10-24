@@ -221,7 +221,18 @@ pub struct ExportFile<'p> {
     pub config: Config,
     // Information used for setting EnvLimit during inductive checking.
     pub mutual_block_sizes: FxHashMap<NamePtr<'p>, (usize, usize)>,
-    pub ind_name_to_recursor_names: FxHashMap<NamePtr<'p>, FxHashSet<NamePtr<'p>>>
+    pub ind_name_to_recursor_names: FxHashMap<NamePtr<'p>, FxHashSet<NamePtr<'p>>>,
+    /// Mutual blocks already checked, by their position (see `check_inductive_declar`).
+    pub(crate) checked_blocks: core::cell::RefCell<FxHashMap<(usize, usize), CheckedBlock>>,
+}
+
+/// What checking a mutual block depended on, of the member it was checked from, and the
+/// recursor names it derived: pointers, by their raw value.
+pub(crate) struct CheckedBlock {
+    pub(crate) uparams: u64,
+    pub(crate) num_params: u16,
+    pub(crate) all_ind_names: Vec<u64>,
+    pub(crate) recursor_names: Vec<u64>,
 }
 
 impl<'p> ExportFile<'p> {
