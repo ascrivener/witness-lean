@@ -252,7 +252,12 @@ impl<'p> ExportFile<'p> {
         let mut ctx = TcCtx::new(self, &mut dag);
         let env = self.new_env(EnvLimit::ByName(d.name));
         let mut tc = TypeChecker::new(&mut ctx, &env, Some(d));
-        f(&mut tc)
+        #[cfg(feature = "trace")]
+        let t0 = std::time::Instant::now();
+        let r = f(&mut tc);
+        #[cfg(feature = "trace")]
+        tc.mem_report(t0.elapsed());
+        r
     }
 
     pub fn with_pp<F, A>(&self, f: F) -> A

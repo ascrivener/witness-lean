@@ -506,11 +506,35 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     pub(crate) fn infer(&mut self, e: ExprPtr<'t>, flag: InferFlag) -> ExprPtr<'t> {
+        #[cfg(feature = "trace")]
+        {
+            let t = prof::enter(self, "infer");
+            let r = self.infer_inner(e, flag);
+            let cold = if prof::wants_cold(&t) {
+                let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
+                let c = prof::begin_cold(self);
+                let _ = self.infer_inner(e, flag);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                Some(m)
+            } else {
+                None
+            };
+            prof::exit(self, t, &[e], cold);
+            return r;
+        }
+        #[cfg(not(feature = "trace"))]
+        self.infer_inner(e, flag)
+    }
+
+    fn infer_inner(&mut self, e: ExprPtr<'t>, flag: InferFlag) -> ExprPtr<'t> {
         if let Some(cached) = self.tc_cache.infer_cache_check.get(&e).copied() {
+            #[cfg(feature = "trace")] prof::hit(0, &e);
             return cached
         }
         if flag == InferFlag::InferOnly {
             if let Some(cached) = self.tc_cache.infer_cache_no_check.get(&e).copied() {
+                #[cfg(feature = "trace")] prof::hit(1, &e);
                 return cached
             }
         }
@@ -535,9 +559,11 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         };
         match flag {
             InferFlag::InferOnly => {
+                #[cfg(feature = "trace")] prof::ins(self, 1, &e, &[e, r]);
                 self.tc_cache.infer_cache_no_check.insert(e, r);
             }
             InferFlag::Check => {
+                #[cfg(feature = "trace")] prof::ins(self, 0, &e, &[e, r]);
                 self.tc_cache.infer_cache_check.insert(e, r);
             }
         }
@@ -757,10 +783,44 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     pub fn whnf(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
+        #[cfg(feature = "trace")]
+        {
+            // NANODA_FLUSH_EVERY=N: clear every cache each N calls, to measure what they save.
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static CALLS: AtomicU64 = AtomicU64::new(0);
+            static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let every = *EVERY.get_or_init(|| std::env::var("NANODA_FLUSH_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+            if every > 0 && CALLS.fetch_add(1, Ordering::Relaxed) % every == every - 1 {
+                self.tc_cache = TcCache::new();
+            }
+        }
+        #[cfg(feature = "trace")]
+        {
+            let t = prof::enter(self, "whnf");
+            let r = self.whnf_inner(e);
+            let cold = if prof::wants_cold(&t) {
+                let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
+                let c = prof::begin_cold(self);
+                let _ = self.whnf_inner(e);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                Some(m)
+            } else {
+                None
+            };
+            prof::exit(self, t, &[e], cold);
+            return r;
+        }
+        #[cfg(not(feature = "trace"))]
+        self.whnf_inner(e)
+    }
+
+    fn whnf_inner(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
         if matches!(self.ctx.read_expr(e), NatLit { .. } | StringLit { .. }) {
             return e
         }
         if let Some(cached) = self.tc_cache.whnf_cache.get(&e).copied() {
+            #[cfg(feature = "trace")] prof::hit(2, &e);
             return cached
         }
         let mut cursor = e;
@@ -771,6 +831,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             } else if let Some(next_term) = self.unfold_def(whnfd) {
                 cursor = next_term;
             } else {
+                #[cfg(feature = "trace")] prof::ins(self, 2, &e, &[e, whnfd]);
                 self.tc_cache.whnf_cache.insert(e, whnfd);
                 return whnfd
             }
@@ -783,6 +844,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
 
     fn whnf_no_unfolding_aux(&mut self, e: ExprPtr<'t>, cheap_proj: bool) -> ExprPtr<'t> {
         if let Some(cached) = self.tc_cache.whnf_no_unfolding_cache.get(&e).copied() {
+            #[cfg(feature = "trace")] prof::hit(3, &e);
             return cached
         }
         let (e_fun, args) = self.ctx.unfold_apps(e);
@@ -837,6 +899,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             Local { .. } | NatLit { .. } | StringLit { .. } => (false, e),
         };
         if should_cache && !cheap_proj {
+            #[cfg(feature = "trace")] prof::ins(self, 3, &e, &[e, eprime]);
             self.tc_cache.whnf_no_unfolding_cache.insert(e, eprime);
         }
         eprime
@@ -951,11 +1014,34 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     pub fn assert_def_eq(&mut self, u: ExprPtr<'t>, v: ExprPtr<'t>) { assert!(self.def_eq(u, v)) }
 
     pub fn def_eq(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
+        #[cfg(feature = "trace")]
+        {
+            let t = prof::enter(self, "def_eq");
+            let r = self.def_eq_inner(x, y);
+            let cold = if prof::wants_cold(&t) {
+                let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
+                let c = prof::begin_cold(self);
+                let _ = self.def_eq_inner(x, y);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                Some(m)
+            } else {
+                None
+            };
+            prof::exit(self, t, &[x, y], cold);
+            return r;
+        }
+        #[cfg(not(feature = "trace"))]
+        self.def_eq_inner(x, y)
+    }
+
+    fn def_eq_inner(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
         if let Some(easy) = self.def_eq_quick_check(x, y) {
             return easy
         }
         let defeq_fail_cache_key = (x, y, self.ctx.eager_mode);
         if self.tc_cache.defeq_fail_cache.contains(&defeq_fail_cache_key) {
+            #[cfg(feature = "trace")] prof::hit(4, &defeq_fail_cache_key);
             return false
         }
         let x_n = self.whnf_no_unfolding_cheap_proj(x);
@@ -997,8 +1083,10 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             }
         };
         if result {
+            #[cfg(feature = "trace")] prof::ins(self, 5, &SortedPair::new(x, y), &[x, y]);
             self.tc_cache.eq_cache.insert(SortedPair::new(x, y));
         } else {
+            #[cfg(feature = "trace")] prof::ins(self, 4, &defeq_fail_cache_key, &[defeq_fail_cache_key.0, defeq_fail_cache_key.1]);
             self.tc_cache.defeq_fail_cache.insert(defeq_fail_cache_key);        
         }
         result
@@ -1152,6 +1240,8 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     /// Try to unfold the base `Const` and re-fold applications, but don't
     /// do any further reduction.
     fn unfold_def(&mut self, e: ExprPtr<'t>) -> Option<ExprPtr<'t>> {
+        #[cfg(feature = "trace")]
+        prof::count_unfold(self, e);
         let (fun, args) = self.ctx.unfold_apps(e);
         let (name, levels) = self.ctx.try_const_info(fun)?;
         let (def_uparams, def_value) = self.env.get_declar_val(&name)?;
@@ -1175,9 +1265,11 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             return Some(true)
         }
         if self.tc_cache.eq_cache.contains(&SortedPair::new(x, y)) {
+            #[cfg(feature = "trace")] prof::hit(5, &SortedPair::new(x, y));
             return Some(true)
         }
         if self.ctx.alpha_eq(x, y) {
+            #[cfg(feature = "trace")] prof::ins(self, 5, &SortedPair::new(x, y), &[x, y]);
             self.tc_cache.eq_cache.insert(SortedPair::new(x, y));
             return Some(true)
         }
@@ -1191,10 +1283,16 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     fn failure_cache_contains(&self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
-        self.tc_cache.congr_fail_cache.contains(&SortedPair::new(x, y))
+        let failed = self.tc_cache.congr_fail_cache.contains(&SortedPair::new(x, y));
+        #[cfg(feature = "trace")]
+        if failed {
+            prof::hit(6, &SortedPair::new(x, y));
+        }
+        failed
     }
 
     fn failure_cache_insert(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) {
+        #[cfg(feature = "trace")] prof::ins(self, 6, &SortedPair::new(x, y), &[x, y]);
         self.tc_cache.congr_fail_cache.insert(SortedPair::new(x, y));
     }
 
@@ -1272,7 +1370,29 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     ///
     /// After each reduction, check whether we can show definitional equality without having
     /// to continue unfolding.
-    fn lazy_delta_step(&mut self, mut x: ExprPtr<'t>, mut y: ExprPtr<'t>) -> DeltaResult<'t> {
+    fn lazy_delta_step(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> DeltaResult<'t> {
+        #[cfg(feature = "trace")]
+        {
+            let t = prof::enter(self, "lazy_delta");
+            let r = self.lazy_delta_step_inner(x, y);
+            let cold = if prof::wants_cold(&t) {
+                let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
+                let c = prof::begin_cold(self);
+                let _ = self.lazy_delta_step_inner(x, y);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                Some(m)
+            } else {
+                None
+            };
+            prof::exit(self, t, &[x, y], cold);
+            return r;
+        }
+        #[cfg(not(feature = "trace"))]
+        self.lazy_delta_step_inner(x, y)
+    }
+
+    fn lazy_delta_step_inner(&mut self, mut x: ExprPtr<'t>, mut y: ExprPtr<'t>) -> DeltaResult<'t> {
         loop {
             if let Some(r) = self.delta_try_nat(x, y) {
                 return r
@@ -1359,5 +1479,343 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             }
         }
         false
+    }
+}
+
+#[cfg(feature = "trace")]
+impl<'x, 't, 'p> TypeChecker<'x, 't, 'p> {
+    /// After a declaration slower than 100 ms: what its checker built, by structure.
+    pub(crate) fn mem_report(&self, elapsed: core::time::Duration) {
+        if elapsed.as_millis() < 100 {
+            return;
+        }
+        prof::summary();
+        prof::fact_report();
+        let dag = &*self.ctx.dag;
+        let c = &self.tc_cache;
+        let e = core::mem::size_of::<crate::expr::Expr<'t>>() + 16;
+        let map = 2 * core::mem::size_of::<usize>() + 8;
+        let exprs = dag.exprs.len();
+        let caches = [
+            ("infer_check", c.infer_cache_check.len()),
+            ("infer_no_check", c.infer_cache_no_check.len()),
+            ("whnf", c.whnf_cache.len()),
+            ("whnf_no_unfolding", c.whnf_no_unfolding_cache.len()),
+            ("eq", c.eq_cache.len()),
+            ("congr_fail", c.congr_fail_cache.len()),
+            ("defeq_fail", c.defeq_fail_cache.len()),
+        ];
+        let entries: usize = caches.iter().map(|(_, n)| n).sum();
+        std::eprintln!(
+            "nanoda mem: {:?}: {} exprs (~{} MiB), {} levels, {} names; caches {} entries (~{} MiB): {}",
+            elapsed,
+            exprs,
+            exprs * e >> 20,
+            dag.levels.len(),
+            dag.names.len(),
+            entries,
+            entries * (map + 8) >> 20,
+            caches.iter().map(|(k, n)| std::format!("{k} {n}")).collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
+/// Where a check's time goes (`trace` builds only): calls of infer, whnf, def_eq and the lazy
+/// delta step slower than NANODA_PROF_MS (default 10), as a tree printed children first, and
+/// how often each definition was unfolded.
+#[cfg(feature = "trace")]
+pub(crate) mod prof {
+    use super::TypeChecker;
+    use crate::util::ExprPtr;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::string::String;
+    use std::time::Instant;
+
+    std::thread_local! {
+        static DEPTH: RefCell<usize> = const { RefCell::new(0) };
+        static UNFOLDS: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+        static CALLS: RefCell<HashMap<&'static str, (u64, u128)>> = RefCell::new(HashMap::new());
+    }
+
+    fn threshold() -> u128 {
+        static T: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        *T.get_or_init(|| std::env::var("NANODA_PROF_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10))
+    }
+
+    pub(crate) struct Entry {
+        name: &'static str,
+        start: Instant,
+        exprs: usize,
+        depth: usize,
+        idx: u64,
+        cold: bool,
+        /// Total cold re-run time so far, at entry: what of the elapsed time wasn't this call's.
+        cold_before: u128,
+    }
+
+    std::thread_local! {
+        /// Inside a cold re-run: no logging, no nested re-runs.
+        static COLD: RefCell<bool> = const { RefCell::new(false) };
+        static INDEX: RefCell<u64> = const { RefCell::new(0) };
+        static COLD_US: RefCell<u128> = const { RefCell::new(0) };
+    }
+
+    pub(crate) fn enter(tc: &TypeChecker<'_, '_, '_>, name: &'static str) -> Entry {
+        let depth = DEPTH.with(|d| {
+            let mut d = d.borrow_mut();
+            *d += 1;
+            *d - 1
+        });
+        let cold = COLD.with(|c| *c.borrow());
+        let idx = INDEX.with(|i| {
+            let mut i = i.borrow_mut();
+            *i += 1;
+            *i
+        });
+        let cold_before = COLD_US.with(|c| *c.borrow());
+        Entry { name, start: Instant::now(), exprs: tc.ctx.dag.exprs.len(), depth, idx, cold, cold_before }
+    }
+
+    std::thread_local! {
+        /// Each cache entry's key, hashed, with the call index it was created at; and every hit,
+        /// as (call index of the hit, call index the entry was created at).
+        static CREATED: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+        static HITS: RefCell<std::vec::Vec<(u64, u64)>> = const { RefCell::new(std::vec::Vec::new()) };
+    }
+
+    fn key<K: core::hash::Hash>(cache: u8, k: &K) -> u64 {
+        use core::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        cache.hash(&mut h);
+        k.hash(&mut h);
+        h.finish()
+    }
+
+    fn now() -> u64 {
+        INDEX.with(|i| *i.borrow())
+    }
+
+    std::thread_local! {
+        /// NANODA_PIECES: each piece's call index and the creation indices of the entries it
+        /// needs; and, for each needed entry, the ids of the nodes its terms reach.
+        static PIECES: RefCell<Option<std::vec::Vec<std::vec::Vec<u64>>>> = const { RefCell::new(None) };
+        static NEEDED: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
+        static FACTS: RefCell<HashMap<u64, std::vec::Vec<u64>>> = RefCell::new(HashMap::new());
+    }
+
+    fn load_pieces() {
+        PIECES.with(|p| {
+            if p.borrow().is_some() {
+                return;
+            }
+            let mut pieces = std::vec::Vec::new();
+            if let Some(path) = std::env::var_os("NANODA_PIECES") {
+                for line in std::fs::read_to_string(path).unwrap().lines() {
+                    let ids: std::vec::Vec<u64> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
+                    NEEDED.with(|n| n.borrow_mut().extend(ids[1..].iter().copied()));
+                    pieces.push(ids);
+                }
+            }
+            *p.borrow_mut() = Some(pieces);
+        });
+    }
+
+    fn node_id<'t>(e: ExprPtr<'t>) -> u64 {
+        use core::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        e.hash(&mut h);
+        h.finish()
+    }
+
+    pub(crate) fn ins<'t, K: core::hash::Hash>(tc: &TypeChecker<'_, 't, '_>, cache: u8, k: &K, roots: &[ExprPtr<'t>]) {
+        let at = now();
+        CREATED.with(|c| {
+            c.borrow_mut().entry(key(cache, k)).or_insert(at);
+        });
+        load_pieces();
+        if NEEDED.with(|n| n.borrow().contains(&at)) {
+            use crate::expr::Expr::*;
+            let mut seen = std::collections::HashSet::new();
+            let mut stack: std::vec::Vec<ExprPtr<'t>> = roots.to_vec();
+            while let Some(e) = stack.pop() {
+                if !seen.insert(e) {
+                    continue;
+                }
+                match tc.ctx.read_expr(e) {
+                    App { fun, arg, .. } => stack.extend([fun, arg]),
+                    Pi { binder_type, body, .. } | Lambda { binder_type, body, .. } => stack.extend([binder_type, body]),
+                    Let { binder_type, val, body, .. } => stack.extend([binder_type, val, body]),
+                    Proj { structure, .. } => stack.push(structure),
+                    Local { binder_type, .. } => stack.push(binder_type),
+                    _ => {},
+                }
+            }
+            FACTS.with(|f| f.borrow_mut().entry(at).or_default().extend(seen.into_iter().map(node_id)));
+        }
+    }
+
+    /// For each piece: the nodes its needed facts reach, shared, against the plain sum.
+    pub(crate) fn fact_report() {
+        let pieces = PIECES.with(|p| p.borrow().clone()).unwrap_or_default();
+        if pieces.is_empty() {
+            return;
+        }
+        let mut rows = std::vec::Vec::new();
+        FACTS.with(|f| {
+            let f = f.borrow();
+            for piece in &pieces {
+                let mut union = std::collections::HashSet::new();
+                let mut sum = 0usize;
+                for id in &piece[1..] {
+                    if let Some(nodes) = f.get(id) {
+                        sum += nodes.len();
+                        union.extend(nodes.iter().copied());
+                    }
+                }
+                rows.push((union.len(), sum, piece.len() - 1));
+            }
+        });
+        for (shared, sum, facts) in &rows {
+            std::eprintln!("piecefacts {facts} {shared} {sum}");
+        }
+    }
+
+    pub(crate) fn hit<K: core::hash::Hash>(cache: u8, k: &K) {
+        if let Some(made) = CREATED.with(|c| c.borrow().get(&key(cache, k)).copied()) {
+            let at = now();
+            HITS.with(|h| h.borrow_mut().push((at, made)));
+        }
+    }
+
+    /// Re-run this call with empty caches if it took 2–50 ms warm (NANODA_COLD=1).
+    pub(crate) fn wants_cold(e: &Entry) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("NANODA_COLD").is_ok());
+        let ms = e.start.elapsed().as_micros() - (COLD_US.with(|c| *c.borrow()) - e.cold_before);
+        on && !e.cold && (2_000..=50_000).contains(&ms)
+    }
+
+    pub(crate) struct Cold {
+        start: Instant,
+        exprs: usize,
+    }
+
+    pub(crate) fn begin_cold(tc: &TypeChecker<'_, '_, '_>) -> Cold {
+        COLD.with(|c| *c.borrow_mut() = true);
+        Cold { start: Instant::now(), exprs: tc.ctx.dag.exprs.len() }
+    }
+
+    pub(crate) fn end_cold(tc: &TypeChecker<'_, '_, '_>, c: Cold) -> (u128, usize) {
+        COLD.with(|c| *c.borrow_mut() = false);
+        let us = c.start.elapsed().as_micros();
+        COLD_US.with(|t| *t.borrow_mut() += us);
+        (us, tc.ctx.dag.exprs.len() - c.exprs)
+    }
+
+    /// Distinct nodes reachable from `terms`, through locals' types; and how many locals.
+    fn size<'t>(tc: &TypeChecker<'_, 't, '_>, terms: &[ExprPtr<'t>]) -> (usize, usize) {
+        use crate::expr::Expr::*;
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: std::vec::Vec<ExprPtr<'t>> = terms.to_vec();
+        let mut locals = 0;
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            match tc.ctx.read_expr(e) {
+                App { fun, arg, .. } => stack.extend([fun, arg]),
+                Pi { binder_type, body, .. } | Lambda { binder_type, body, .. } => stack.extend([binder_type, body]),
+                Let { binder_type, val, body, .. } => stack.extend([binder_type, val, body]),
+                Proj { structure, .. } => stack.push(structure),
+                Local { binder_type, .. } => {
+                    locals += 1;
+                    stack.push(binder_type)
+                },
+                _ => {},
+            }
+        }
+        (seen.len(), locals)
+    }
+
+    fn head<'t>(tc: &TypeChecker<'_, 't, '_>, e: ExprPtr<'t>) -> String {
+        let (f, args) = tc.ctx.unfold_apps(e);
+        match tc.ctx.read_expr(f) {
+            crate::expr::Expr::Const { name, .. } => std::format!("{:?}/{}", tc.ctx.debug_print(name), args.len()),
+            other => std::format!("{}/{}", std::format!("{:?}", other).split([' ', '{', '(']).next().unwrap_or("?"), args.len()),
+        }
+    }
+
+    pub(crate) fn exit<'t>(tc: &TypeChecker<'_, 't, '_>, e: Entry, terms: &[ExprPtr<'t>], cold: Option<(u128, usize)>) {
+        DEPTH.with(|d| *d.borrow_mut() -= 1);
+        if e.cold {
+            return;
+        }
+        // Warm time only: a cold re-run, if any, came after.
+        let us = e.start.elapsed().as_micros() - (COLD_US.with(|c| *c.borrow()) - e.cold_before);
+        if (std::env::var_os("NANODA_COLD").is_some() || std::env::var_os("NANODA_HITS").is_some()) && us >= 2_000 {
+            let (nodes, locals) = size(tc, terms);
+            let (cold_us, cold_exprs) = cold.unwrap_or((0, 0));
+            std::eprintln!(
+                "node {} {} {} {} {} {} {} {} {}",
+                e.idx, e.depth, e.name, us, cold_us, cold_exprs, nodes, locals, now()
+            );
+        }
+        CALLS.with(|c| {
+            let mut c = c.borrow_mut();
+            let v = c.entry(e.name).or_insert((0, 0));
+            v.0 += 1;
+            if e.depth == 0 || true { v.1 += us; }
+        });
+        if us / 1000 >= threshold() {
+            let heads: std::vec::Vec<String> = terms.iter().map(|t| head(tc, *t)).collect();
+            std::eprintln!(
+                "prof {:indent$}{} {} ms, +{} exprs: {}",
+                "",
+                e.name,
+                us / 1000,
+                tc.ctx.dag.exprs.len() - e.exprs,
+                heads.join(" =?= "),
+                indent = 2 * e.depth
+            );
+        }
+    }
+
+    pub(crate) fn count_unfold<'t>(tc: &TypeChecker<'_, 't, '_>, e: ExprPtr<'t>) {
+        let (f, _) = tc.ctx.unfold_apps(e);
+        if let crate::expr::Expr::Const { name, .. } = tc.ctx.read_expr(f) {
+            let n = std::format!("{:?}", tc.ctx.debug_print(name));
+            UNFOLDS.with(|u| *u.borrow_mut().entry(n).or_insert(0) += 1);
+        }
+    }
+
+    /// Print call counts and the most unfolded definitions, then reset.
+    pub(crate) fn summary() {
+        if let Some(path) = std::env::var_os("NANODA_HITS") {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+            HITS.with(|h| {
+                for (at, made) in h.borrow_mut().drain(..) {
+                    f.write_all(&at.to_le_bytes()).unwrap();
+                    f.write_all(&made.to_le_bytes()).unwrap();
+                }
+            });
+        }
+        CALLS.with(|c| {
+            let mut v: std::vec::Vec<_> = c.borrow_mut().drain().collect();
+            v.sort();
+            for (name, (n, _)) in v {
+                std::eprintln!("prof calls: {name} {n}");
+            }
+        });
+        UNFOLDS.with(|u| {
+            let mut v: std::vec::Vec<_> = u.borrow_mut().drain().collect();
+            let total: u64 = v.iter().map(|(_, n)| n).sum();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            std::eprintln!("prof unfolds: {total} in all, {} definitions", v.len());
+            for (name, n) in v.into_iter().take(15) {
+                std::eprintln!("prof unfold {n:>9} {name}");
+            }
+        });
     }
 }
