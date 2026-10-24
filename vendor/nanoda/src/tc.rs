@@ -1,5 +1,8 @@
 #[allow(unused_imports)]
 use crate::prelude::*;
+use crate::judgment::Entry;
+#[cfg(feature = "trace")]
+use crate::judgment::{Call, Outcome};
 use crate::env::ReducibilityHint;
 use crate::env::{ConstructorData, Declar, DeclarInfo, Env, InductiveData, RecRule, RecursorData};
 use crate::expr::Expr;
@@ -77,6 +80,9 @@ pub struct TypeChecker<'x, 't, 'p> {
     /// to make sure that all of the universe paramters actually used in a declaration `d` are
     /// properly represented in the declaration's uparams info.
     pub(crate) declar_info: Option<DeclarInfo<'t>>,
+    /// Records the kernel's calls and cache traffic while planning judgments (`crate::record`).
+    #[cfg(feature = "trace")]
+    pub(crate) rec: Option<alloc::boxed::Box<crate::record::Recorder<'t>>>,
 }
 
 impl<'p> ExportFile<'p> {
@@ -168,7 +174,14 @@ impl<'p> ExportFile<'p> {
 impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     pub fn new(dag: &'x mut TcCtx<'t, 'p>, env: &'x Env<'x, 't>, declar_info: Option<DeclarInfo<'t>>) -> Self {
         assert_eq!(dag.dbj_level_counter, 0);
-        Self { ctx: dag, env, tc_cache: TcCache::new(), declar_info } 
+        Self {
+            ctx: dag,
+            env,
+            tc_cache: TcCache::new(),
+            declar_info,
+            #[cfg(feature = "trace")]
+            rec: None,
+        } 
     }
 
     /// Conduct the preliminary checks done on all declarations; a declaration
@@ -516,11 +529,24 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     pub(crate) fn infer(&mut self, e: ExprPtr<'t>, flag: InferFlag) -> ExprPtr<'t> {
+        #[cfg(feature = "trace")]
+        if self.rec.is_some() {
+            let t = self.note_enter(Call::Infer(e, flag == InferFlag::Check));
+            let r = self.infer_core(e, flag);
+            self.note_exit(t, Outcome::Expr(r));
+            return r;
+        }
+        self.infer_core(e, flag)
+    }
+
+    fn infer_core(&mut self, e: ExprPtr<'t>, flag: InferFlag) -> ExprPtr<'t> {
         if let Some(cached) = self.tc_cache.infer_cache_check.get(&e).copied() {
+            self.note_hit(|| Entry::Infer(e, cached));
             return cached
         }
         if flag == InferFlag::InferOnly {
             if let Some(cached) = self.tc_cache.infer_cache_no_check.get(&e).copied() {
+                self.note_hit(|| Entry::InferOnly(e, cached));
                 return cached
             }
         }
@@ -546,9 +572,11 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         match flag {
             InferFlag::InferOnly => {
                 self.tc_cache.infer_cache_no_check.insert(e, r);
+                self.note_made(|| Entry::InferOnly(e, r));
             }
             InferFlag::Check => {
                 self.tc_cache.infer_cache_check.insert(e, r);
+                self.note_made(|| Entry::Infer(e, r));
             }
         }
         r
@@ -767,10 +795,22 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     pub fn whnf(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
+        #[cfg(feature = "trace")]
+        if self.rec.is_some() {
+            let t = self.note_enter(Call::Whnf(e));
+            let r = self.whnf_core(e);
+            self.note_exit(t, Outcome::Expr(r));
+            return r;
+        }
+        self.whnf_core(e)
+    }
+
+    fn whnf_core(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
         if matches!(self.ctx.read_expr(e), NatLit { .. } | StringLit { .. }) {
             return e
         }
         if let Some(cached) = self.tc_cache.whnf_cache.get(&e).copied() {
+            self.note_hit(|| Entry::Whnf(e, cached));
             return cached
         }
         let mut cursor = e;
@@ -782,6 +822,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
                 cursor = next_term;
             } else {
                 self.tc_cache.whnf_cache.insert(e, whnfd);
+                self.note_made(|| Entry::Whnf(e, whnfd));
                 return whnfd
             }
         }
@@ -793,6 +834,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
 
     fn whnf_no_unfolding_aux(&mut self, e: ExprPtr<'t>, cheap_proj: bool) -> ExprPtr<'t> {
         if let Some(cached) = self.tc_cache.whnf_no_unfolding_cache.get(&e).copied() {
+            self.note_hit(|| Entry::WhnfCore(e, cached));
             return cached
         }
         let (e_fun, args) = self.ctx.unfold_apps(e);
@@ -848,6 +890,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         };
         if should_cache && !cheap_proj {
             self.tc_cache.whnf_no_unfolding_cache.insert(e, eprime);
+            self.note_made(|| Entry::WhnfCore(e, eprime));
         }
         eprime
     }
@@ -961,11 +1004,23 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     pub fn assert_def_eq(&mut self, u: ExprPtr<'t>, v: ExprPtr<'t>) { assert!(self.def_eq(u, v)) }
 
     pub fn def_eq(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
+        #[cfg(feature = "trace")]
+        if self.rec.is_some() {
+            let t = self.note_enter(Call::DefEq(x, y));
+            let r = self.def_eq_core(x, y);
+            self.note_exit(t, Outcome::Bool(r));
+            return r;
+        }
+        self.def_eq_core(x, y)
+    }
+
+    fn def_eq_core(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
         if let Some(easy) = self.def_eq_quick_check(x, y) {
             return easy
         }
         let defeq_fail_cache_key = (x, y, self.ctx.eager_mode);
         if self.tc_cache.defeq_fail_cache.contains(&defeq_fail_cache_key) {
+            self.note_hit(|| Entry::DefEqFail(x, y, defeq_fail_cache_key.2));
             return false
         }
         let x_n = self.whnf_no_unfolding_cheap_proj(x);
@@ -1008,8 +1063,10 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         };
         if result {
             self.tc_cache.eq_cache.insert(SortedPair::new(x, y));
+            self.note_made(|| Entry::DefEq(x, y));
         } else {
-            self.tc_cache.defeq_fail_cache.insert(defeq_fail_cache_key);        
+            self.tc_cache.defeq_fail_cache.insert(defeq_fail_cache_key);
+            self.note_made(|| Entry::DefEqFail(x, y, defeq_fail_cache_key.2));
         }
         result
     }
@@ -1185,10 +1242,12 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             return Some(true)
         }
         if self.tc_cache.eq_cache.contains(&SortedPair::new(x, y)) {
+            self.note_hit(|| Entry::DefEq(x, y));
             return Some(true)
         }
         if self.ctx.alpha_eq(x, y) {
             self.tc_cache.eq_cache.insert(SortedPair::new(x, y));
+            self.note_made(|| Entry::DefEq(x, y));
             return Some(true)
         }
         if let Some(r) = self.def_eq_sort(x, y) {
@@ -1200,12 +1259,46 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         None
     }
 
-    fn failure_cache_contains(&self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
-        self.tc_cache.congr_fail_cache.contains(&SortedPair::new(x, y))
+    fn failure_cache_contains(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
+        let hit = self.tc_cache.congr_fail_cache.contains(&SortedPair::new(x, y));
+        if hit {
+            self.note_hit(|| Entry::CongrFail(x, y));
+        }
+        hit
     }
 
     fn failure_cache_insert(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) {
         self.tc_cache.congr_fail_cache.insert(SortedPair::new(x, y));
+        self.note_made(|| Entry::CongrFail(x, y));
+    }
+
+    /// A cache hit, for the recorder (see `crate::record`); nothing without the `trace` feature.
+    #[inline(always)]
+    fn note_hit(&mut self, _entry: impl FnOnce() -> Entry<'t>) {
+        #[cfg(feature = "trace")]
+        if let Some(r) = self.rec.as_mut() {
+            r.hit(_entry());
+        }
+    }
+
+    /// A cache entry made, for the recorder.
+    #[inline(always)]
+    fn note_made(&mut self, _entry: impl FnOnce() -> Entry<'t>) {
+        #[cfg(feature = "trace")]
+        if let Some(r) = self.rec.as_mut() {
+            r.made(_entry());
+        }
+    }
+
+    #[cfg(feature = "trace")]
+    fn note_enter(&mut self, call: Call<'t>) -> u32 {
+        let (depth, eager) = (self.ctx.dbj_level_counter, self.ctx.eager_mode);
+        self.rec.as_mut().unwrap().enter(call, depth, eager)
+    }
+
+    #[cfg(feature = "trace")]
+    fn note_exit(&mut self, idx: u32, outcome: Outcome<'t>) {
+        self.rec.as_mut().unwrap().exit(idx, outcome);
     }
 
     fn try_eq_const_app(
@@ -1282,7 +1375,21 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     ///
     /// After each reduction, check whether we can show definitional equality without having
     /// to continue unfolding.
-    pub(crate) fn lazy_delta_step(&mut self, mut x: ExprPtr<'t>, mut y: ExprPtr<'t>) -> DeltaResult<'t> {
+    pub(crate) fn lazy_delta_step(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> DeltaResult<'t> {
+        #[cfg(feature = "trace")]
+        if self.rec.is_some() {
+            let t = self.note_enter(Call::LazyDelta(x, y));
+            let r = self.lazy_delta_step_core(x, y);
+            self.note_exit(t, match r {
+                FoundEqResult(b) => Outcome::Bool(b),
+                Exhausted(a, b) => Outcome::Exhausted(a, b),
+            });
+            return r;
+        }
+        self.lazy_delta_step_core(x, y)
+    }
+
+    fn lazy_delta_step_core(&mut self, mut x: ExprPtr<'t>, mut y: ExprPtr<'t>) -> DeltaResult<'t> {
         loop {
             if let Some(r) = self.delta_try_nat(x, y) {
                 return r

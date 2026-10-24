@@ -23,6 +23,26 @@
 //!                                  each whole or its phase P (1 constructors, 2 recursors; see the
 //!                                  check's DECLARATIONS_MAGIC), for witness-sim
 //!
+//!     lean-host judgments ARGS OUT [MS [COSTS]]
+//!                                  plan judgments for the theorem the attest op ARGS proves (its one
+//!                                  untrusted subject), ARGS trusting its whole closure, so that every
+//!                                  constant a judgment mentions resolves to the node declaring it:
+//!                                  record its check, cut it into ops of at most
+//!                                  MS native milliseconds of the kernel's own work (default 25), and
+//!                                  write OUT/group-N.judgment, OUT/group-N.calls and OUT/plan.json
+//!                                  (each group's round, cites and estimated gas; what the theorem's
+//!                                  own attestation cites); with COSTS (judgments-check's
+//!                                  costs.json for an earlier plan), grouping by each unit's
+//!                                  measured replay time
+//!     lean-host judgments-check ARGS OUT
+//!                                  run every op of that plan (ARGS as for judgments) through the
+//!                                  check natively, in order, then the theorem's own, citing what it
+//!                                  plans: each trusting what it looks up (traced in the whole
+//!                                  closure) and what it must load; write each op's arguments as
+//!                                  OUT/group-N.args and OUT/final.args, for witness-sim, and each
+//!                                  unit's replay time as OUT/costs.json; count ops over 45 native
+//!                                  ms (about 4.2e9 gas)
+//!
 //! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
 //! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
 //! milliseconds come from gas budgets measured there (`tools/lean/gas_per_ms.py`).
@@ -316,6 +336,175 @@ fn declarations_args(args: &str, positions: &str, out: &str) {
 	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &encode(&[node]))).unwrap();
 }
 
+/// Plan judgments for the one untrusted theorem of the attest op `args`.
+fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
+	let bytes = std::fs::read(args).expect("arguments");
+	let input = witness_check::Input::parse(&bytes).expect("well-formed arguments");
+	let start = Instant::now();
+	let nodes = lean_check::load_attest(&input).expect("nodes load");
+	let i = nodes.nodes.iter().position(|n| n.theorem && !n.assumed).expect("an untrusted theorem");
+	let unit_costs = costs.map(|c| {
+		let v: Value = serde_json::from_slice(&std::fs::read(c).expect("costs")).expect("JSON");
+		v.as_object().unwrap().iter().map(|(k, ns)| (k.parse().unwrap(), ns.as_u64().unwrap())).collect()
+	});
+	let cfg = nanoda_lib::plan::PlanConfig { budget_ns: (budget_ms * 1e6) as u64, unit_costs, ..Default::default() };
+	let plan = nodes.plan_judgments(i, &cfg).expect("planned");
+	std::fs::create_dir_all(out).unwrap();
+	let mut groups = Vec::new();
+	for (g, group) in plan.groups.iter().enumerate() {
+		std::fs::write(format!("{out}/group-{g}.judgment"), &group.judgment).unwrap();
+		std::fs::write(format!("{out}/group-{g}.calls"), &group.calls).unwrap();
+		groups.push(serde_json::json!({
+			"round": group.round, "cites": group.cites, "units": group.units, "gas": group.gas,
+			"judgment_bytes": group.judgment.len(), "calls_bytes": group.calls.len(),
+			"unit_ns": group.unit_ns,
+		}));
+	}
+	let summary = serde_json::json!({
+		"declaration": nodes.nodes[i].hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+		"calls": plan.calls, "units": plan.units, "rounds": plan.rounds,
+		"groups": groups, "final_cites": plan.final_cites, "final_gas": plan.final_gas,
+	});
+	std::fs::write(format!("{out}/plan.json"), serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+	let max_gas = plan.groups.iter().map(|g| g.gas).fold(plan.final_gas, f64::max);
+	println!(
+		"{} calls, {} units, {} rounds, {} ops (+ the theorem's own, citing {}); estimated gas: max {max_gas:.2e}; {} needs recomputed; planned in {:?}",
+		plan.calls, plan.units, plan.rounds, plan.groups.len(), plan.final_cites.len(), plan.skipped, start.elapsed()
+	);
+}
+
+/// The hashes a node (or, after the statement's hash, a proof) imports.
+fn import_hashes(mut bytes: &[u8]) -> Vec<Hash> {
+	let mut n = 0usize;
+	let mut shift = 0;
+	loop {
+		let b = bytes[0];
+		bytes = &bytes[1..];
+		n |= usize::from(b & 0x7f) << shift;
+		shift += 7;
+		if b & 0x80 == 0 {
+			break;
+		}
+	}
+	(0..n).map(|k| bytes[32 * k..32 * k + 32].try_into().unwrap()).collect()
+}
+
+/// The nodes `f` looks up, checking in a closure of `trusted` nodes and `node` (untrusted, with
+/// `proof` if given), by hash.
+fn traced_op(trusted: &[Vec<u8>], node: &[u8], proof: Option<&[u8]>, f: impl Fn(&nanoda_lib::nodes::Nodes, usize)) -> std::collections::BTreeSet<Hash> {
+	let mut blobs: Vec<(bool, Vec<u8>)> = trusted.iter().map(|d| (true, d.clone())).collect();
+	blobs.push((false, node.to_vec()));
+	if let Some(p) = proof {
+		blobs.push((false, p.to_vec()));
+	}
+	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+	let check_blobs: Vec<CheckBlob> = blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
+	let args = check_args(CheckMode::Attest, &check_blobs, &[], &encode(&[]));
+	let input = witness_check::Input::parse(&args).unwrap();
+	let nodes = lean_check::load_attest(&input).expect("nodes load");
+	let i = nodes.find(&blake2b256(node)).unwrap();
+	nanoda_lib::nodes::trace::start();
+	f(&nodes, i);
+	let looked_up = nanoda_lib::nodes::trace::stop();
+	nodes.nodes.iter().filter(|n| looked_up.iter().any(|d| n.declars.contains(d))).map(|n| n.hash).collect()
+}
+
+/// Run a judgment plan's ops through the check, then the theorem's own attestation, each trusting
+/// just what it looks up (traced against the theorem's whole closure) and what it must load: the
+/// nodes the theorem's statement (and, for its own attestation, its proof) imports, and for a
+/// judgment op the nodes its judgment imports.
+fn judgments_check(full: &str, out: &str) {
+	let bytes = std::fs::read(full).expect("arguments");
+	let input = witness_check::Input::parse(&bytes).expect("well-formed arguments");
+	let plan: Value = serde_json::from_slice(&std::fs::read(format!("{out}/plan.json")).unwrap()).unwrap();
+	let closure: Vec<Vec<u8>> = input.blobs().filter(|b| b.trusted).map(|b| b.data.to_vec()).collect();
+	let by_hash: std::collections::HashMap<Hash, Vec<u8>> = closure.iter().map(|d| (blake2b256(d), d.clone())).collect();
+	let node = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).expect("a node").data.to_vec();
+	let proof: Vec<u8> = input
+		.blobs()
+		.map(|b| b.data.to_vec())
+		.chain(lean_check::parse_witness(input.witness).unwrap().into_iter().map(<[u8]>::to_vec))
+		.find(|d| d.starts_with(nanoda_lib::nodes::PROOF_MAGIC))
+		.expect("a proof");
+	let statement_imports = import_hashes(&node[nanoda_lib::nodes::NODE_MAGIC.len()..]);
+	let judgment = |g: u64| std::fs::read(format!("{out}/group-{g}.judgment")).unwrap();
+	let run = |blobs: &[(bool, Vec<u8>)], witness: &[u8], name: &str| -> (bool, usize) {
+		let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+		let check_blobs: Vec<CheckBlob> =
+			blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
+		let a = check_args(CheckMode::Attest, &check_blobs, &[], witness);
+		std::fs::write(format!("{out}/{name}.args"), &a).unwrap();
+		let input = witness_check::Input::parse(&a).unwrap();
+		(std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false), a.len())
+	};
+	let env = |keep: std::collections::BTreeSet<Hash>| -> Vec<(bool, Vec<u8>)> {
+		keep.into_iter().filter(|h| *h != blake2b256(&node)).map(|h| (true, by_hash[&h].clone())).collect()
+	};
+	let groups = plan["groups"].as_array().unwrap();
+	let (mut worst, mut failed, mut biggest, mut over) = (Duration::ZERO, 0, 0, 0);
+	let mut costs = serde_json::Map::new();
+	for (g, group) in groups.iter().enumerate() {
+		let cited: Vec<Vec<u8>> = group["cites"].as_array().unwrap().iter().map(|c| judgment(c.as_u64().unwrap())).collect();
+		let mine = judgment(g as u64);
+		let calls = std::fs::read(format!("{out}/group-{g}.calls")).unwrap();
+		let cited_refs: Vec<&[u8]> = cited.iter().map(Vec::as_slice).collect();
+		let mut keep = traced_op(&closure, &node, None, |nodes, i| {
+			nodes.attest_judgments(i, &cited_refs, &calls, &[&mine]).expect("the op checks in the whole closure")
+		});
+		keep.extend(nanoda_lib::judgment::header(&mine).unwrap().imports);
+		keep.extend(statement_imports.iter().copied());
+		let mut blobs = env(keep);
+		blobs.extend(cited.into_iter().map(|c| (true, c)));
+		blobs.push((false, mine));
+		let env_bytes: usize = blobs.iter().filter(|(t, d)| *t && d.starts_with(nanoda_lib::nodes::NODE_MAGIC)).map(|(_, d)| d.len()).sum();
+		let env_nodes = blobs.iter().filter(|(t, d)| *t && d.starts_with(nanoda_lib::nodes::NODE_MAGIC)).count();
+		let cited_bytes: usize = blobs.iter().filter(|(t, d)| *t && d.starts_with(nanoda_lib::judgment::JUDGMENT_MAGIC)).map(|(_, d)| d.len()).sum();
+		let own_bytes = blobs.last().unwrap().1.len();
+		let calls_bytes = calls.len();
+		let t0 = Instant::now();
+		let (ok, size) = run(&blobs, &encode(&[node.clone(), calls]), &format!("group-{g}"));
+		worst = worst.max(t0.elapsed());
+		if t0.elapsed() > Duration::from_millis(45) {
+			over += 1;
+		}
+		let times = nanoda_lib::judgment::CALL_TIMES.lock().unwrap().clone();
+		for (unit, ns) in group["unit_ns"].as_array().unwrap().iter().zip(times) {
+			costs.insert(unit[0].as_u64().unwrap().to_string(), Value::from(ns));
+		}
+		println!(
+			"op {g} round {} units {} est {:.2e}: {:.1} ms; env {env_nodes} nodes {} KB, cited {} KB, own {} KB, calls {} KB",
+			group["round"], group["units"], group["gas"].as_f64().unwrap(), t0.elapsed().as_secs_f64() * 1e3,
+			env_bytes / 1000, cited_bytes / 1000, own_bytes / 1000, calls_bytes / 1000
+		);
+		biggest = biggest.max(size);
+		if !ok {
+			failed += 1;
+			println!("group {g} (round {}, {} units) FAILED", group["round"], group["units"]);
+		}
+	}
+	let cited: Vec<Vec<u8>> = plan["final_cites"].as_array().unwrap().iter().map(|c| judgment(c.as_u64().unwrap())).collect();
+	let cited_refs: Vec<&[u8]> = cited.iter().map(Vec::as_slice).collect();
+	let mut keep = traced_op(&closure, &node, Some(&proof), |nodes, i| nodes.check_with(i, &cited_refs).expect("checks"));
+	keep.extend(statement_imports.iter().copied());
+	keep.extend(import_hashes(&proof[nanoda_lib::nodes::PROOF_MAGIC.len() + 32..]));
+	let mut blobs = env(keep);
+	blobs.extend(cited.into_iter().map(|c| (true, c)));
+	blobs.push((false, node.clone()));
+	let t0 = Instant::now();
+	let (ok, size) = run(&blobs, &encode(std::slice::from_ref(&proof)), "final");
+	std::fs::write(format!("{out}/costs.json"), serde_json::to_vec(&costs).unwrap()).unwrap();
+	println!(
+		"{} ops, {failed} failed, {over} over 45 ms, slowest {worst:?}, biggest arguments {} KB; the theorem's own: {ok} in {:?} ({} KB)",
+		groups.len(),
+		biggest / 1000,
+		t0.elapsed(),
+		size / 1000
+	);
+	if failed > 0 || !ok {
+		std::process::exit(1);
+	}
+}
+
 fn main() {
 	// Type errors panic, which counts as false, as on the PVM.
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
@@ -336,6 +525,10 @@ fn main() {
 			println!("{ok} in {:?}", start.elapsed());
 		},
 		["declarations-args", args, positions, out] => declarations_args(args, positions, out),
+		["judgments", args, out] => judgments(args, out, 25.0, None),
+		["judgments", args, out, ms] => judgments(args, out, ms.parse().expect("milliseconds"), None),
+		["judgments", args, out, ms, costs] => judgments(args, out, ms.parse().expect("milliseconds"), Some(costs)),
+		["judgments-check", full, out] => judgments_check(full, out),
 		["args", dir, p, n, out] => write_args(&Dir::open(dir), p, n.parse().expect("batch number"), out),
 		["trace", dir, p, out] => trace(&Dir::open(dir), p, out, Duration::from_millis(100)),
 		["trace", dir, p, out, ms] => trace(&Dir::open(dir), p, out, Duration::from_millis(ms.parse().expect("milliseconds"))),

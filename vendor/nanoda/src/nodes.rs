@@ -303,14 +303,29 @@ impl<'p> Nodes<'p> {
         self.declared_by.iter().find(|(n, _)| n.get_hash() == name.get_hash()).map(|(_, h)| *h)
     }
 
-    /// Check that every constant `entries` mention is declared, here, by one of `imports`: then
-    /// each means here what it meant where the entries were made (see [`crate::judgment`]).
-    fn check_imports<'t>(&self, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>], imports: &[Hash]) -> Result<(), Box<dyn Error>> {
-        // Names compare by pointer; these are the environment's, before the checker's lifetime.
-        let declared_by: FxHashMap<u64, Hash> = self.declared_by.iter().map(|(n, h)| (n.get_hash(), *h)).collect();
+    /// Check that the constants `entries` mention mean here what they meant where the entries
+    /// were made, or will (see [`crate::judgment`]): each declared, here, by one of `imports`.
+    /// Attesting them (`made`), each must be: if one weren't loaded at all, the kernel would read
+    /// it as opaque, and could make an entry that's false where it's defined. Citing them, as for
+    /// a trusted node, only each that is loaded: one that isn't can't be looked up here, and its
+    /// import's hash fixes what it means, as it did where the entries were attested.
+    fn check_imports<'t>(&self, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>], imports: &[Hash], made: bool) -> Result<(), Box<dyn Error>> {
+        Self::check_imports_in(&self.declared_by_ptr(), tc, entries, imports, made)
+    }
+
+    /// Which node declares each loaded name, by the name's pointer (the environment's names, from
+    /// before any checker's lifetime, compare by pointer).
+    fn declared_by_ptr(&self) -> FxHashMap<u64, Hash> {
+        self.declared_by.iter().map(|(n, h)| (n.get_hash(), *h)).collect()
+    }
+
+    /// [`Self::check_imports`], given [`Self::declared_by_ptr`].
+    fn check_imports_in<'t>(declared_by: &FxHashMap<u64, Hash>, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>], imports: &[Hash], made: bool) -> Result<(), Box<dyn Error>> {
         for name in judgment::mentions(tc, entries) {
-            if !declared_by.get(&name.get_hash()).is_some_and(|h| imports.contains(h)) {
-                return Err("a judgment mentions a constant not declared by one of its imports".into());
+            match declared_by.get(&name.get_hash()) {
+                Some(h) if imports.contains(h) => {},
+                None if !made => {},
+                _ => return Err("a judgment mentions a constant not declared by one of its imports".into()),
             }
         }
         Ok(())
@@ -333,8 +348,9 @@ impl<'p> Nodes<'p> {
             if header.declaration != *declaration {
                 return Err("a judgment for another declaration".into());
             }
-            let entries = judgment::entries(tc, &header)?;
-            self.check_imports(tc, &entries, &header.imports)?;
+            let mut l = judgment::Lazy::new(&header)?;
+            let entries = (0..l.len()).map(|k| l.entry(tc, k)).collect::<Result<Vec<_>, _>>()?;
+            self.check_imports(tc, &entries, &header.imports, false)?;
             judgment::seed(tc, &entries);
         }
         Ok(())
@@ -379,23 +395,96 @@ impl<'p> Nodes<'p> {
     pub fn attest_judgments(&self, declaration: usize, cited: &[&[u8]], calls: &[u8], subjects: &[&[u8]]) -> Result<(), Box<dyn Error>> {
         let d = self.single(declaration)?;
         let hash = self.nodes[declaration].hash;
+        let headers = cited.iter().map(|b| judgment::header(b)).collect::<Result<Vec<_>, _>>()?;
+        if headers.iter().any(|h| h.declaration != hash) {
+            return Err("a judgment for another declaration".into());
+        }
         self.file.with_tc_and_declar(*d.info(), |tc| {
-            self.seed(tc, &hash, cited)?;
-            for (depth, call) in judgment::calls(tc, calls)? {
-                judgment::run(tc, depth, call)?;
+            let mut lazy = headers.iter().map(judgment::Lazy::new).collect::<Result<Vec<_>, _>>()?;
+            let declared_by = self.declared_by_ptr();
+            let mut levels = new_fx_hash_map();
+            #[cfg(feature = "trace")]
+            let t0 = std::time::Instant::now();
+            let calls = judgment::calls(tc, calls)?;
+            #[cfg(feature = "trace")]
+            let (mut seeding, mut slow) = (core::time::Duration::ZERO, Vec::new());
+            #[cfg(feature = "trace")]
+            let mut times = Vec::new();
+            // Each call runs seeded with what it needs, just before it: no call sees an entry its
+            // own check, in the whole declaration's, made only later.
+            for (depth, eager, call, seeds) in calls {
+                #[cfg(feature = "trace")]
+                let ts = std::time::Instant::now();
+                let mut by_judgment: FxHashMap<usize, Vec<Entry<'_>>> = new_fx_hash_map();
+                for (j, k) in seeds {
+                    let entry = lazy.get_mut(j).ok_or("a seed from a judgment not cited")?.entry(tc, k)?;
+                    by_judgment.entry(j).or_default().push(entry);
+                }
+                for (j, entries) in &by_judgment {
+                    Self::check_imports_in(&declared_by, tc, entries, &headers[*j].imports, false)?;
+                    judgment::seed(tc, entries);
+                }
+                #[cfg(feature = "trace")]
+                let tc0 = std::time::Instant::now();
+                judgment::run_memo(tc, depth, eager, call, &mut levels)?;
+                #[cfg(feature = "trace")]
+                {
+                    seeding += tc0 - ts;
+                    slow.push(tc0.elapsed().as_micros());
+                    times.push(u64::try_from(ts.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                }
+            }
+            #[cfg(feature = "trace")]
+            {
+                *judgment::CALL_TIMES.lock().unwrap() = times;
+            }
+            #[cfg(feature = "trace")]
+            if std::env::var_os("NANODA_OP_TIMES").is_some() {
+                slow.sort_by_key(|&x| core::cmp::Reverse(x));
+                std::eprintln!("op: seeding {seeding:?}, all {:?} ({} calls; slowest {:?} µs)", t0.elapsed(), slow.len(), &slow[..slow.len().min(5)]);
             }
             for blob in subjects {
                 let header = judgment::header(blob)?;
                 if header.declaration != hash {
                     return Err("a judgment for another declaration".into());
                 }
-                let entries = judgment::entries(tc, &header)?;
-                self.check_imports(tc, &entries, &header.imports)?;
+                let mut l = judgment::Lazy::new(&header)?;
+                let entries = (0..l.len()).map(|k| l.entry(tc, k)).collect::<Result<Vec<_>, _>>()?;
+                self.check_imports(tc, &entries, &header.imports, true)?;
                 if !entries.iter().all(|e| judgment::holds(tc, e)) {
                     return Err("an entry the calls didn't make".into());
                 }
             }
             Ok(())
+        })
+    }
+
+    /// Plan judgments for node `i`'s declaration (one with a value): record its check, and cut it
+    /// into ops that each fit `cfg` (see [`crate::plan`]). Type errors panic.
+    #[cfg(feature = "trace")]
+    pub fn plan_judgments(&self, i: usize, cfg: &crate::plan::PlanConfig) -> Result<crate::plan::Plan, Box<dyn Error>> {
+        let d = self.single(i)?;
+        let val = match d {
+            Declar::Theorem { val, .. } | Declar::Definition { val, .. } | Declar::Opaque { val, .. } => *val,
+            _ => return Err("judgments for a declaration without a value".into()),
+        };
+        let hash = self.nodes[i].hash;
+        self.file.with_tc_and_declar(*d.info(), |tc| {
+            tc.rec = Some(Box::new(crate::record::Recorder::new()));
+            tc.check_declar_info(d).unwrap();
+            let inferred_type = tc.infer(val, InferFlag::Check);
+            tc.assert_def_eq(inferred_type, d.info().ty);
+            let mut rec = tc.rec.take().unwrap();
+            rec.finish();
+            crate::plan::plan(tc, &rec, &hash, cfg, |tc, entries| {
+                let imports = self.judgment_imports(tc, entries);
+                if imports.is_none() {
+                    for n in judgment::mentions(tc, entries).into_iter().filter(|&n| self.declared_by(n).is_none()) {
+                        std::eprintln!("not declared by a loaded node: {:?}", tc.ctx.debug_print(n));
+                    }
+                }
+                imports
+            })
         })
     }
 

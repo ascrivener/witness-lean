@@ -367,10 +367,10 @@ fn attest_judgments(pins: &[u8], trusted: &[&[u8]], cited: &[&[u8]], subjects: &
 fn honest(p: &Pack) -> (Vec<u8>, Vec<u8>) {
 	in_checker(&p.pins(), p.env(), p.goal(), p.proof_of(p.goal()), |nodes, tc, val| {
 		let call = Call::Infer(val.unwrap(), true);
-		jd::run(tc, 0, call).unwrap();
+		jd::run(tc, 0, false, call).unwrap();
 		let entries = jd::cached(tc);
 		assert!(!entries.is_empty());
-		(judgment_of(nodes, tc, p.goal(), &entries), jd::write_calls(tc, &[(0, call)]))
+		(judgment_of(nodes, tc, p.goal(), &entries), jd::write_calls(tc, &[(0, false, call, vec![])]))
 	})
 }
 
@@ -403,11 +403,11 @@ fn forged_five() -> (Pack, Vec<u8>, Vec<u8>, Vec<u8>) {
 		in_checker(&five.pins(), five.env(), five.goal(), five.proof_of(five.goal()), |nodes, tc, val| {
 			let val = val.unwrap();
 			let stated = testing::declaration(tc);
-			assert_eq!(jd::run(tc, 0, Call::Infer(val, false)).unwrap(), Outcome::Expr(stated));
+			assert_eq!(jd::run(tc, 0, false, Call::Infer(val, false)).unwrap(), Outcome::Expr(stated));
 			assert!(jd::holds(tc, &Entry::InferOnly(val, stated)) && !jd::holds(tc, &Entry::Infer(val, stated)));
 			let forged = judgment_of(nodes, tc, five.goal(), &[Entry::Infer(val, stated)]);
-			let calls_check = jd::write_calls(tc, &[(0, Call::Infer(val, true))]);
-			let calls_only = jd::write_calls(tc, &[(0, Call::Infer(val, false))]);
+			let calls_check = jd::write_calls(tc, &[(0, false, Call::Infer(val, true), vec![])]);
+			let calls_only = jd::write_calls(tc, &[(0, false, Call::Infer(val, false), vec![])]);
 			(forged, calls_check, calls_only)
 		});
 	(five, forged, calls_check, calls_only)
@@ -435,14 +435,14 @@ fn entries_must_be_made_by_the_calls() {
 	let (judgment, calls) = honest(&f);
 	let (with_extra, infer_only, relabelled) = in_checker(&f.pins(), f.env(), f.goal(), f.proof_of(f.goal()), |nodes, tc, val| {
 		let val = val.unwrap();
-		jd::run(tc, 0, Call::Infer(val, true)).unwrap();
+		jd::run(tc, 0, false, Call::Infer(val, true)).unwrap();
 		let mut entries = jd::cached(tc);
-		let Outcome::Expr(ty) = jd::run(tc, 0, Call::Infer(val, true)).unwrap() else { panic!() };
+		let Outcome::Expr(ty) = jd::run(tc, 0, false, Call::Infer(val, true)).unwrap() else { panic!() };
 		// An entry the calls don't make: the proof's type equal to its value.
 		entries.push(Entry::DefEq(ty, val));
 		let with_extra = judgment_of(nodes, tc, f.goal(), &entries);
 		// Only inferring the proof's type, not checking it, caches it as such.
-		let infer_only = jd::write_calls(tc, &[(0, Call::Infer(val, false))]);
+		let infer_only = jd::write_calls(tc, &[(0, false, Call::Infer(val, false), vec![])]);
 		let relabelled = judgment_of(nodes, tc, f.goal(), &[Entry::Infer(val, ty)]);
 		(with_extra, infer_only, relabelled)
 	});
@@ -495,8 +495,8 @@ fn judgments_import_what_they_mention() {
 
 #[test]
 fn a_judgment_means_what_its_imports_declare() {
-	// A judgment for goal_f made over the redefinition's myF (`myF _ := 1`), attested honestly,
-	// mentions myF; where goal_f is checked, myF is the poster's (`myF n := n + 1`).
+	// A judgment for goal_f made over the redefinition's myF (`myF _ := 1`) mentions myF; where
+	// goal_f is checked, myF is the poster's (`myF n := n + 1`).
 	let (f, redefine) = (pack!("f"), pack!("redefine"));
 	let pins = [f.pins(), redefine.pins()].concat();
 	let their_goal_f = imports(redefine.goal()).unwrap()[0];
@@ -504,12 +504,15 @@ fn a_judgment_means_what_its_imports_declare() {
 	let (judgment, calls) = in_checker(&pins, &their_env, f.goal(), None, |nodes, tc, _| {
 		let my_f = testing::constant(tc, "myF");
 		let call = Call::Whnf(my_f);
-		jd::run(tc, 0, Call::Infer(my_f, true)).unwrap();
-		jd::run(tc, 0, call).unwrap();
+		jd::run(tc, 0, false, Call::Infer(my_f, true)).unwrap();
+		jd::run(tc, 0, false, call).unwrap();
 		let entries = jd::cached(tc);
-		(judgment_of(nodes, tc, f.goal(), &entries), jd::write_calls(tc, &[(0, Call::Infer(my_f, true)), (0, call)]))
+		(judgment_of(nodes, tc, f.goal(), &entries), jd::write_calls(tc, &[(0, false, Call::Infer(my_f, true), vec![]), (0, false, call, vec![])]))
 	});
-	assert!(attest_judgments(&pins, &their_env, &[], &[&judgment], f.goal(), &calls), "true of their myF");
+	// It can't be attested: goal_f's node is loaded as checking it would load it, its imports with
+	// it, and they pin the poster's myF.
+	assert!(!attest_judgments(&pins, &their_env, &[], &[&judgment], f.goal(), &calls), "attested over their myF");
+	// Nor, were it attested, cited where myF is the poster's.
 	let proof = f.proof_of(f.goal()).unwrap();
 	assert!(attest(&pins, f.env(), &[f.goal()], &[proof]));
 	assert!(!attest(&pins, &[f.env(), &[&judgment[..]]].concat(), &[f.goal()], &[proof]), "cited for the poster's");
@@ -520,7 +523,7 @@ fn locals_carry_their_types() {
 	let f = pack!("f");
 	let (honest_one, retyped, calls, deep, shallow) = in_checker(&f.pins(), f.env(), f.goal(), f.proof_of(f.goal()), |nodes, tc, val| {
 		let val = val.unwrap();
-		jd::run(tc, 0, Call::Infer(val, true)).unwrap();
+		jd::run(tc, 0, false, Call::Infer(val, true)).unwrap();
 		// An inference about the proof's bound `n : Nat`, opened as a local.
 		let (key, ty) = jd::cached(tc)
 			.into_iter()
@@ -535,10 +538,10 @@ fn locals_carry_their_types() {
 		let (k2, t2) = (testing::replace(tc, key, local, swapped), testing::replace(tc, ty, local, swapped));
 		let honest_one = judgment_of(nodes, tc, f.goal(), &[Entry::Infer(key, ty)]);
 		let retyped = judgment_of(nodes, tc, f.goal(), &[Entry::Infer(k2, t2)]);
-		let calls = jd::write_calls(tc, &[(0, Call::Infer(val, true))]);
+		let calls = jd::write_calls(tc, &[(0, false, Call::Infer(val, true), vec![])]);
 		// The inference again, as a call of its own: from above its local, and from at it.
-		let deep = jd::write_calls(tc, &[(1, Call::Infer(key, true))]);
-		let shallow = jd::write_calls(tc, &[(0, Call::Infer(key, true))]);
+		let deep = jd::write_calls(tc, &[(1, false, Call::Infer(key, true), vec![])]);
+		let shallow = jd::write_calls(tc, &[(0, false, Call::Infer(key, true), vec![])]);
 		(honest_one, retyped, calls, deep, shallow)
 	});
 	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&honest_one], f.goal(), &calls));
@@ -675,4 +678,36 @@ fn an_inductive_types_check_splits_into_phases() {
 	assert!(!attest(&pins, &[env, &[&ctor_phase[..]]].concat(), &[node], &[]));
 	let bad = parts(node, &[(0, 3)]);
 	assert!(!attest_declarations(&pins, env, &[&bad], node), "no such phase");
+}
+
+#[test]
+fn attesting_a_judgment_needs_what_it_mentions_loaded() {
+	// Where it's attested, every constant a judgment mentions must be loaded (if one weren't, the
+	// kernel would read it as opaque): leave out a node its imports name, one the goal's statement
+	// doesn't import, and it isn't attested.
+	let f = pack!("f");
+	let (judgment, calls) = honest(&f);
+	let goal_imports = imports(f.goal()).unwrap();
+	let extra: Vec<Hash> = jd::header(&judgment).unwrap().imports.into_iter().filter(|h| !goal_imports.contains(h)).collect();
+	assert!(!extra.is_empty());
+	let env: Vec<&[u8]> = f.env().iter().copied().filter(|n| blake2b256(n) != extra[0]).collect();
+	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&judgment], f.goal(), &calls));
+	assert!(!attest_judgments(&f.pins(), &env, &[], &[&judgment], f.goal(), &calls), "an import left out");
+}
+
+#[test]
+fn calls_seed_only_from_cited_judgments() {
+	// A call's seeds name a cited judgment and an entry in it; one past either is refused.
+	let f = pack!("f");
+	let (judgment, _) = honest(&f);
+	let calls = |seeds: Vec<(usize, usize)>| {
+		in_checker(&f.pins(), f.env(), f.goal(), f.proof_of(f.goal()), |_, tc, val| {
+			jd::write_calls(tc, &[(0, false, Call::Infer(val.unwrap(), true), seeds)])
+		})
+	};
+	let n = { let h = jd::header(&judgment).unwrap(); jd::Lazy::new(&h).unwrap().len() };
+	// Seeded with every entry, the subject holds whatever path the call then takes.
+	assert!(attest_judgments(&f.pins(), f.env(), &[&judgment], &[&judgment], f.goal(), &calls((0..n).map(|k| (0, k)).collect())));
+	assert!(!attest_judgments(&f.pins(), f.env(), &[&judgment], &[&judgment], f.goal(), &calls(vec![(1, 0)])), "no second cited judgment");
+	assert!(!attest_judgments(&f.pins(), f.env(), &[&judgment], &[&judgment], f.goal(), &calls(vec![(0, n)])), "past its entries");
 }

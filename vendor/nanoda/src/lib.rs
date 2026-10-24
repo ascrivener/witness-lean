@@ -26,6 +26,10 @@ pub mod nodes;
 pub mod parser;
 pub mod pretty_printer;
 pub mod quot;
+#[cfg(feature = "trace")]
+pub mod plan;
+#[cfg(feature = "trace")]
+pub(crate) mod record;
 pub mod tc;
 #[cfg(test)]
 mod tests;
