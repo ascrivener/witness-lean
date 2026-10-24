@@ -1853,6 +1853,21 @@ pub(crate) mod prof {
 
     /// For each piece: the nodes its needed facts reach, shared, against the plain sum.
     pub(crate) fn fact_report() {
+        // NANODA_FACTNODES=file: each needed entry's creation index, node count and node ids.
+        if let Some(path) = std::env::var_os("NANODA_FACTNODES") {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+            FACTS.with(|facts| {
+                for (at, ids) in facts.borrow().iter() {
+                    let mut ids = ids.clone();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    for x in [*at, ids.len() as u64].into_iter().chain(ids) {
+                        f.write_all(&x.to_le_bytes()).unwrap();
+                    }
+                }
+            });
+        }
         let pieces = PIECES.with(|p| p.borrow().clone()).unwrap_or_default();
         if pieces.is_empty() {
             return;

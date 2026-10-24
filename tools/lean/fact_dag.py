@@ -1,10 +1,11 @@
 """The fact DAG of one heavy declaration: pieces plus every call whose cache entry a unit hits
 from outside its own region, closed to a fixpoint; then units, total work, and depth.
 
-    fact_dag.py DIR
+    fact_dag.py DIR [OUT]
 
 DIR holds a nanoda-profiling run's `spans.bin` (NANODA_SPANS), `hits.bin` (NANODA_HITS) and
-`pieces.txt` (the piece cut, as NANODA_PIECES reads it), all from the same binary.
+`pieces.txt` (the piece cut, as NANODA_PIECES reads it), all from the same binary. With OUT,
+also writes OUT/units.json (the DAG) and OUT/facts.txt (every needed fact, for NANODA_PIECES).
 """
 import sys
 import numpy as np
@@ -84,6 +85,25 @@ for a, m in zip(u[at][outside].tolist(), u[made][outside].tolist()):
 for r in R:
     if r:
         needs[int(u[parent[r]])].add(r)
+if len(sys.argv) > 2:
+    # The DAG, for grouping (fact_groups.py): each unit's root, own work, depth comes after; the
+    # facts (creation indices) it needs from outside, the facts made in it that others need, and
+    # the units nested directly in it. And every needed fact, as NANODA_PIECES reads a piece.
+    import json
+    made_in = {}
+    for m in set(made[outside].tolist()):
+        made_in.setdefault(int(u[m]), []).append(m)
+    need_facts = {r: set() for r in R}
+    for a, m in zip(u[at][outside].tolist(), made[outside].tolist()):
+        need_facts[a].add(m)
+    nested = {r: [] for r in R}
+    for r in R:
+        if r:
+            nested[int(u[parent[r]])].append(r)
+    with open(sys.argv[2] + "/facts.txt", "w") as f:
+        f.write(" ".join(["0"] + [str(m) for m in sorted(set(made[outside].tolist()))]) + "\n")
+    units_out = [{"root": r, "work": work[r], "needs": sorted(need_facts[r]), "makes": sorted(made_in.get(r, [])), "nested": nested[r]} for r in R]
+
 # Depth: longest chain, processing units by when they finished.
 order = sorted(R, key=lambda r: (end[r], -r))
 pos = {r: k for k, r in enumerate(order)}
@@ -93,6 +113,11 @@ for r in order:
     ds = [depth[m] for m in needs[r] if m in depth]
     depth[r] = 1 + max(ds, default=0)
     path[r] = work[r] + max((path[m] for m in needs[r] if m in path), default=0)
+if len(sys.argv) > 2:
+    for x in units_out:
+        x["depth"] = depth[x["root"]]
+    with open(sys.argv[2] + "/units.json", "w") as f:
+        json.dump(units_out, f)
 total = sum(work.values())
 w = np.array([work[r] for r in R])
 print(f"\n{len(R)} units; order violations {bad}")
