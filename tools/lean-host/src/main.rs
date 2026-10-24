@@ -17,6 +17,11 @@
 //!                                  `over T: NAME` for each declaration that alone takes longer;
 //!                                  each batch in OUT records how long it took (`ms`)
 //!
+//!     lean-host declarations-args ARGS K,K… OUT
+//!                                  write OUT: the attest op ARGS, whose one subject is an inductive
+//!                                  block's node, checking only its declarations at positions K…
+//!                                  (see the check's DECLARATIONS_MAGIC), for witness-sim
+//!
 //! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
 //! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
 //! milliseconds come from gas budgets measured there (`tools/lean/gas_per_ms.py`).
@@ -283,6 +288,25 @@ fn write_args(dir: &Dir, plan: &str, n: usize, out: &str) {
 	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &encode(&proofs))).unwrap();
 }
 
+/// The attest op `args`, its one subject an inductive block's node, as an op checking only the
+/// declarations at `positions`.
+fn declarations_args(args: &str, positions: &str, out: &str) {
+	let args = std::fs::read(args).expect("arguments");
+	let input = witness_check::Input::parse(&args).expect("well-formed arguments");
+	let node = input.blobs().find(|b| !b.trusted).expect("a subject").data.to_vec();
+	let positions: Vec<u8> = positions.split(',').map(|k| k.parse().expect("a position")).collect();
+	let mut subject = lean_check::DECLARATIONS_MAGIC.to_vec();
+	subject.extend_from_slice(&blake2b256(&node));
+	subject.push(positions.len() as u8);
+	subject.extend_from_slice(&positions);
+	let mut blobs: Vec<(bool, Vec<u8>)> = input.blobs().filter(|b| b.trusted).map(|b| (true, b.data.to_vec())).collect();
+	blobs.push((false, subject));
+	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+	let check_blobs: Vec<CheckBlob> =
+		blobs.iter().zip(&hashes).map(|((trusted, data), h)| CheckBlob { trusted: *trusted, hash: *h, data }).collect();
+	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &encode(&[node]))).unwrap();
+}
+
 fn main() {
 	// Type errors panic, which counts as false, as on the PVM.
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
@@ -302,6 +326,7 @@ fn main() {
 			let ok = std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false);
 			println!("{ok} in {:?}", start.elapsed());
 		},
+		["declarations-args", args, positions, out] => declarations_args(args, positions, out),
 		["args", dir, p, n, out] => write_args(&Dir::open(dir), p, n.parse().expect("batch number"), out),
 		["trace", dir, p, out] => trace(&Dir::open(dir), p, out, Duration::from_millis(100)),
 		["trace", dir, p, out, ms] => trace(&Dir::open(dir), p, out, Duration::from_millis(ms.parse().expect("milliseconds"))),

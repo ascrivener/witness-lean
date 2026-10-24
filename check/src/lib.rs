@@ -26,6 +26,13 @@
 //! witness lets a reveal trust attested subjects only if its bounty cites one (or the hunter
 //! would pick the attestations' params), so a bounty cites an attested node, its `Goal` say.
 //!
+//! **Splitting an inductive block.** A node holding an inductive block (its types, constructors
+//! and recursors) can be too big to check in one op even when each declaration isn't. An op whose
+//! subjects are *declarations blobs* (see [`DECLARATIONS_MAGIC`]) for one such node, given as the
+//! witness, checks just those declarations, the node loaded as an untrusted one is (its imports
+//! loaded, declaring what it mentions). An op attesting the node, or a reveal, may then cite them:
+//! the node's declarations they cover aren't checked again. A theorem's node can't be split.
+//!
 //! Only `propext`, `Classical.choice` and `Quot.sound` may be declared as axioms. Type errors
 //! panic, which counts as false.
 
@@ -119,7 +126,33 @@ fn import_list(mut bytes: &[u8]) -> Option<Vec<Hash>> {
 /// a declaration against those loaded before it). Each node loads after the ones it (and its
 /// proof) imports; a trusted node's imports needn't be there (see `nanoda_lib::nodes`), an
 /// untrusted one's must.
-fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+///
+/// An untrusted inductive block's declarations that the declarations blobs `cited` (attested)
+/// cover were checked already, and aren't again; a cited blob for any other node is refused.
+fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>, cited: &[&[u8]]) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+	let cited: Vec<(Hash, Vec<usize>)> = cited.iter().map(|b| declarations_of(b)).collect::<Option<_>>()?;
+	let nodes = load(pins, entries)?;
+	let mut used = 0;
+	for (i, node) in nodes.nodes.iter().enumerate() {
+		let entry = &entries[&node.hash];
+		if !entry.trusted {
+			if node.assumed {
+				return None;
+			}
+			let mine: Vec<&(Hash, Vec<usize>)> = cited.iter().filter(|(h, _)| *h == node.hash).collect();
+			used += mine.len();
+			let done: Vec<usize> = mine.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+			if !done.is_empty() && (!nodes.is_inductive_block(i) || done.iter().any(|&k| k >= nodes.declaration_count(i))) {
+				return None;
+			}
+			nodes.check_some(i, |k| !done.contains(&k));
+		}
+	}
+	(used == cited.len()).then_some(nodes)
+}
+
+/// Load `entries`, trusted ones first, each after its imports.
+fn load<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
 	let mut loader = NodeLoader::new(pins);
 	for trusted_phase in [true, false] {
 		for (root, _) in entries.iter().filter(|(_, e)| e.trusted == trusted_phase) {
@@ -153,17 +186,20 @@ fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Opt
 			}
 		}
 	}
-	let nodes = loader.finish().ok()?;
-	for (i, node) in nodes.nodes.iter().enumerate() {
-		let entry = &entries[&node.hash];
-		if !entry.trusted {
-			if node.assumed {
-				return None;
-			}
-			nodes.check(i);
-		}
-	}
-	Some(nodes)
+	loader.finish().ok()
+}
+
+/// A declarations blob: [`DECLARATIONS_MAGIC`], an inductive block's node hash, then a count and
+/// that many positions within the node, as unsigned LEB128: the declarations an op checked.
+pub const DECLARATIONS_MAGIC: &[u8] = b"LEANDCL\x01";
+
+fn declarations_of(blob: &[u8]) -> Option<(Hash, Vec<usize>)> {
+	let mut rest = blob.strip_prefix(DECLARATIONS_MAGIC)?;
+	let (node, r) = rest.split_first_chunk::<32>()?;
+	rest = r;
+	let n = uvar(&mut rest)?;
+	let positions = (0..n).map(|_| uvar(&mut rest)).collect::<Option<Vec<_>>>()?;
+	rest.is_empty().then_some((*node, positions))
 }
 
 /// Add `node` to `entries`. The same trusted node may come twice (an op may cite a subject
@@ -192,9 +228,14 @@ fn attest(input: &Input, pins: &[Hash]) -> Option<()> {
 		return None;
 	}
 	let mut entries = BTreeMap::new();
+	let (mut cited, mut declarations) = (Vec::new(), Vec::new());
 	let mut subjects = 0;
 	let mut proofs = parse_witness(input.witness)?;
 	for blob in input.blobs() {
+		if blob.data.starts_with(DECLARATIONS_MAGIC) {
+			if blob.trusted { cited.push(blob.data) } else { declarations.push(blob.data) }
+			continue;
+		}
 		// A batch too big for an op carries its proofs among its subjects instead.
 		if !blob.trusted && blob.data.starts_with(PROOF_MAGIC) {
 			proofs.push(blob.data);
@@ -203,17 +244,56 @@ fn attest(input: &Input, pins: &[Hash]) -> Option<()> {
 		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
 		subjects += usize::from(!blob.trusted);
 	}
+	if !declarations.is_empty() {
+		// An op checking some declarations of one inductive block, and nothing else.
+		if subjects != 0 || !cited.is_empty() {
+			return None;
+		}
+		return attest_declarations(pins, entries, &declarations, &proofs);
+	}
 	if subjects == 0 {
 		return None;
 	}
 	attach(&mut entries, &proofs)?;
-	load_and_check(pins, &entries).map(|_| ())
+	load_and_check(pins, &entries, &cited).map(|_| ())
+}
+
+/// Attest `declarations` (blobs), each naming declarations of one inductive block, whose node is
+/// the witness: load it as an untrusted node (so its imports are loaded, and declare what it
+/// mentions), and check just those declarations, as checking the whole node would.
+fn attest_declarations<'a>(pins: &[Hash], mut entries: BTreeMap<Hash, Entry<'a>>, declarations: &[&[u8]], witness: &[&'a [u8]]) -> Option<()> {
+	let &[node] = witness else { return None };
+	if !node.starts_with(NODE_MAGIC) {
+		return None;
+	}
+	let hash = blake2b256(node);
+	let mut positions = Vec::new();
+	for blob in declarations {
+		let (of, p) = declarations_of(blob)?;
+		if of != hash {
+			return None;
+		}
+		positions.extend(p);
+	}
+	insert(&mut entries, hash, node, false)?;
+	let nodes = load(pins, &entries)?;
+	let i = nodes.find(&hash)?;
+	if !nodes.is_inductive_block(i) || positions.iter().any(|&k| k >= nodes.declaration_count(i)) {
+		return None;
+	}
+	nodes.check_some(i, |k| positions.contains(&k));
+	Some(())
 }
 
 fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {
 	let goal: &Hash = input.params.try_into().ok()?;
 	let mut entries = BTreeMap::new();
+	let mut cited = Vec::new();
 	for blob in input.blobs() {
+		if blob.trusted && blob.data.starts_with(DECLARATIONS_MAGIC) {
+			cited.push(blob.data);
+			continue;
+		}
 		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
 	}
 	let (nodes, proofs): (Vec<&[u8]>, Vec<&[u8]>) =
@@ -222,7 +302,7 @@ fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {
 		insert(&mut entries, blake2b256(node), node, false)?;
 	}
 	attach(&mut entries, &proofs)?;
-	let loaded = load_and_check(pins, &entries)?;
+	let loaded = load_and_check(pins, &entries, &cited)?;
 	// Untrusted theorems were proven above, and trusted ones were when they were attested.
 	loaded.nodes[loaded.find(goal)?].theorem.then_some(())
 }

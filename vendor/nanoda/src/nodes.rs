@@ -258,9 +258,31 @@ impl<'p> Nodes<'p> {
     /// the declarations loaded before it. An assumed statement's type is checked, but nothing
     /// proves it.
     pub fn check(&self, i: usize) {
-        for d in self.nodes[i].declars.clone() {
-            self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
+        self.check_some(i, |_| true);
+    }
+
+    /// [`Self::check`] only the declarations of node `i` at the positions (within the node) that
+    /// `which` picks.
+    pub fn check_some(&self, i: usize, which: impl Fn(usize) -> bool) {
+        for (k, d) in self.nodes[i].declars.clone().enumerate() {
+            if which(k) {
+                self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
+            }
         }
+    }
+
+    /// How many declarations node `i` holds.
+    pub fn declaration_count(&self, i: usize) -> usize {
+        self.nodes[i].declars.len()
+    }
+
+    /// Whether node `i` is an inductive block: inductive types, their constructors and recursors.
+    /// Only such a node's declarations may be checked apart (each is checked alone the same way
+    /// whichever op it's in; a theorem's node can't be split from its proof).
+    pub fn is_inductive_block(&self, i: usize) -> bool {
+        self.nodes[i].declars.clone().all(|d| {
+            matches!(self.file.declars.get_index(d).unwrap().1, Declar::Inductive(..) | Declar::Constructor(..) | Declar::Recursor(..))
+        })
     }
 
     /// Check that node `theorem` is a theorem with no universe parameters whose type is exactly

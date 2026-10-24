@@ -315,3 +315,102 @@ fn nodes_must_import_what_they_mention() {
 		assert!(!attest(&two.pins(), env, &[&stripped], &[]), "import {i} left out");
 	}
 }
+
+// Splitting an inductive block (see `DECLARATIONS_MAGIC`).
+
+/// A declarations blob naming `positions` of node `node`.
+fn declarations(node: &[u8], positions: &[usize]) -> Vec<u8> {
+	let mut out = DECLARATIONS_MAGIC.to_vec();
+	out.extend_from_slice(&blake2b256(node));
+	out.push(positions.len() as u8);
+	out.extend(positions.iter().map(|&k| k as u8));
+	out
+}
+
+/// The pack's inductive block with the most declarations among those importing something, its
+/// position, and how many it holds.
+fn biggest_block(p: &Pack) -> (usize, usize) {
+	let pins = super::pins(&p.pins()).unwrap();
+	let mut loader = NodeLoader::new(&pins);
+	for n in &p.nodes {
+		loader.add(blake2b256(n), n, None, true).unwrap();
+	}
+	let nodes = loader.finish().unwrap();
+	(0..p.nodes.len())
+		.map(|k| (k, nodes.find(&blake2b256(p.nodes[k])).unwrap()))
+		.filter(|&(k, i)| nodes.is_inductive_block(i) && !imports(p.nodes[k]).unwrap().is_empty())
+		.map(|(k, i)| (k, nodes.declaration_count(i)))
+		.max_by_key(|&(_, n)| n)
+		.unwrap()
+}
+
+/// Attest declarations blobs `subjects` of `node`, trusting `trusted`.
+fn attest_declarations(pins: &[u8], trusted: &[&[u8]], subjects: &[&[u8]], node: &[u8]) -> bool {
+	let blobs: Vec<(bool, &[u8])> = trusted.iter().map(|n| (true, *n)).chain(subjects.iter().map(|j| (false, *j))).collect();
+	run(CheckMode::Attest, &blobs, Some(pins), &[], &encode(&[node]))
+}
+
+#[test]
+fn inductive_blocks_split_by_declaration() {
+	let f = pack!("f");
+	let pins = f.pins();
+	let (k, n) = biggest_block(&f);
+	assert!(n >= 3, "an inductive with constructors and a recursor");
+	let (env, node) = (&f.nodes[..k], f.nodes[k]);
+	let (first, rest) = (declarations(node, &[0]), declarations(node, &(1..n).collect::<Vec<_>>()));
+	assert!(attest_declarations(&pins, env, &[&first], node));
+	assert!(attest_declarations(&pins, env, &[&rest], node));
+	assert!(attest_declarations(&pins, env, &[&first, &rest], node), "two blobs in one op");
+	// The node, citing both, or one (the rest checked here), or none.
+	assert!(attest(&pins, &[env, &[&first[..], &rest[..]]].concat(), &[node], &[]));
+	assert!(attest(&pins, &[env, &[&first[..]]].concat(), &[node], &[]));
+	assert!(attest(&pins, env, &[node], &[]));
+	// By a reveal too, with the block among the solver's nodes.
+	let trusted: Vec<&[u8]> = f.env().iter().copied().filter(|b| *b != node).chain([&first[..]]).collect();
+	let solver = [vec![node], f.with_proofs(&[f.goal()])].concat();
+	assert!(reveal(f.goal(), &pins, &trusted, &solver));
+	assert!(!reveal(f.goal(), &pins, &[f.env(), &[&first[..]]].concat(), &f.with_proofs(&[f.goal()])), "its node trusted");
+}
+
+#[test]
+fn only_inductive_blocks_split() {
+	let f = pack!("f");
+	let pins = f.pins();
+	let (k, n) = biggest_block(&f);
+	let (env, node) = (&f.nodes[..k], f.nodes[k]);
+	// A theorem's node: checking its "declaration" would skip its proof.
+	let goal = declarations(f.goal(), &[0]);
+	assert!(!attest_declarations(&pins, f.env(), &[&goal], f.goal()));
+	let proof = f.proof_of(f.goal()).unwrap();
+	assert!(!attest(&pins, &[f.env(), &[&goal[..]]].concat(), &[f.goal()], &[proof]), "cited for a theorem");
+	// Positions past the node's end.
+	let past = declarations(node, &[n]);
+	assert!(!attest_declarations(&pins, env, &[&past], node));
+	assert!(!attest(&pins, &[env, &[&past[..]]].concat(), &[node], &[]));
+	// For another node than the witness, or cited where that node isn't checked.
+	let other = declarations(f.nodes[k - 1], &[0]);
+	assert!(!attest_declarations(&pins, env, &[&other], node));
+	let first = declarations(node, &[0]);
+	assert!(!attest(&pins, &[f.nodes[..=k].to_vec(), vec![&first[..]]].concat(), &[f.nodes[k + 1]], &[]), "its node trusted");
+	// Not alongside other subjects, nor without the node.
+	assert!(!attest(&pins, env, &[node, &first], &[]));
+	let blobs: Vec<(bool, &[u8])> = env.iter().map(|n| (true, *n)).chain([(false, &first[..])]).collect();
+	assert!(!run(CheckMode::Attest, &blobs, Some(&pins), &[], &encode(&[])));
+}
+
+#[test]
+fn a_split_block_is_checked_where_its_hash_pins() {
+	// The block's node is loaded as an untrusted one: every import loaded, declaring what it
+	// mentions. Without one of them, its declarations aren't checked.
+	let f = pack!("f");
+	let pins = f.pins();
+	let (k, _) = biggest_block(&f);
+	let (env, node) = (&f.nodes[..k], f.nodes[k]);
+	let first = declarations(node, &[0]);
+	let imported = imports(node).unwrap();
+	assert!(!imported.is_empty());
+	for skip in env.iter().filter(|n| imported.contains(&blake2b256(n))) {
+		let fewer: Vec<&[u8]> = env.iter().copied().filter(|n| n != skip).collect();
+		assert!(!attest_declarations(&pins, &fewer, &[&first], node), "without one of its imports");
+	}
+}
