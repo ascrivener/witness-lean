@@ -35,7 +35,7 @@ echo "service $SVC"
 item "$($W propose --service "$SVC" --nonce 0 --fee-asset test --commit-deposit 10 --attest-deposit 10)"
 
 ATTESTERS=${ATTESTERS:-a1,a2,a3,a4,a5,a6,a7,a8}
-for who in ${ATTESTERS//,/ }; do item "$($W mint --to "$who" --amount 100000000)"; done
+for who in ${ATTESTERS//,/ }; do item "$($W mint --to "$who" --amount 1000000)"; done
 BATCHES=$(ls "$WORK" | grep -c '^batch-[0-9]*\.subjects$')
 step "attesters ($ATTESTERS) attest Mathlib: $BATCHES batches"
 # From WORK: its batches name their files relative to it.
