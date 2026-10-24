@@ -376,13 +376,14 @@ fn declarations_args(args: &str, positions: &str, out: &str) {
 	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &encode(&[node]))).unwrap();
 }
 
-/// Plan judgments for the one untrusted theorem of the attest op `args`.
+/// Plan judgments for the one untrusted declaration of the attest op `args`.
 fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	let bytes = std::fs::read(args).expect("arguments");
 	let input = witness_check::Input::parse(&bytes).expect("well-formed arguments");
 	let start = Instant::now();
 	let nodes = lean_check::load_attest(&input).expect("nodes load");
-	let i = nodes.nodes.iter().position(|n| n.theorem && !n.assumed).expect("an untrusted theorem");
+	let node = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).expect("an untrusted node");
+	let i = nodes.find(&blake2b256(node.data)).expect("the untrusted node loaded");
 	let unit_costs = costs.map(|c| {
 		let v: Value = serde_json::from_slice(&std::fs::read(c).expect("costs")).expect("JSON");
 		v.as_object().unwrap().iter().map(|(k, ns)| (k.parse().unwrap(), ns.as_u64().unwrap())).collect()
@@ -696,12 +697,12 @@ fn judgments_ops(full: &str, out: &str) {
 	let plan: Value = serde_json::from_slice(&std::fs::read(format!("{out}/plan.json")).unwrap()).unwrap();
 	let closure: Vec<Vec<u8>> = input.blobs().filter(|b| b.trusted).map(|b| b.data.to_vec()).collect();
 	let node = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).expect("a node").data.to_vec();
-	let proof: Vec<u8> = input
+	// A theorem's proof; a definition's value is in its node.
+	let proof: Option<Vec<u8>> = input
 		.blobs()
 		.map(|b| b.data.to_vec())
 		.chain(lean_check::parse_witness(input.witness).unwrap().into_iter().map(<[u8]>::to_vec))
-		.find(|d| d.starts_with(nanoda_lib::nodes::PROOF_MAGIC))
-		.expect("a proof");
+		.find(|d| d.starts_with(nanoda_lib::nodes::PROOF_MAGIC));
 	let node_hash = blake2b256(&node);
 	let statement_imports = import_hashes(&node[nanoda_lib::nodes::NODE_MAGIC.len()..]);
 	let judgment = |g: u64| std::fs::read(format!("{out}/group-{g}.judgment")).unwrap();
@@ -710,7 +711,7 @@ fn judgments_ops(full: &str, out: &str) {
 	let load = |with_proof: bool| -> Vec<u8> {
 		let mut blobs: Vec<(bool, &[u8])> = closure.iter().map(|d| (true, &d[..])).collect();
 		blobs.push((false, &node[..]));
-		if with_proof {
+		if let (true, Some(proof)) = (with_proof, &proof) {
 			blobs.push((false, &proof[..]));
 		}
 		let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
@@ -741,7 +742,8 @@ fn judgments_ops(full: &str, out: &str) {
 		let calls = std::fs::read(format!("{out}/group-{g}.calls")).unwrap();
 		let ok = std::cell::Cell::new(true);
 		let mut keep = looked_up(&ops_nodes, &|| {
-			if ops_nodes.attest_judgments(i, &cited_refs, &calls, &[&mine]).is_err() {
+			if let Err(e) = ops_nodes.attest_judgments(i, &cited_refs, &calls, &[&mine]) {
+				println!("group {g}: {e}");
 				ok.set(false);
 			}
 		});
@@ -792,7 +794,9 @@ fn judgments_ops(full: &str, out: &str) {
 		}
 	});
 	keep.extend(statement_imports.iter().copied());
-	keep.extend(import_hashes(&proof[nanoda_lib::nodes::PROOF_MAGIC.len() + 32..]));
+	if let Some(proof) = &proof {
+		keep.extend(import_hashes(&proof[nanoda_lib::nodes::PROOF_MAGIC.len() + 32..]));
+	}
 	keep.remove(&node_hash);
 	let summary = serde_json::json!({
 		"node": hex_of(&node_hash),

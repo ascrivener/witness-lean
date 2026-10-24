@@ -453,6 +453,29 @@ fn entries_must_be_made_by_the_calls() {
 }
 
 #[test]
+fn whnf_without_unfolding_is_computed_if_not_made() {
+	let f = pack!("f");
+	let (true_whnf, wrong_whnf, no_calls) = in_checker(&f.pins(), f.env(), f.goal(), f.proof_of(f.goal()), |nodes, tc, val| {
+		jd::run(tc, 0, false, Call::Infer(val.unwrap(), true)).unwrap();
+		let (k, v) = jd::cached(tc)
+			.into_iter()
+			.find_map(|e| match e {
+				Entry::WhnfCore(k, v) if k != v => Some((k, v)),
+				_ => None,
+			})
+			.expect("a reducing whnf without unfolding");
+		(
+			judgment_of(nodes, tc, f.goal(), &[Entry::WhnfCore(k, v)]),
+			judgment_of(nodes, tc, f.goal(), &[Entry::WhnfCore(k, k)]),
+			jd::write_calls(tc, &[]),
+		)
+	});
+	// No call makes either: the check reduces the term itself, and only the true value holds.
+	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&true_whnf], f.goal(), &no_calls));
+	assert!(!attest_judgments(&f.pins(), f.env(), &[], &[&wrong_whnf], f.goal(), &no_calls));
+}
+
+#[test]
 fn judgments_are_for_one_declaration() {
 	let (two, f) = (pack!("two"), pack!("f"));
 	let (for_f, _) = honest(&f);

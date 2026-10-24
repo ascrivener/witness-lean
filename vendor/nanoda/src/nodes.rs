@@ -451,6 +451,32 @@ impl<'p> Nodes<'p> {
                 let mut l = judgment::Lazy::new(&header)?;
                 let entries = (0..l.len()).map(|k| l.entry(tc, k)).collect::<Result<Vec<_>, _>>()?;
                 self.check_imports(tc, &entries, &header.imports, true)?;
+                // A whnf without unfolding the calls didn't make, because a call took a cached
+                // shortcut its traced run couldn't: computed here, as the checker would. It's a
+                // fact about reduction alone, not about typing.
+                for e in &entries {
+                    if let Entry::WhnfCore(k, _) = *e {
+                        if !judgment::holds(tc, e) {
+                            tc.whnf_no_unfolding(k);
+                        }
+                    }
+                }
+                #[cfg(feature = "trace")]
+                if std::env::var_os("NANODA_WHY").is_some() {
+                    let c = &tc.tc_cache;
+                    for (k, e) in entries.iter().enumerate().filter(|(_, e)| !judgment::holds(tc, e)) {
+                        let why = match *e {
+                            judgment::Entry::Infer(x, _) => format!("Infer, key cached: {:?}", c.infer_cache_check.contains_key(&x)),
+                            judgment::Entry::InferOnly(x, _) => format!("InferOnly, key cached: {:?}", c.infer_cache_no_check.contains_key(&x)),
+                            judgment::Entry::Whnf(x, _) => format!("Whnf, key cached: {:?}", c.whnf_cache.contains_key(&x)),
+                            judgment::Entry::WhnfCore(x, _) => format!("WhnfCore, key cached: {:?}", c.whnf_no_unfolding_cache.contains_key(&x)),
+                            judgment::Entry::DefEqFail(_, _, eager) => format!("DefEqFail eager {eager}"),
+                            judgment::Entry::DefEq(..) => "DefEq".into(),
+                            judgment::Entry::CongrFail(..) => "CongrFail".into(),
+                        };
+                        std::eprintln!("entry {k} of {}: {why}", entries.len());
+                    }
+                }
                 if !entries.iter().all(|e| judgment::holds(tc, e)) {
                     return Err("an entry the calls didn't make".into());
                 }
