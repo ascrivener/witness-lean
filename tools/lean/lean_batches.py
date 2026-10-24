@@ -13,8 +13,9 @@ and gets an empty witness. With RATE (gas per native millisecond, gas_per_ms.py'
 batch-N.gas: the gas its check is estimated to use, from the time lean-host trace recorded.
 For a plan with a goal: goal.trust,
 goal.pack (the goal's node and proof, the reveal's witness), goal.hash (its hash, hex), and
-goal.cite (one CLAIM:ENTRY the bounty cites, to fix the pins: a node the goal imports). Also
-pins (the pinned nodes' hashes, hex, back to back: the check's attest params). Prints the number
+goal.cite (one CLAIM:ENTRY the bounty cites, so its reveal may trust attested nodes: a node the
+goal imports). Also pins (the export's pinned nodes' hashes, hex, back to back, which must be among
+the check's own: check/pins.txt). Prints the number
 of batches.
 """
 import json

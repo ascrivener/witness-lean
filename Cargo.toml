@@ -1,9 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["check", "tools/lean-host"]
-# vendor/nanoda is a member too (a path dependency inside the workspace), but its own tests
-# predate the no_std port, so `cargo test` covers only these.
-default-members = ["check", "tools/lean-host"]
+members = ["check", "tools/lean-host", "vendor/nanoda"]
+default-members = ["check", "tools/lean-host", "vendor/nanoda"]
 
 [workspace.package]
 edition = "2024"

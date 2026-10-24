@@ -66,29 +66,36 @@ fn encode(items: &[&[u8]]) -> Vec<u8> {
 	out
 }
 
-/// Run the check; blobs get their real hashes, as witness gives them.
-fn run(mode: CheckMode, blobs: &[(bool, &[u8])], params: &[u8], witness: &[u8]) -> bool {
+/// Run the check with `pins` (32-byte hashes, back to back; `None` for its own); blobs get their
+/// real hashes, as witness gives them.
+fn run(mode: CheckMode, blobs: &[(bool, &[u8])], pins: Option<&[u8]>, params: &[u8], witness: &[u8]) -> bool {
 	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
 	let blobs: Vec<_> =
 		blobs.iter().zip(&hashes).map(|(&(trusted, data), h)| CheckBlob { trusted, hash: *h, data }).collect();
 	let args = check_args(mode, &blobs, params, witness);
 	// Type errors panic, which the PVM turns into false.
-	std::panic::catch_unwind(|| check(&Input::parse(&args).unwrap())).unwrap_or(false)
+	std::panic::catch_unwind(|| {
+		let input = Input::parse(&args).unwrap();
+		match pins {
+			Some(pins) => check_with(&input, &super::pins(pins).unwrap()),
+			None => check(&input),
+		}
+	})
+	.unwrap_or(false)
 }
 
-/// Reveal `solver`'s nodes and proofs for the theorem statement `goal`, trusting `trusted`.
+/// Reveal `solver`'s nodes and proofs for the theorem statement `goal`, trusting `trusted`, with
+/// `pins`.
 fn reveal(goal: &[u8], pins: &[u8], trusted: &[&[u8]], solver: &[&[u8]]) -> bool {
-	let mut params = blake2b256(goal).to_vec();
-	params.extend_from_slice(pins);
 	let blobs: Vec<(bool, &[u8])> = trusted.iter().map(|n| (true, *n)).collect();
-	run(CheckMode::Reveal, &blobs, &params, &encode(solver))
+	run(CheckMode::Reveal, &blobs, Some(pins), &blake2b256(goal), &encode(solver))
 }
 
-/// Attest `subjects` with `proofs`, trusting `trusted`.
+/// Attest `subjects` with `proofs`, trusting `trusted`, with `pins`.
 fn attest(pins: &[u8], trusted: &[&[u8]], subjects: &[&[u8]], proofs: &[&[u8]]) -> bool {
 	let blobs: Vec<(bool, &[u8])> =
 		trusted.iter().map(|n| (true, *n)).chain(subjects.iter().map(|n| (false, *n))).collect();
-	run(CheckMode::Attest, &blobs, pins, &encode(proofs))
+	run(CheckMode::Attest, &blobs, Some(pins), &[], &encode(proofs))
 }
 
 #[test]
@@ -157,6 +164,22 @@ fn proofs_are_type_checked() {
 	assert!(!reveal(five.goal(), &five.pins(), &[], &five.with_proofs(&five.nodes)));
 	// Its environment is fine, so it attests.
 	assert!(attest(&five.pins(), &[], five.env(), &five.with_proofs(five.env())[five.env().len()..]));
+}
+
+#[test]
+fn the_built_in_pins_are_this_toolchains() {
+	// The fixtures are exports on the toolchain the check's pins are for, so its own pins serve.
+	let f = pack!("f");
+	let proofs = f.with_proofs(&f.nodes)[f.nodes.len()..].to_vec();
+	let subjects: Vec<(bool, &[u8])> = f.nodes.iter().map(|n| (false, *n)).collect();
+	assert!(run(CheckMode::Attest, &subjects, None, &[], &encode(&proofs)));
+	assert!(!run(CheckMode::Attest, &subjects, None, &[0; 32], &encode(&proofs)), "attest params");
+	let two = pack!("two");
+	let trusted: Vec<(bool, &[u8])> = two.env().iter().map(|n| (true, *n)).collect();
+	let solver = encode(&two.with_proofs(&[two.goal()]));
+	assert!(run(CheckMode::Reveal, &trusted, None, &blake2b256(two.goal()), &solver));
+	let pinned = [blake2b256(two.goal()).as_slice(), PINS].concat();
+	assert!(!run(CheckMode::Reveal, &trusted, None, &pinned, &solver), "pins as reveal params");
 }
 
 #[test]
@@ -235,7 +258,6 @@ fn attesting_batches() {
 	assert!(!attest(&pins, &[], second, &proofs_of(second)), "without what it imports");
 	assert!(!attest(&pins, first, second, &[]), "without its proofs");
 	assert!(!attest(&pins, &f.nodes, &[], &[]), "no subjects");
-	assert!(!attest(&pins[1..], &[], &f.nodes, &proofs_of(&f.nodes)), "pins not 32 bytes each");
 	assert!(!attest(&pins, first, second, &[proofs_of(second), vec![second[0]]].concat()), "a node in the proofs");
 	assert!(!attest(&pins, first, &[second, &second[..1]].concat(), &proofs_of(second)), "a node twice");
 	// Proofs may come among the subjects instead, or some there and some in the witness.

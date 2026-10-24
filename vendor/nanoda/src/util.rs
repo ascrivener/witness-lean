@@ -193,6 +193,7 @@ pub struct ExprCache<'t> {
     pub(crate) abstr_cache: FxHashMap<(ExprPtr<'t>, u16), ExprPtr<'t>>,
     /// A cache for (expr, starting deBruijn level, current deBruijn level)
     pub(crate) abstr_cache_levels: FxHashMap<(ExprPtr<'t>, u16, u16), ExprPtr<'t>>,
+    pub(crate) alpha_eq_visited: FxHashSet<SortedPair<'t>>,
 }
 
 impl<'t> ExprCache<'t> {
@@ -203,6 +204,7 @@ impl<'t> ExprCache<'t> {
             subst_cache: new_fx_hash_map(),
             dsubst_cache: new_fx_hash_map(),
             abstr_cache_levels: new_fx_hash_map(),
+            alpha_eq_visited: new_fx_hash_set(),
         }
     }
 }
