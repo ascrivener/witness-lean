@@ -17,8 +17,12 @@ field-count validation, #63 and #65), with changes for running as a witness chec
 - **Mutual inductive blocks checked once** (`check_inductive_declar` in `src/inductive.rs`):
   upstream checks a block in full from each of its members; here from the first, with each
   later member checking its own type and that it gives the same universe parameters, parameter
-  count and member list. And `Nodes::check_some` and `Nodes::is_inductive_block`, for checking an
-  inductive block's declarations in separate ops (see witness-lean's `check/src/lib.rs`).
+  count and member list. A block is remembered only when checked whole.
+- **Checking an inductive block in parts** (`Nodes::check_parts`, `Nodes::is_inductive_block`,
+  `ExportFile::check_declar_phase` and `env::Phase`): some of a block's declarations, or one of
+  the two phases of an inductive type's check after its type and specs (its constructors, or its
+  recursors), for checking a block too big for one op in several (see witness-lean's
+  `check/src/lib.rs`).
 
 The crate is `no_std` except under test: upstream's tests run with std (and `rand`, a
 dev-dependency), reading their exports through `Config::in_memory`'s parser (`src/tests/util.rs`).
