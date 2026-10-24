@@ -27,6 +27,10 @@ for i in range(1, n + 1):
     parent[i] = stack[-1]
     stack.append(i)
 us[0] = int(sum(us[i] for i in range(1, n + 1) if parent[i] == 0))
+# Each call's exclusive time: its own, not its sub-calls'.
+excl = us.copy()
+for i in range(1, n + 1):
+    excl[parent[i]] -= us[i]
 BUDGET = 30_000  # µs of instrumented time per unit's own work (about 18 ms native)
 pieces = [int(l.split()[0]) for l in open(f"{h}/pieces.txt")]
 # Units to start with: the pieces, the declaration, and each of its top-level calls.
@@ -66,6 +70,21 @@ for it in range(50):
                     break
                 split.add(k)
                 left -= us[k]
+        # Where that isn't enough, what's left is time spent inside big calls themselves (one step
+        # each, however big): split those off too, the biggest first.
+        stuck = {r for r in over if own[r] - sum(us[k] for k in kids.get(r, []) if k in split) > BUDGET}
+        if stuck:
+            heavy = {}
+            for i in range(1, n + 1):
+                if not isroot[i] and u[i] in stuck and i not in split and excl[i] > 50:
+                    heavy.setdefault(int(u[i]), []).append(i)
+            for r, ks in heavy.items():
+                left = own[r] - sum(us[k] for k in kids.get(r, []) if k in split)
+                for k in sorted(ks, key=lambda k: -excl[k]):
+                    if left <= BUDGET:
+                        break
+                    split.add(k)
+                    left -= us[k]
     print(f"iteration {it}: {len(roots)} units, {int(outside.sum())} outside hits, {len(new)} new units, {len(over)} over budget split into {len(split)}", flush=True)
     if not new and not split:
         break
@@ -123,7 +142,7 @@ w = np.array([work[r] for r in R])
 print(f"\n{len(R)} units; order violations {bad}")
 print(f"work: total {total/1e3:.0f} ms (whole check {us[0]/1e3:.0f} ms); per unit median {np.median(w):.0f} µs, p99 {np.percentile(w,99)/1e3:.1f} ms, max {w.max()/1e3:.1f} ms")
 D = max(depth.values())
-print(f"depth {D} rounds; critical path {max(path.values())/1e3:.0f} ms")
+print(f"depth {D} rounds; critical path {max(path.values())/1e3:.0f} ms; biggest single step {excl[1:].max()/1e3:.1f} ms")
 ne = np.array([len(needs[r]) for r in R])
 print(f"needs per unit: median {np.median(ne):.0f}, p99 {np.percentile(ne,99):.0f}, max {ne.max()}")
 lv = {}
