@@ -111,26 +111,66 @@ Split the check at the level of kernel judgments, and attest the judgments the p
   it needs adversarial tests of its own, as the Kernel Arena's do for the kernel.
 - **Contexts.** 96% of the facts pieces need mention local variables (the declaration's
   hypotheses and binders), so facts are mostly specific to their declaration, and few would be
-  reused across Mathlib. They can still be matched exactly: a cache entry that mentions a local is
-  only hit while that local is in scope, so every fact a piece needs should mention only locals in
-  scope where the piece starts. State a piece as a judgment under that context, and each fact
-  closed over a prefix of it; a piece run opens the context as fresh locals, instantiates its facts
-  with them, and seeds its caches, after which lookups match by hash as usual.
+  reused across Mathlib. That needs no renaming: nanoda's locals are de Bruijn *levels*, a local
+  is the value (level, name, type), and binders open and close as a stack. A piece is a pure
+  function of its input terms and its starting depth, so a run that starts at the same depth with
+  the same inputs builds the same keys, and its facts match by hash, shipped as they are.
 
 This keeps every step re-executed by validators: no ZK proof and no fraud-proof window.
 
+## Stage 1: a native prototype
+
+Measured on `instIsIsoIndCoimageImageComparison` with nanoda's own caches (`nanoda-profiling`
+branch, `NANODA_REPLAY`, `NANODA_SPANS`, `tools/lean/fact_dag.py`).
+
+**Pieces run alone, on their facts.** Each of the 311 pieces was re-run, at the point it starts,
+on a fresh cache seeded only with the entries made in the calls it needs (a median 1,326 entries,
+max 7,026), and again on an empty cache:
+
+| 311 pieces | Seeded with their facts | Empty cache |
+|---|---|---|
+| Same result as the whole check | 311 | 311 |
+| Median | 2.6 ms | 130 ms |
+| 90th percentile | 10.6 ms | 222 ms |
+| Max | 49.1 ms | 442 ms |
+| Over 50 ms | 0 | 248 |
+
+Both re-runs happen inside the whole check's DAG, so neither has to intern terms; a real piece run
+also loads its inputs and facts (a median ~0.7 MB) and builds its intermediate terms.
+
+How locals reach the facts a piece hits (670,067 hits on entries made before the piece): 30% of
+the facts mention only locals the piece's inputs reach, 66% locals the piece's own binders
+rebuild (at or above its starting depth), 2% live context locals the inputs don't mention, and
+2.4% (in 19 pieces) a reused level with a different type. All of these are built by the piece's
+own computation, which the replays confirm.
+
+**The fact DAG.** Every fact a piece needs is made by a call, which becomes a unit of its own,
+with needs of its own; a unit's own work is its call minus the units nested in it, and a unit over
+budget gives up its largest sub-calls that fit. Closed to a fixpoint (instrumented times; the whole
+check takes 2.09 s here against 1.3 s plain):
+
+| | |
+|---|---|
+| Units | 70,654, of which 43,783 trivial (3 ms between them) |
+| Total work | 2.09 s: the whole check, each call done once |
+| Largest unit | 39.6 ms (one top-level call's own work); every other one 30 ms or less |
+| Depth | 17 rounds; critical path 77 ms |
+| Needs per unit | median 1, 99th percentile 4, max 3,798 |
+| Busiest round | 807 units, 712 ms of work |
+
+So the work doesn't grow, and the rounds are few. The cost is the number of units: they have to
+be batched, many facts to a work item, and the trivial ones are cheaper recomputed than cited.
+
 ## Open questions
 
-1. **The fact DAG's total work and depth.** Checking a fact can need other facts. Each entry is
-   computed once, so total work should stay near the original, plus loading each attestation's
-   inputs; the depth sets how many rounds attesting takes. Unmeasured.
+1. **Batching units.** 70,654 units in 17 rounds: how many facts a work item can verify and
+   cite, and which facts to recompute rather than cite, set how many packages a declaration costs.
 2. **Shipping facts with sharing.** The 28× saving needs subterms content-addressed and carried
    once, as witness-lean's nodes are, without a Merkle path per node outweighing them. Facts as
    self-contained blobs would be 18–120 MB a piece.
 3. **More than one declaration.** Measured on `instIsIsoIndCoimageImageComparison` only.
-4. **Matching facts across contexts.** That every fact a piece needs mentions only locals in scope
-   at its start follows from how nanoda creates locals, but is unmeasured; universe parameters need
-   the same treatment.
+4. **Isolated runs.** The replays ran inside the whole check's DAG. A piece run from only its
+   inputs and facts, in a DAG of its own and then in PolkaVM, is the next measurement.
 5. **Chains.** Long reductions (`decide`, big computations) are chains rather than trees. The same
    mechanism attests them link by link (`a ≡ a₁ ≡ a₂ …`) if the intermediate terms stay small.
    None of the heavy tail measured so far is of this kind.
