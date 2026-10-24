@@ -120,20 +120,28 @@ op. The median attestation uses 4.7×10⁸ gas, as for FLT, and 99% use under 1.
 simulator, 2,185 batches attest; then one lemma, `iteratedFDerivWithin_succ_apply_right`, needs
 more gas to check than a refine has (about 6.5×10⁹), and everything downstream waits on it.
 
+**All of Mathlib**: 717,116 nodes, laid out by `tools/lean/mathlib_work.py` as 51,090 batches,
+plus 46,446 ops for the 966 declarations too heavy for one refine. Those are split into judgments:
+kernel cache entries attested in pieces that cite each other, then the declaration's own check,
+seeded with them ([docs/design/heavy-declarations.md](docs/design/heavy-declarations.md); why it's
+sound: [docs/design/judgment-soundness.md](docs/design/judgment-soundness.md)). Every one of the
+97,536 passes checked natively; `scripts/mathlib-sim.sh` attests them in witness-sim, heavy ops
+included, at about 1.5 a second on an 8-core laptop.
+
 ## Limits and next steps
 
 - **Blobs travel with the ops, as extrinsics.** Every attest and reveal carries the check, its
   batch's nodes and the nodes it trusts (each with a Merkle path into its attestation), so the
   chain holds only records: no node is stored on chain. A package carries at most about 13.8 MB;
-  Mathlib's batches trust at most about 3 MB. A batch's proofs, the check's witness, are capped
-  at witness's 64 KiB `MAX_WITNESS_LEN`; a batch with more carries them among its subjects.
+  Mathlib's batches trust at most about 3 MB. A batch's proofs, the check's witness, travel in the
+  op up to witness's 64 KiB `MAX_WITNESS_LEN`, or as an extrinsic of their own (witness's CLI does
+  that for any over 1 KiB); `lean_batches.py` still puts more than 60 KB among the subjects.
 - **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
   and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
   them, built in for its Lean toolchain (see How it works). A new toolchain needs a new check.
-- **A single declaration can be too heavy for a refine.** FTA's heaviest fits (since witness
-  allows a check 5×10⁹ gas), but 57 of Lean's 60 heaviest Mathlib theorems need several refines
-  under nanoda, the worst about 60. They don't split at the proof level, and checkpointing the
-  check's VM would have to carry 40–75 MiB a step. [docs/design/heavy-declarations.md](docs/design/heavy-declarations.md)
-  measures why, and proposes attested memoization: split at kernel judgments, and attest the
-  results the pieces share.
-- **Next:** the open questions in the heavy-declarations design (the fact DAG's work and depth, shipping facts with sharing), and a nanoda profile of all of Mathlib to count its heavy tail.
+- **A heavy declaration costs several times its check.** 966 of Mathlib's declarations need more
+  than a refine; split into judgments, each costs about 7× its whole check (environment loads and
+  rebuilt entries), and the heaviest takes 254 rounds. That's most of Mathlib's gas.
+- **Next:** the open questions in [docs/design/heavy-declarations.md](docs/design/heavy-declarations.md)
+  (the overhead and latency of splitting, literal dependencies in the converter), a review of the
+  judgment soundness argument by a kernel author, and Mathlib on a real testnet.
