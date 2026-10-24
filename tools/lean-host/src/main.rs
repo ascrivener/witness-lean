@@ -17,10 +17,11 @@
 //!                                  `over T: NAME` for each declaration that alone takes longer;
 //!                                  each batch in OUT records how long it took (`ms`)
 //!
-//!     lean-host declarations-args ARGS K,K… OUT
+//!     lean-host declarations-args ARGS K[:P],… OUT
 //!                                  write OUT: the attest op ARGS, whose one subject is an inductive
-//!                                  block's node, checking only its declarations at positions K…
-//!                                  (see the check's DECLARATIONS_MAGIC), for witness-sim
+//!                                  block's node, checking only its declarations at positions K…,
+//!                                  each whole or its phase P (1 constructors, 2 recursors; see the
+//!                                  check's DECLARATIONS_MAGIC), for witness-sim
 //!
 //! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
 //! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
@@ -294,11 +295,19 @@ fn declarations_args(args: &str, positions: &str, out: &str) {
 	let args = std::fs::read(args).expect("arguments");
 	let input = witness_check::Input::parse(&args).expect("well-formed arguments");
 	let node = input.blobs().find(|b| !b.trusted).expect("a subject").data.to_vec();
-	let positions: Vec<u8> = positions.split(',').map(|k| k.parse().expect("a position")).collect();
+	let parts: Vec<(u8, u8)> = positions
+		.split(',')
+		.map(|kp| match kp.split_once(':') {
+			Some((k, p)) => (k.parse().expect("a position"), p.parse().expect("a phase")),
+			None => (kp.parse().expect("a position"), 0),
+		})
+		.collect();
 	let mut subject = lean_check::DECLARATIONS_MAGIC.to_vec();
 	subject.extend_from_slice(&blake2b256(&node));
-	subject.push(positions.len() as u8);
-	subject.extend_from_slice(&positions);
+	subject.push(parts.len() as u8);
+	for (k, p) in parts {
+		subject.extend_from_slice(&[k, p]);
+	}
 	let mut blobs: Vec<(bool, Vec<u8>)> = input.blobs().filter(|b| b.trusted).map(|b| (true, b.data.to_vec())).collect();
 	blobs.push((false, subject));
 	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();

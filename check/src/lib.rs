@@ -31,7 +31,9 @@
 //! subjects are *declarations blobs* (see [`DECLARATIONS_MAGIC`]) for one such node, given as the
 //! witness, checks just those declarations, the node loaded as an untrusted one is (its imports
 //! loaded, declaring what it mentions). An op attesting the node, or a reveal, may then cite them:
-//! the node's declarations they cover aren't checked again. A theorem's node can't be split.
+//! the node's declarations they cover aren't checked again. An inductive type's own check splits
+//! further, into its constructors and its recursors; it's covered when both are. A theorem's node
+//! can't be split. Splitting is never needed, only allowed: a node checked whole costs least.
 //!
 //! Only `propext`, `Classical.choice` and `Quot.sound` may be declared as axioms. Type errors
 //! panic, which counts as false.
@@ -41,6 +43,7 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, vec::Vec};
+use nanoda_lib::env::Phase;
 use nanoda_lib::nodes::{Hash, NODE_MAGIC, NodeLoader, PROOF_MAGIC};
 use witness_check::{Input, Mode};
 
@@ -130,7 +133,7 @@ fn import_list(mut bytes: &[u8]) -> Option<Vec<Hash>> {
 /// An untrusted inductive block's declarations that the declarations blobs `cited` (attested)
 /// cover were checked already, and aren't again; a cited blob for any other node is refused.
 fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>, cited: &[&[u8]]) -> Option<nanoda_lib::nodes::Nodes<'a>> {
-	let cited: Vec<(Hash, Vec<usize>)> = cited.iter().map(|b| declarations_of(b)).collect::<Option<_>>()?;
+	let cited: Vec<(Hash, Vec<(usize, Phase)>)> = cited.iter().map(|b| declarations_of(b)).collect::<Option<_>>()?;
 	let nodes = load(pins, entries)?;
 	let mut used = 0;
 	for (i, node) in nodes.nodes.iter().enumerate() {
@@ -139,16 +142,35 @@ fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>, cited:
 			if node.assumed {
 				return None;
 			}
-			let mine: Vec<&(Hash, Vec<usize>)> = cited.iter().filter(|(h, _)| *h == node.hash).collect();
+			let mine: Vec<&(Hash, Vec<(usize, Phase)>)> = cited.iter().filter(|(h, _)| *h == node.hash).collect();
 			used += mine.len();
-			let done: Vec<usize> = mine.iter().flat_map(|(_, p)| p.iter().copied()).collect();
-			if !done.is_empty() && (!nodes.is_inductive_block(i) || done.iter().any(|&k| k >= nodes.declaration_count(i))) {
+			let done: Vec<(usize, Phase)> = mine.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+			if !done.is_empty() && !valid_parts(&nodes, i, &done) {
 				return None;
 			}
-			nodes.check_some(i, |k| !done.contains(&k));
+			// What's left of each declaration: all of it, the phase not cited, or nothing.
+			nodes.check_parts(i, |k| {
+				let has = |p: Phase| done.contains(&(k, p));
+				if has(Phase::Whole) || (has(Phase::Constructors) && has(Phase::Recursors)) {
+					alloc::vec![]
+				} else if has(Phase::Constructors) {
+					alloc::vec![Phase::Recursors]
+				} else if has(Phase::Recursors) {
+					alloc::vec![Phase::Constructors]
+				} else {
+					alloc::vec![Phase::Whole]
+				}
+			});
 		}
 	}
 	(used == cited.len()).then_some(nodes)
+}
+
+/// Whether `parts` name parts of node `i`, an inductive block: positions within it, and phases
+/// only of its inductive types.
+fn valid_parts(nodes: &nanoda_lib::nodes::Nodes, i: usize, parts: &[(usize, Phase)]) -> bool {
+	nodes.is_inductive_block(i)
+		&& parts.iter().all(|&(k, p)| k < nodes.declaration_count(i) && (p == Phase::Whole || nodes.is_inductive_type(i, k)))
 }
 
 /// Load `entries`, trusted ones first, each after its imports.
@@ -189,17 +211,32 @@ fn load<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda
 	loader.finish().ok()
 }
 
-/// A declarations blob: [`DECLARATIONS_MAGIC`], an inductive block's node hash, then a count and
-/// that many positions within the node, as unsigned LEB128: the declarations an op checked.
+/// A declarations blob: [`DECLARATIONS_MAGIC`], an inductive block's node hash, then a count
+/// (unsigned LEB128) and that many parts its op checked: a declaration's position within the node
+/// (unsigned LEB128) and a phase byte: 0 the whole declaration, 1 an inductive type's
+/// constructors, 2 its recursors (see `nanoda_lib::env::Phase`).
 pub const DECLARATIONS_MAGIC: &[u8] = b"LEANDCL\x01";
 
-fn declarations_of(blob: &[u8]) -> Option<(Hash, Vec<usize>)> {
+fn declarations_of(blob: &[u8]) -> Option<(Hash, Vec<(usize, Phase)>)> {
 	let mut rest = blob.strip_prefix(DECLARATIONS_MAGIC)?;
 	let (node, r) = rest.split_first_chunk::<32>()?;
 	rest = r;
 	let n = uvar(&mut rest)?;
-	let positions = (0..n).map(|_| uvar(&mut rest)).collect::<Option<Vec<_>>>()?;
-	rest.is_empty().then_some((*node, positions))
+	let parts = (0..n)
+		.map(|_| {
+			let k = uvar(&mut rest)?;
+			let (&p, r) = rest.split_first()?;
+			rest = r;
+			let phase = match p {
+				0 => Phase::Whole,
+				1 => Phase::Constructors,
+				2 => Phase::Recursors,
+				_ => return None,
+			};
+			Some((k, phase))
+		})
+		.collect::<Option<Vec<_>>>()?;
+	rest.is_empty().then_some((*node, parts))
 }
 
 /// Add `node` to `entries`. The same trusted node may come twice (an op may cite a subject
@@ -267,21 +304,25 @@ fn attest_declarations<'a>(pins: &[Hash], mut entries: BTreeMap<Hash, Entry<'a>>
 		return None;
 	}
 	let hash = blake2b256(node);
-	let mut positions = Vec::new();
+	let mut parts = Vec::new();
 	for blob in declarations {
 		let (of, p) = declarations_of(blob)?;
 		if of != hash {
 			return None;
 		}
-		positions.extend(p);
+		parts.extend(p);
 	}
 	insert(&mut entries, hash, node, false)?;
 	let nodes = load(pins, &entries)?;
 	let i = nodes.find(&hash)?;
-	if !nodes.is_inductive_block(i) || positions.iter().any(|&k| k >= nodes.declaration_count(i)) {
+	if !valid_parts(&nodes, i, &parts) {
 		return None;
 	}
-	nodes.check_some(i, |k| positions.contains(&k));
+	nodes.check_parts(i, |k| {
+		let mut phases: Vec<Phase> = parts.iter().filter(|(j, _)| *j == k).map(|&(_, p)| p).collect();
+		phases.dedup();
+		phases
+	});
 	Some(())
 }
 

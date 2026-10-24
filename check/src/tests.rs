@@ -318,12 +318,19 @@ fn nodes_must_import_what_they_mention() {
 
 // Splitting an inductive block (see `DECLARATIONS_MAGIC`).
 
-/// A declarations blob naming `positions` of node `node`.
+/// A declarations blob naming the declarations at `positions` of node `node`, whole.
 fn declarations(node: &[u8], positions: &[usize]) -> Vec<u8> {
+	parts(node, &positions.iter().map(|&k| (k, 0)).collect::<Vec<_>>())
+}
+
+/// A declarations blob naming `parts` of node `node`: positions and phase bytes.
+fn parts(node: &[u8], parts: &[(usize, u8)]) -> Vec<u8> {
 	let mut out = DECLARATIONS_MAGIC.to_vec();
 	out.extend_from_slice(&blake2b256(node));
-	out.push(positions.len() as u8);
-	out.extend(positions.iter().map(|&k| k as u8));
+	out.push(parts.len() as u8);
+	for &(k, p) in parts {
+		out.extend_from_slice(&[k as u8, p]);
+	}
 	out
 }
 
@@ -413,4 +420,28 @@ fn a_split_block_is_checked_where_its_hash_pins() {
 		let fewer: Vec<&[u8]> = env.iter().copied().filter(|n| n != skip).collect();
 		assert!(!attest_declarations(&pins, &fewer, &[&first], node), "without one of its imports");
 	}
+}
+
+#[test]
+fn an_inductive_types_check_splits_into_phases() {
+	let f = pack!("f");
+	let pins = f.pins();
+	let (k, n) = biggest_block(&f);
+	let (env, node) = (&f.nodes[..k], f.nodes[k]);
+	// Position 0 is the block's (first) inductive type; the rest its constructors and recursors.
+	let ctors = parts(node, &[(0, 1)]);
+	let recs = parts(node, &[(0, 2)]);
+	let rest = declarations(node, &(1..n).collect::<Vec<_>>());
+	assert!(attest_declarations(&pins, env, &[&ctors], node));
+	assert!(attest_declarations(&pins, env, &[&recs], node));
+	// Both phases cited: the type is covered; one: the other phase runs where the node's attested.
+	assert!(attest(&pins, &[env, &[&ctors[..], &recs[..], &rest[..]]].concat(), &[node], &[]));
+	assert!(attest(&pins, &[env, &[&ctors[..], &rest[..]]].concat(), &[node], &[]));
+	assert!(attest(&pins, &[env, &[&recs[..]]].concat(), &[node], &[]));
+	// Phases only of an inductive type, and only the three.
+	let ctor_phase = parts(node, &[(n - 1, 1)]);
+	assert!(!attest_declarations(&pins, env, &[&ctor_phase], node), "a phase of a recursor");
+	assert!(!attest(&pins, &[env, &[&ctor_phase[..]]].concat(), &[node], &[]));
+	let bad = parts(node, &[(0, 3)]);
+	assert!(!attest_declarations(&pins, env, &[&bad], node), "no such phase");
 }

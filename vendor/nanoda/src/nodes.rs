@@ -29,7 +29,7 @@
 //! witness, subjects of attestations).
 #[allow(unused_imports)]
 use crate::prelude::*;
-use crate::env::Declar;
+use crate::env::{Declar, Phase};
 use crate::expr::Expr;
 use crate::level::Level;
 use crate::parser::Parser;
@@ -258,17 +258,26 @@ impl<'p> Nodes<'p> {
     /// the declarations loaded before it. An assumed statement's type is checked, but nothing
     /// proves it.
     pub fn check(&self, i: usize) {
-        self.check_some(i, |_| true);
+        self.check_parts(i, |_| vec![Phase::Whole]);
     }
 
-    /// [`Self::check`] only the declarations of node `i` at the positions (within the node) that
-    /// `which` picks.
-    pub fn check_some(&self, i: usize, which: impl Fn(usize) -> bool) {
+    /// [`Self::check`] the parts of node `i`'s declarations that `parts` picks, by each one's
+    /// position within the node: the phases of its check to run (see [`Phase`]), none to skip it.
+    /// Panics if it names phases of a declaration that isn't an inductive type.
+    pub fn check_parts(&self, i: usize, parts: impl Fn(usize) -> Vec<Phase>) {
         for (k, d) in self.nodes[i].declars.clone().enumerate() {
-            if which(k) {
-                self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
+            let d = self.file.declars.get_index(d).unwrap().1;
+            for phase in parts(k) {
+                self.file.check_declar_phase(d, phase);
             }
         }
+    }
+
+    /// Whether node `i`'s declaration at position `k` is an inductive type (so its check has
+    /// phases).
+    pub fn is_inductive_type(&self, i: usize, k: usize) -> bool {
+        let d = self.nodes[i].declars.start + k;
+        k < self.nodes[i].declars.len() && matches!(self.file.declars.get_index(d).unwrap().1, Declar::Inductive(..))
     }
 
     /// How many declarations node `i` holds.
