@@ -31,3 +31,7 @@ theorem goal_sorry : GoalGcd := sorry
 -- The same attacks on the small statement, so the fixtures stay small.
 theorem goal_two_axiom : GoalTwo := extra_axiom.elim
 theorem goal_two_sorry : GoalTwo := sorry
+
+-- The kernel checks this by expanding `""` to `String.ofList []`, which needs `Char.ofNat`
+-- loaded though no term mentions it: a literal's node imports what its expansion uses.
+theorem goal_empty : String.ofList [] = "" := rfl

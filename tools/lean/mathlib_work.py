@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lay out attesting all of Mathlib for witness's attest-batches.py, heavy declarations included.
 
-    mathlib_work.py PACK PROFILE WORK [--budget-ms MS] [--jobs N] [--lean-host PATH]
+    mathlib_work.py PACK PROFILE WORK [--budget-ms MS] [--jobs N] [--lean-host PATH] [--trust-builtins]
 
 PACK is a `lean-host convert --pack` directory (with manifest.jsonl) and PROFILE its `lean-host
 profile`. Batches are planned as plan_profile.py plans them, at MS (default 40) estimated native
@@ -11,6 +11,11 @@ milliseconds a batch. A node too slow for any batch alone is *heavy*:
   twice, the second plan grouping by the costs the first measured.
 Heavy nodes are done in N parallel jobs (default 6), in WORK/heavy/HASH, and skipped when done
 (their ops.json exists), so a run can be resumed.
+
+--trust-builtins makes every batch also trust the kernel's built-in nodes (the check's pins and
+what they import) attested below its depth: needed for a pack converted before nodes imported
+what their literals expand through (a string literal uses `String.ofList` and `Char.ofNat`
+without naming them), and not since.
 
 WORK is laid out as attest-batches.py reads it, with paths relative to WORK (run it there): batch-N.subjects (node, proof and judgment
 files), batch-N.trust (CLAIM:ENTRY references), batch-N.witness and batch-N.gas, with every
@@ -88,6 +93,7 @@ def main():
     p.add_argument("--budget-ms", type=float, default=40)
     p.add_argument("--jobs", type=int, default=6)
     p.add_argument("--lean-host", default=os.path.join(os.path.dirname(__file__), "../../target/release/lean-host"))
+    p.add_argument("--trust-builtins", action="store_true")
     a = p.parse_args()
     a.work = os.path.abspath(a.work)
     os.makedirs(f"{a.work}/heavy", exist_ok=True)
@@ -163,10 +169,10 @@ def main():
         open(f"{a.work}/batch-{n}.gas", "w").write(str(int(gas)))
 
     rel = lambda f: os.path.relpath(f, a.work)
-    # The kernel's built-in constants (the check's pins) and what they import: a literal's
-    # expansion uses them without naming them, so neither a node's imports nor the profile's
-    # lookups have them. Every batch trusts those attested at a lower depth than its own.
-    pins = [l.split()[0] for l in open(PINS) if l.strip() and not l.startswith("#")]
+    # With --trust-builtins, the kernel's built-in constants (the check's pins) and what they
+    # import, for packs whose nodes don't import what their literals expand through. Every batch
+    # trusts those attested at a lower depth than its own.
+    pins = [l.split()[0] for l in open(PINS) if l.strip() and not l.startswith("#")] if a.trust_builtins else []
     index = {h: i for i, h in enumerate(hashes)}
     builtins, stack = set(), [index[h] for h in pins]
     while stack:

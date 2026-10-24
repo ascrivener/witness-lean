@@ -734,3 +734,42 @@ fn calls_seed_only_from_cited_judgments() {
 	assert!(!attest_judgments(&f.pins(), f.env(), &[&judgment], &[&judgment], f.goal(), &calls(vec![(1, 0)])), "no second cited judgment");
 	assert!(!attest_judgments(&f.pins(), f.env(), &[&judgment], &[&judgment], f.goal(), &calls(vec![(0, n)])), "past its entries");
 }
+
+/// The hashes a node or proof imports, from its header.
+fn imports_in(blob: &[u8]) -> Vec<Hash> {
+	let rest = match blob.strip_prefix(NODE_MAGIC) {
+		Some(rest) => rest,
+		None => &blob.strip_prefix(PROOF_MAGIC).unwrap()[32..],
+	};
+	let (mut count, mut shift, mut at) = (0usize, 0, 0);
+	loop {
+		let b = rest[at];
+		count |= usize::from(b & 0x7f) << shift;
+		at += 1;
+		if b & 0x80 == 0 {
+			break;
+		}
+		shift += 7;
+	}
+	rest[at..][..32 * count].chunks(32).map(|c| c.try_into().unwrap()).collect()
+}
+
+#[test]
+fn a_literal_imports_what_it_expands_to() {
+	// `String.ofList [] = ""` by `rfl`: the kernel expands `""`, through `Char.ofNat`, which no
+	// term mentions. Trusting only what the theorem imports, and what those import, as a batch
+	// does, it checks: its node imports what the literal's expansion uses.
+	let p = pack!("empty");
+	let proof = p.proof_of(p.goal()).unwrap();
+	let mut closure = std::collections::BTreeSet::new();
+	let mut stack: Vec<Hash> = imports_in(p.goal()).into_iter().chain(imports_in(proof)).collect();
+	while let Some(h) = stack.pop() {
+		if closure.insert(h) {
+			let node = p.env().iter().find(|n| blake2b256(n) == h).unwrap();
+			stack.extend(imports_in(node));
+		}
+	}
+	let trusted: Vec<&[u8]> = p.env().iter().copied().filter(|n| closure.contains(&blake2b256(n))).collect();
+	assert!(trusted.len() < p.env().len(), "the closure is a strict part of the export");
+	assert!(attest(&p.pins(), &trusted, &[p.goal()], &[proof]));
+}

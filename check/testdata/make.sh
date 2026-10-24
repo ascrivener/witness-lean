@@ -12,6 +12,7 @@
 #   a theorem, an extra axiom, sorry).
 # - redefine: GoalF proved over the solver's own myF.
 # - five: GoalTwo edited to say 2 + 2 = 5, with the honest proof of 2 + 2 = 4.
+# - empty: String.ofList [] = "", checked by expanding the literal.
 set -euo pipefail
 : "${LEAN4EXPORT:?set LEAN4EXPORT to the lean4export binary}"
 here=$(cd "$(dirname "$0")" && pwd)
@@ -21,7 +22,7 @@ work=$(mktemp -d)
 	cd "$here/lean"
 	lake build >/dev/null
 	lake build Fixtures.Redefine >/dev/null
-	for t in goal_two goal_f goal_wrong goal_def goal_two_axiom goal_two_sorry; do
+	for t in goal_two goal_f goal_wrong goal_def goal_two_axiom goal_two_sorry goal_empty; do
 		lake env "$LEAN4EXPORT" Fixtures.Solutions -- $t >"$work/$t.ndjson"
 	done
 	lake env "$LEAN4EXPORT" Fixtures.Redefine -- goal_f >"$work/redefine.ndjson"
@@ -29,7 +30,7 @@ work=$(mktemp -d)
 cd "$work"
 sed 's/"natVal":"4"}/"natVal":"5"}/' goal_two.ndjson >five.ndjson
 for pair in two:goal_two f:goal_f wrong:goal_wrong def:goal_def axiom:goal_two_axiom \
-	sorry:goal_two_sorry redefine:redefine five:five; do
+	sorry:goal_two_sorry redefine:redefine five:five empty:goal_empty; do
 	name=${pair%%:*} src=${pair#*:}
 	python3 "$tools/lean_nodes.py" $src.ndjson nodes-$name 2>/dev/null
 	python3 "$tools/lean_pack.py" nodes-$name >"$here/$name.pack"
