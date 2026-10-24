@@ -1,7 +1,10 @@
 # Upstream contributions
 
-Contributions to send upstream, not yet posted: two nanoda_lib PRs (the kernel speedups vendored in
-`vendor/`) and a lean4export issue. To be submitted from the maintainer's own GitHub account.
+Contributions sent upstream on 2026-10-24: two nanoda_lib PRs (the kernel speedups vendored in
+`vendor/`), [ammkrn/nanoda_lib#66](https://github.com/ammkrn/nanoda_lib/pull/66) and
+[#67](https://github.com/ammkrn/nanoda_lib/pull/67), and a lean4export issue,
+[leanprover/lean4export#58](https://github.com/leanprover/lean4export/issues/58). The texts as
+posted are below; the PRs' timings were measured against `998e0a8`.
 
 ## 1. nanoda_lib PR
 
