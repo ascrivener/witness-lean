@@ -135,8 +135,22 @@ max 7,026), and again on an empty cache:
 | Max | 49.1 ms | 442 ms |
 | Over 50 ms | 0 | 248 |
 
-Both re-runs happen inside the whole check's DAG, so neither has to intern terms; a real piece run
-also loads its inputs and facts (a median ~0.7 MB) and builds its intermediate terms.
+**Isolated, and in PolkaVM.** Each piece was then written out on its own (`nanoda_lib::piece`: its
+call, starting depth, inputs, result and facts, with shared subterms once) and run in a fresh
+checker for the declaration, its terms rebuilt with the checker's own constructors, in the
+environment of the declaration's traced arguments (620 nodes, 635 KB):
+
+| 311 pieces | |
+|---|---|
+| Size, facts included | median 100 KB, max 320 KB |
+| Same result as the whole check, natively and in PolkaVM | 311 |
+| Native run, after rebuilding terms and seeding (~1 ms) | median 2.3 ms, max 49 ms (profiling build) |
+| PolkaVM gas, whole check op | median 6.5×10⁸, 90th percentile 9.1×10⁸, max 1.53×10⁹ |
+| Of which loading the environment | ~5×10⁸ |
+
+Every piece fits a refine three times over. Sharing the environment load, the 311 pack into 19
+work items of 4.5×10⁹ (`lean-check` built with the research-only `pieces` feature;
+`lean-host piece`, `piece-args`).
 
 How locals reach the facts a piece hits (670,067 hits on entries made before the piece): 30% of
 the facts mention only locals the piece's inputs reach, 66% locals the piece's own binders
@@ -169,8 +183,10 @@ be batched, many facts to a work item, and the trivial ones are cheaper recomput
    once, as witness-lean's nodes are, without a Merkle path per node outweighing them. Facts as
    self-contained blobs would be 18–120 MB a piece.
 3. **More than one declaration.** Measured on `instIsIsoIndCoimageImageComparison` only.
-4. **Isolated runs.** The replays ran inside the whole check's DAG. A piece run from only its
-   inputs and facts, in a DAG of its own and then in PolkaVM, is the next measurement.
+4. **Trusting facts on chain.** The isolated pieces seed their caches with facts as given. On
+   chain, each fact must be a judgment an earlier attestation checked: facts content-addressed
+   and cited, and the check seeding only cited ones. That's the soundness-relevant code to build
+   and test adversarially.
 5. **Chains.** Long reductions (`decide`, big computations) are chains rather than trees. The same
    mechanism attests them link by link (`a ≡ a₁ ≡ a₂ …`) if the intermediate terms stay small.
    None of the heavy tail measured so far is of this kind.
