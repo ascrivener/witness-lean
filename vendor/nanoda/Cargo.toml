@@ -28,3 +28,5 @@ num-bigint = { version = "0.5.1", features = ["rand_0_10", "serde"] }
 # Record which declarations the kernel looks up (`nodes::trace`), for planning what a check needs
 # to trust. Needs std; never for the PVM.
 trace = []
+# Helpers for tampering with judgments in tests (`judgment::testing`).
+testing = []

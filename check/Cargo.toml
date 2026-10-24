@@ -17,4 +17,5 @@ nanoda_lib = { path = "../vendor/nanoda" }
 blake2b_simd = { version = "1.0.5", default-features = false }
 
 [dev-dependencies]
+nanoda_lib = { path = "../vendor/nanoda", features = ["testing"] }
 witness-types = { workspace = true, features = ["std"] }

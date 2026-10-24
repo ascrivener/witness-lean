@@ -14,6 +14,13 @@ field-count validation, #63 and #65), with changes for running as a witness chec
   hash, loaded into one environment after their imports, with every constant they mention
   pinned, and the kernel's special names (`Nat.add`, the permitted axioms) pinned to given
   nodes. See witness-lean's `tools/lean/node_format.md`.
+- **Judgments** (`src/judgment.rs`, and `Nodes::check_with` and `Nodes::attest_judgments` in
+  `src/nodes.rs`): kernel cache entries written out and read back into a checker with its own
+  constructors, so an attested entry can seed a later check of the same declaration. A judgment
+  imports, as a node does, the nodes declaring every constant it mentions; a call runs from a
+  starting depth above its inputs' locals. See witness-lean's
+  `docs/design/heavy-declarations.md`. `lazy_delta_step` is `pub(crate)` for running it as a
+  call, and `SortedPair`'s fields for writing its entries.
 
 The crate is `no_std` except under test: upstream's tests run with std (and `rand`, a
 dev-dependency), reading their exports through `Config::in_memory`'s parser (`src/tests/util.rs`).

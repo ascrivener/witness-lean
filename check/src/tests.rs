@@ -315,3 +315,234 @@ fn nodes_must_import_what_they_mention() {
 		assert!(!attest(&two.pins(), env, &[&stripped], &[]), "import {i} left out");
 	}
 }
+
+// Judgments (see `nanoda_lib::judgment`).
+
+use nanoda_lib::judgment::{self as jd, Call, Entry, Outcome, testing};
+use nanoda_lib::nodes::Nodes;
+use nanoda_lib::tc::TypeChecker;
+use nanoda_lib::util::ExprPtr;
+
+/// Load `trusted`, then `goal` (with `proof`, unchecked, or trusted without), and run `f` in a
+/// checker for the goal's declaration, given its value if it has one.
+fn in_checker<R>(
+	pins: &[u8],
+	trusted: &[&[u8]],
+	goal: &[u8],
+	proof: Option<&[u8]>,
+	f: impl FnOnce(&Nodes<'static>, &mut TypeChecker<'_, '_, 'static>, Option<ExprPtr<'static>>) -> R,
+) -> R {
+	let pins = super::pins(pins).unwrap();
+	let mut loader = NodeLoader::new(&pins);
+	for n in trusted {
+		loader.add(blake2b256(n), n, None, true).unwrap();
+	}
+	loader.add(blake2b256(goal), goal, proof, proof.is_none()).unwrap();
+	let nodes = loader.finish().unwrap();
+	let i = nodes.find(&blake2b256(goal)).unwrap();
+	let d = nodes.file.declars.get_index(nodes.nodes[i].declars.start).unwrap().1;
+	let val = match d {
+		nanoda_lib::env::Declar::Theorem { val, .. } => Some(*val),
+		_ => None,
+	};
+	let info = *d.info();
+	nodes.file.with_tc_and_declar(info, |tc| f(&nodes, tc, val))
+}
+
+/// A judgment of `entries` for `goal`, importing what they mention.
+fn judgment_of<'t>(nodes: &Nodes<'static>, tc: &TypeChecker<'_, 't, 'static>, goal: &[u8], entries: &[Entry<'t>]) -> Vec<u8> {
+	let imports = nodes.judgment_imports(tc, entries).unwrap();
+	jd::write_judgment(tc, &blake2b256(goal), &imports, entries)
+}
+
+/// Attest the judgments `subjects` for `goal`, made by `calls`, trusting `trusted` and citing
+/// `cited`.
+fn attest_judgments(pins: &[u8], trusted: &[&[u8]], cited: &[&[u8]], subjects: &[&[u8]], goal: &[u8], calls: &[u8]) -> bool {
+	let blobs: Vec<(bool, &[u8])> =
+		trusted.iter().chain(cited).map(|n| (true, *n)).chain(subjects.iter().map(|j| (false, *j))).collect();
+	run(CheckMode::Attest, &blobs, Some(pins), &[], &encode(&[goal, calls]))
+}
+
+/// The honest judgment for a pack's goal: everything inferring its proof caches, with the calls.
+fn honest(p: &Pack) -> (Vec<u8>, Vec<u8>) {
+	in_checker(&p.pins(), p.env(), p.goal(), p.proof_of(p.goal()), |nodes, tc, val| {
+		let call = Call::Infer(val.unwrap(), true);
+		jd::run(tc, 0, call).unwrap();
+		let entries = jd::cached(tc);
+		assert!(!entries.is_empty());
+		(judgment_of(nodes, tc, p.goal(), &entries), jd::write_calls(tc, &[(0, call)]))
+	})
+}
+
+#[test]
+fn judgments_are_attested_and_used() {
+	for p in [pack!("two"), pack!("f")] {
+		let (judgment, calls) = honest(&p);
+		assert!(attest_judgments(&p.pins(), p.env(), &[], &[&judgment], p.goal(), &calls));
+		// Cited when the goal is checked, by attest and by reveal.
+		let proof = p.proof_of(p.goal()).unwrap();
+		let cited = [p.env(), &[&judgment[..]]].concat();
+		assert!(attest(&p.pins(), &cited, &[p.goal()], &[proof]));
+		assert!(reveal(p.goal(), &p.pins(), &cited, &p.with_proofs(&[p.goal()])));
+		// A judgment op cites judgments too, and needs the declaration's node and its calls.
+		assert!(attest_judgments(&p.pins(), p.env(), &[&judgment], &[&judgment], p.goal(), &calls), "citing itself");
+		let blobs: Vec<(bool, &[u8])> = p.env().iter().map(|n| (true, *n)).chain([(false, &judgment[..])]).collect();
+		assert!(!run(CheckMode::Attest, &blobs, Some(&p.pins()), &[], &encode(&[&calls[..]])), "no node");
+		assert!(!run(CheckMode::Attest, &blobs, Some(&p.pins()), &[], &encode(&[p.goal()])), "no calls");
+		assert!(!attest(&p.pins(), p.env(), &[p.goal(), &judgment], &[proof]), "with a node to attest");
+	}
+}
+
+/// GoalTwo edited to 2 + 2 = 5 (everywhere, its proof's own ascription too), with a forged
+/// entry: that its proof is well typed, of the statement's type. Inferring the proof's type
+/// without checking it does give the statement's type, as an unchecked entry; checking it fails.
+/// Also the calls that infer it checking, and only inferring.
+fn forged_five() -> (Pack, Vec<u8>, Vec<u8>, Vec<u8>) {
+	let five = pack!("five");
+	let (forged, calls_check, calls_only) =
+		in_checker(&five.pins(), five.env(), five.goal(), five.proof_of(five.goal()), |nodes, tc, val| {
+			let val = val.unwrap();
+			let stated = testing::declaration(tc);
+			assert_eq!(jd::run(tc, 0, Call::Infer(val, false)).unwrap(), Outcome::Expr(stated));
+			assert!(jd::holds(tc, &Entry::InferOnly(val, stated)) && !jd::holds(tc, &Entry::Infer(val, stated)));
+			let forged = judgment_of(nodes, tc, five.goal(), &[Entry::Infer(val, stated)]);
+			let calls_check = jd::write_calls(tc, &[(0, Call::Infer(val, true))]);
+			let calls_only = jd::write_calls(tc, &[(0, Call::Infer(val, false))]);
+			(forged, calls_check, calls_only)
+		});
+	(five, forged, calls_check, calls_only)
+}
+
+#[test]
+fn forged_judgments_are_refused() {
+	let (five, forged, calls_check, calls_only) = forged_five();
+	let proof = five.proof_of(five.goal()).unwrap();
+	assert!(!attest(&five.pins(), five.env(), &[five.goal()], &[proof]), "five doesn't check");
+	// The forged entry isn't one the kernel makes: checking fails, and only inferring makes the
+	// unchecked entry, not this one.
+	assert!(!attest_judgments(&five.pins(), five.env(), &[], &[&forged], five.goal(), &calls_check));
+	assert!(!attest_judgments(&five.pins(), five.env(), &[], &[&forged], five.goal(), &calls_only));
+	// Not cited (attested), it's a subject: an op of judgments can't also check a node.
+	assert!(!attest(&five.pins(), five.env(), &[five.goal(), &forged], &[proof]));
+	// Cited, it's believed: so witness must only pass attested judgments as trusted, which it does
+	// (and only those attested by this check).
+	assert!(attest(&five.pins(), &[five.env(), &[&forged[..]]].concat(), &[five.goal()], &[proof]));
+}
+
+#[test]
+fn entries_must_be_made_by_the_calls() {
+	let f = pack!("f");
+	let (judgment, calls) = honest(&f);
+	let (with_extra, infer_only, relabelled) = in_checker(&f.pins(), f.env(), f.goal(), f.proof_of(f.goal()), |nodes, tc, val| {
+		let val = val.unwrap();
+		jd::run(tc, 0, Call::Infer(val, true)).unwrap();
+		let mut entries = jd::cached(tc);
+		let Outcome::Expr(ty) = jd::run(tc, 0, Call::Infer(val, true)).unwrap() else { panic!() };
+		// An entry the calls don't make: the proof's type equal to its value.
+		entries.push(Entry::DefEq(ty, val));
+		let with_extra = judgment_of(nodes, tc, f.goal(), &entries);
+		// Only inferring the proof's type, not checking it, caches it as such.
+		let infer_only = jd::write_calls(tc, &[(0, Call::Infer(val, false))]);
+		let relabelled = judgment_of(nodes, tc, f.goal(), &[Entry::Infer(val, ty)]);
+		(with_extra, infer_only, relabelled)
+	});
+	assert!(!attest_judgments(&f.pins(), f.env(), &[], &[&with_extra], f.goal(), &calls), "an extra entry");
+	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&relabelled], f.goal(), &calls), "checked, it holds");
+	assert!(!attest_judgments(&f.pins(), f.env(), &[], &[&relabelled], f.goal(), &infer_only), "inferred only");
+	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&judgment], f.goal(), &calls));
+}
+
+#[test]
+fn judgments_are_for_one_declaration() {
+	let (two, f) = (pack!("two"), pack!("f"));
+	let (for_f, _) = honest(&f);
+	let (for_two, calls_two) = honest(&two);
+	let proof = two.proof_of(two.goal()).unwrap();
+	// f's judgment cited in an op checking only GoalTwo's proof: it's for something else.
+	let pins = [two.pins(), f.pins()].concat();
+	assert!(!attest(&pins, &[two.env(), &[&for_f[..]]].concat(), &[two.goal()], &[proof]));
+	// Attested for GoalTwo, it can't be attested as f's.
+	assert!(!attest_judgments(&pins, f.env(), &[], &[&for_two], f.goal(), &calls_two));
+	// Cited where GoalTwo is trusted rather than checked.
+	let five = pack!("five");
+	let five_proof = five.proof_of(five.goal()).unwrap();
+	let cited = [two.nodes.clone(), vec![&for_two[..]]].concat();
+	assert!(!attest(&[two.pins(), five.pins()].concat(), &cited, &[five.goal()], &[five_proof]));
+}
+
+#[test]
+fn judgments_import_what_they_mention() {
+	let (five, forged, _, _) = forged_five();
+	let proof = five.proof_of(five.goal()).unwrap();
+	// The forged entry, cited without imports, or missing one: not believed.
+	let header = jd::header(&forged).unwrap();
+	assert!(header.imports.len() > 1);
+	let with_imports = |imports: &[Hash]| {
+		let mut out = jd::JUDGMENT_MAGIC.to_vec();
+		out.extend_from_slice(&header.declaration);
+		out.push(imports.len() as u8);
+		imports.iter().for_each(|h| out.extend_from_slice(h));
+		let items_at = jd::JUDGMENT_MAGIC.len() + 32 + 1 + 32 * header.imports.len();
+		out.extend_from_slice(&forged[items_at..]);
+		out
+	};
+	let cite = |j: &[u8]| attest(&five.pins(), &[five.env(), &[j]].concat(), &[five.goal()], &[proof]);
+	assert!(cite(&with_imports(&header.imports)), "as written: believed (see forged_judgments_are_refused)");
+	assert!(!cite(&with_imports(&[])), "no imports");
+	assert!(!cite(&with_imports(&header.imports[1..])), "one left out");
+	assert!(!cite(&with_imports(&header.imports[..header.imports.len() - 1])), "another left out");
+}
+
+#[test]
+fn a_judgment_means_what_its_imports_declare() {
+	// A judgment for goal_f made over the redefinition's myF (`myF _ := 1`), attested honestly,
+	// mentions myF; where goal_f is checked, myF is the poster's (`myF n := n + 1`).
+	let (f, redefine) = (pack!("f"), pack!("redefine"));
+	let pins = [f.pins(), redefine.pins()].concat();
+	let their_goal_f = imports(redefine.goal()).unwrap()[0];
+	let their_env: Vec<&[u8]> = redefine.env().iter().copied().filter(|n| blake2b256(n) != their_goal_f).collect();
+	let (judgment, calls) = in_checker(&pins, &their_env, f.goal(), None, |nodes, tc, _| {
+		let my_f = testing::constant(tc, "myF");
+		let call = Call::Whnf(my_f);
+		jd::run(tc, 0, Call::Infer(my_f, true)).unwrap();
+		jd::run(tc, 0, call).unwrap();
+		let entries = jd::cached(tc);
+		(judgment_of(nodes, tc, f.goal(), &entries), jd::write_calls(tc, &[(0, Call::Infer(my_f, true)), (0, call)]))
+	});
+	assert!(attest_judgments(&pins, &their_env, &[], &[&judgment], f.goal(), &calls), "true of their myF");
+	let proof = f.proof_of(f.goal()).unwrap();
+	assert!(attest(&pins, f.env(), &[f.goal()], &[proof]));
+	assert!(!attest(&pins, &[f.env(), &[&judgment[..]]].concat(), &[f.goal()], &[proof]), "cited for the poster's");
+}
+
+#[test]
+fn locals_carry_their_types() {
+	let f = pack!("f");
+	let (honest_one, retyped, calls, deep, shallow) = in_checker(&f.pins(), f.env(), f.goal(), f.proof_of(f.goal()), |nodes, tc, val| {
+		let val = val.unwrap();
+		jd::run(tc, 0, Call::Infer(val, true)).unwrap();
+		// An inference about the proof's bound `n : Nat`, opened as a local.
+		let (key, ty) = jd::cached(tc)
+			.into_iter()
+			.find_map(|e| match e {
+				Entry::Infer(k, t) if !testing::locals(tc, k).is_empty() => Some((k, t)),
+				_ => None,
+			})
+			.expect("an inference under the binder");
+		let local = testing::locals(tc, key)[0];
+		let other = testing::declaration(tc);
+		let swapped = testing::retyped(tc, local, other);
+		let (k2, t2) = (testing::replace(tc, key, local, swapped), testing::replace(tc, ty, local, swapped));
+		let honest_one = judgment_of(nodes, tc, f.goal(), &[Entry::Infer(key, ty)]);
+		let retyped = judgment_of(nodes, tc, f.goal(), &[Entry::Infer(k2, t2)]);
+		let calls = jd::write_calls(tc, &[(0, Call::Infer(val, true))]);
+		// The inference again, as a call of its own: from above its local, and from at it.
+		let deep = jd::write_calls(tc, &[(1, Call::Infer(key, true))]);
+		let shallow = jd::write_calls(tc, &[(0, Call::Infer(key, true))]);
+		(honest_one, retyped, calls, deep, shallow)
+	});
+	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&honest_one], f.goal(), &calls));
+	assert!(!attest_judgments(&f.pins(), f.env(), &[], &[&retyped], f.goal(), &calls), "the local retyped");
+	assert!(attest_judgments(&f.pins(), f.env(), &[], &[&honest_one], f.goal(), &deep), "a call above its local");
+	assert!(!attest_judgments(&f.pins(), f.env(), &[], &[&honest_one], f.goal(), &shallow), "a call at its local's level");
+}
