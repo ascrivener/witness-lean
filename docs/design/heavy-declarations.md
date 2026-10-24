@@ -201,9 +201,15 @@ Failure facts should only cost completeness, since every way the kernel accepts 
 positive judgments. That's worth confirming by review, but they're attested the same way anyway.
 
 **Scope.** Locals are (level, name, type) values, so an entry carries its whole local context. What
-it depends on beyond its terms is the environment, the declarations before its own, and the
-declaration's universe parameters. The declaration node's hash fixes both, so a check seeds a
-judgment only into a checker set up for that same declaration, and refuses one for any other.
+it depends on beyond its terms is the declaration's universe parameters and what the constants it
+mentions mean. A check seeds a judgment only into a checker for the declaration it names. And as a
+node does, a judgment imports the nodes declaring every constant it mentions, and is used only
+where each is declared by one of them. The declaration's hash alone doesn't fix that: a statement
+node pins what the statement mentions, not the proof, and an op loads only the nodes its check
+touches, so a name could mean something else where a judgment is used than where it was made.
+
+**Calls** run from a starting depth above every local their inputs mention, so the binders they
+open are fresh and can't capture an input's local.
 
 **Producing judgments.** A group's op names its units' calls (kind, depth, inputs, as in a
 piece), trusts the environment's nodes and the judgments it cites, and has its own judgment blob
