@@ -627,7 +627,17 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
         self.dbj_level_counter += 1;
         let id = FVarId::DbjLevel(level);
         let hash = hash64!(crate::expr::LOCAL_HASH, binder_name, binder_style, binder_type, id);
-        self.alloc_expr(Expr::Local { binder_name, binder_style, binder_type, id, hash })
+        let e = self.alloc_expr(Expr::Local { binder_name, binder_style, binder_type, id, hash });
+        #[cfg(feature = "trace")]
+        LIVE.with(|l| {
+            use core::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            e.hash(&mut h);
+            let mut l = l.borrow_mut();
+            l.truncate(level as usize);
+            l.push(h.finish());
+        });
+        e
     }
 
     /// Construct a free variable expression representing a deBruijn level, reusing
@@ -997,3 +1007,9 @@ struct ExitStatus {
     pp_err: Option<String>
 }
 
+
+#[cfg(feature = "trace")]
+std::thread_local! {
+    /// The local opened at each deBruijn level, while it's open (profiling).
+    pub(crate) static LIVE: core::cell::RefCell<std::vec::Vec<u64>> = core::cell::RefCell::new(std::vec::Vec::new());
+}

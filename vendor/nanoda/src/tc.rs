@@ -509,6 +509,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         #[cfg(feature = "trace")]
         {
             let t = prof::enter(self, "infer");
+            prof::piece_start(self, &t, &[e]);
             let r = self.infer_inner(e, flag);
             let cold = if prof::wants_cold(&t) {
                 let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
@@ -520,6 +521,15 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             } else {
                 None
             };
+            if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                let saved = core::mem::replace(&mut self.tc_cache, seed);
+                let c = prof::begin_cold(self);
+                let r2 = self.infer_inner(e, flag);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                prof::replayed(self, &t, r2 == r, n, warm_us, m);
+            }
+            prof::piece_end(&t);
             prof::exit(self, t, &[e], cold);
             return r;
         }
@@ -797,6 +807,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         #[cfg(feature = "trace")]
         {
             let t = prof::enter(self, "whnf");
+            prof::piece_start(self, &t, &[e]);
             let r = self.whnf_inner(e);
             let cold = if prof::wants_cold(&t) {
                 let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
@@ -808,6 +819,15 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             } else {
                 None
             };
+            if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                let saved = core::mem::replace(&mut self.tc_cache, seed);
+                let c = prof::begin_cold(self);
+                let r2 = self.whnf_inner(e);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                prof::replayed(self, &t, r2 == r, n, warm_us, m);
+            }
+            prof::piece_end(&t);
             prof::exit(self, t, &[e], cold);
             return r;
         }
@@ -1017,6 +1037,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         #[cfg(feature = "trace")]
         {
             let t = prof::enter(self, "def_eq");
+            prof::piece_start(self, &t, &[x, y]);
             let r = self.def_eq_inner(x, y);
             let cold = if prof::wants_cold(&t) {
                 let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
@@ -1028,6 +1049,15 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             } else {
                 None
             };
+            if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                let saved = core::mem::replace(&mut self.tc_cache, seed);
+                let c = prof::begin_cold(self);
+                let r2 = self.def_eq_inner(x, y);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                prof::replayed(self, &t, r2 == r, n, warm_us, m);
+            }
+            prof::piece_end(&t);
             prof::exit(self, t, &[x, y], cold);
             return r;
         }
@@ -1374,6 +1404,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         #[cfg(feature = "trace")]
         {
             let t = prof::enter(self, "lazy_delta");
+            prof::piece_start(self, &t, &[x, y]);
             let r = self.lazy_delta_step_inner(x, y);
             let cold = if prof::wants_cold(&t) {
                 let saved = core::mem::replace(&mut self.tc_cache, TcCache::new());
@@ -1385,6 +1416,15 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             } else {
                 None
             };
+            if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                let saved = core::mem::replace(&mut self.tc_cache, seed);
+                let c = prof::begin_cold(self);
+                let r2 = self.lazy_delta_step_inner(x, y);
+                let m = prof::end_cold(self, c);
+                self.tc_cache = saved;
+                prof::replayed(self, &t, r2 == r, n, warm_us, m);
+            }
+            prof::piece_end(&t);
             prof::exit(self, t, &[x, y], cold);
             return r;
         }
@@ -1570,7 +1610,9 @@ pub(crate) mod prof {
         let cold = COLD.with(|c| *c.borrow());
         let idx = INDEX.with(|i| {
             let mut i = i.borrow_mut();
-            *i += 1;
+            if !cold {
+                *i += 1;
+            }
             *i
         });
         let cold_before = COLD_US.with(|c| *c.borrow());
@@ -1582,6 +1624,8 @@ pub(crate) mod prof {
         /// as (call index of the hit, call index the entry was created at).
         static CREATED: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
         static HITS: RefCell<std::vec::Vec<(u64, u64)>> = const { RefCell::new(std::vec::Vec::new()) };
+        /// Every call's (index, last index in its subtree, warm µs), for NANODA_SPANS.
+        static SPANS: RefCell<std::vec::Vec<(u64, u64, u64)>> = const { RefCell::new(std::vec::Vec::new()) };
     }
 
     fn key<K: core::hash::Hash>(cache: u8, k: &K) -> u64 {
@@ -1602,6 +1646,125 @@ pub(crate) mod prof {
         static PIECES: RefCell<Option<std::vec::Vec<std::vec::Vec<u64>>>> = const { RefCell::new(None) };
         static NEEDED: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
         static FACTS: RefCell<HashMap<u64, std::vec::Vec<u64>>> = RefCell::new(HashMap::new());
+        /// Whether a needed entry's terms mention a local variable (aren't closed).
+        static OPEN: RefCell<HashMap<u64, bool>> = RefCell::new(HashMap::new());
+        /// The locals each needed entry's terms reach; the piece being run, with its inputs'
+        /// locals; and (outside hits checked, facts with a local outside the piece's inputs).
+        static FACT_LOCALS: RefCell<HashMap<u64, std::vec::Vec<(u64, u16)>>> = RefCell::new(HashMap::new());
+        /// The piece being run: its start, its inputs' locals, and the live local at each level.
+        static ACTIVE: RefCell<Option<(u64, std::collections::HashSet<u64>, std::vec::Vec<u64>)>> = const { RefCell::new(None) };
+        /// Outside hits in pieces, and of their facts' locals: [input, live context, made inside, dead, unique].
+        static SCOPE: RefCell<(u64, [u64; 5], [std::collections::HashSet<u64>; 5])> = RefCell::new((0, [0; 5], Default::default()));
+        static STARTS: RefCell<std::collections::HashSet<u64>> = RefCell::new(std::collections::HashSet::new());
+    }
+
+    /// The ids of the locals `roots` reach, through locals' types.
+    fn locals<'t>(tc: &TypeChecker<'_, 't, '_>, roots: &[ExprPtr<'t>]) -> std::vec::Vec<(u64, u16)> {
+        use crate::expr::Expr::*;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = std::vec::Vec::new();
+        let mut stack: std::vec::Vec<ExprPtr<'t>> = roots.to_vec();
+        while let Some(e) = stack.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            match tc.ctx.read_expr(e) {
+                App { fun, arg, .. } => stack.extend([fun, arg]),
+                Pi { binder_type, body, .. } | Lambda { binder_type, body, .. } => stack.extend([binder_type, body]),
+                Let { binder_type, val, body, .. } => stack.extend([binder_type, val, body]),
+                Proj { structure, .. } => stack.push(structure),
+                Local { binder_type, id, .. } => {
+                    let level = match id { crate::expr::FVarId::DbjLevel(l) => l, _ => u16::MAX };
+                    out.push((node_id(e), level));
+                    stack.push(binder_type)
+                },
+                _ => {},
+            }
+        }
+        out
+    }
+
+    pub(crate) fn piece_start<'t>(tc: &TypeChecker<'_, 't, '_>, e: &Entry, terms: &[ExprPtr<'t>]) {
+        if e.cold {
+            return;
+        }
+        load_pieces();
+        if STARTS.with(|s| s.borrow().contains(&e.idx)) {
+            let ls = locals(tc, terms).into_iter().map(|(id, _)| id).collect();
+            let live = crate::util::LIVE.with(|l| l.borrow()[..usize::from(tc.ctx.dbj_level_counter)].to_vec());
+            ACTIVE.with(|a| *a.borrow_mut() = Some((e.idx, ls, live)));
+        }
+    }
+
+    /// NANODA_REPLAY: for a piece's call, a cache seeded with the entries created in the calls
+    /// the piece needs (and how many), plus the piece's warm time so far.
+    pub(crate) fn seed<'t>(tc: &TypeChecker<'_, 't, '_>, e: &Entry) -> Option<(crate::util::TcCache<'t>, usize, u128)> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if e.cold || !*ON.get_or_init(|| std::env::var("NANODA_REPLAY").is_ok()) || !STARTS.with(|s| s.borrow().contains(&e.idx)) {
+            return None;
+        }
+        let warm_us = e.start.elapsed().as_micros() - (COLD_US.with(|c| *c.borrow()) - e.cold_before);
+        let t0 = Instant::now();
+        let needed: std::collections::HashSet<u64> = PIECES.with(|p| {
+            p.borrow().as_ref().unwrap().iter().find(|ids| ids[0] == e.idx).unwrap()[1..].iter().copied().collect()
+        });
+        let mut n = 0;
+        let mut out = crate::util::TcCache::new();
+        // NANODA_REPLAY=empty: the same re-run with nothing seeded, for comparison.
+        if std::env::var("NANODA_REPLAY").is_ok_and(|v| v == "empty") {
+            return Some((out, 0, warm_us));
+        }
+        let c = &tc.tc_cache;
+        CREATED.with(|cr| {
+            let cr = cr.borrow();
+            let mut ok = |id: u8, h: u64| {
+                let yes = cr.get(&h).is_some_and(|at| needed.contains(at));
+                n += usize::from(yes);
+                let _ = id;
+                yes
+            };
+            for (&k, &v) in &c.infer_cache_check {
+                if ok(0, key(0, &k)) { out.infer_cache_check.insert(k, v); }
+            }
+            for (&k, &v) in &c.infer_cache_no_check {
+                if ok(1, key(1, &k)) { out.infer_cache_no_check.insert(k, v); }
+            }
+            for (&k, &v) in &c.whnf_cache {
+                if ok(2, key(2, &k)) { out.whnf_cache.insert(k, v); }
+            }
+            for (&k, &v) in &c.whnf_no_unfolding_cache {
+                if ok(3, key(3, &k)) { out.whnf_no_unfolding_cache.insert(k, v); }
+            }
+            for &k in &c.defeq_fail_cache {
+                if ok(4, key(4, &k)) { out.defeq_fail_cache.insert(k); }
+            }
+            for &k in &c.eq_cache {
+                if ok(5, key(5, &k)) { out.eq_cache.insert(k); }
+            }
+            for &k in &c.congr_fail_cache {
+                if ok(6, key(6, &k)) { out.congr_fail_cache.insert(k); }
+            }
+        });
+        // Seeding isn't the enclosing calls' work.
+        COLD_US.with(|t| *t.borrow_mut() += t0.elapsed().as_micros());
+        Some((out, n, warm_us))
+    }
+
+    pub(crate) fn replayed(tc: &TypeChecker<'_, '_, '_>, e: &Entry, same: bool, seeded: usize, warm_us: u128, m: (u128, usize)) {
+        let _ = tc;
+        std::eprintln!("replay {} {} warm_us {} replay_us {} same {} seeded {} new_exprs {}", e.idx, e.name, warm_us, m.0, same, seeded, m.1);
+    }
+
+    pub(crate) fn piece_end(e: &Entry) {
+        if e.cold {
+            return;
+        }
+        ACTIVE.with(|a| {
+            let mut a = a.borrow_mut();
+            if a.as_ref().is_some_and(|(idx, ..)| *idx == e.idx) {
+                *a = None;
+            }
+        });
     }
 
     fn load_pieces() {
@@ -1614,6 +1777,7 @@ pub(crate) mod prof {
                 for line in std::fs::read_to_string(path).unwrap().lines() {
                     let ids: std::vec::Vec<u64> = line.split_whitespace().map(|x| x.parse().unwrap()).collect();
                     NEEDED.with(|n| n.borrow_mut().extend(ids[1..].iter().copied()));
+                    STARTS.with(|s| s.borrow_mut().insert(ids[0]));
                     pieces.push(ids);
                 }
             }
@@ -1629,6 +1793,9 @@ pub(crate) mod prof {
     }
 
     pub(crate) fn ins<'t, K: core::hash::Hash>(tc: &TypeChecker<'_, 't, '_>, cache: u8, k: &K, roots: &[ExprPtr<'t>]) {
+        if COLD.with(|c| *c.borrow()) {
+            return;
+        }
         let at = now();
         CREATED.with(|c| {
             c.borrow_mut().entry(key(cache, k)).or_insert(at);
@@ -1651,6 +1818,14 @@ pub(crate) mod prof {
                     _ => {},
                 }
             }
+            let open = roots.iter().any(|&r| match tc.ctx.read_expr(r) {
+                App { has_fvars, .. } | Pi { has_fvars, .. } | Lambda { has_fvars, .. } | Let { has_fvars, .. } | Proj { has_fvars, .. } => has_fvars,
+                Local { .. } => true,
+                _ => false,
+            });
+            OPEN.with(|o| *o.borrow_mut().entry(at).or_insert(false) |= open);
+            let ls = locals(tc, roots);
+            FACT_LOCALS.with(|f| f.borrow_mut().entry(at).or_default().extend(ls));
             FACTS.with(|f| f.borrow_mut().entry(at).or_default().extend(seen.into_iter().map(node_id)));
         }
     }
@@ -1679,12 +1854,61 @@ pub(crate) mod prof {
         for (shared, sum, facts) in &rows {
             std::eprintln!("piecefacts {facts} {shared} {sum}");
         }
+        SCOPE.with(|s| {
+            let s = s.borrow();
+            let n: std::vec::Vec<usize> = s.2.iter().map(|p| p.len()).collect();
+            std::eprintln!("scope: {} outside hits in pieces; worst local: input-only {} ({} pieces), live context {} ({}), made inside {} ({}), dead {} ({}), unique {} ({})",
+                s.0, s.1[0], n[0], s.1[1], n[1], s.1[2], n[2], s.1[3], n[3], s.1[4], n[4]);
+        });
+        OPEN.with(|o| {
+            let o = o.borrow();
+            for piece in &pieces {
+                let open = piece[1..].iter().filter(|id| o.get(id) == Some(&true)).count();
+                std::eprintln!("pieceopen {} {}", piece.len() - 1, open);
+            }
+        });
     }
 
     pub(crate) fn hit<K: core::hash::Hash>(cache: u8, k: &K) {
+        if COLD.with(|c| *c.borrow()) {
+            return;
+        }
         if let Some(made) = CREATED.with(|c| c.borrow().get(&key(cache, k)).copied()) {
             let at = now();
             HITS.with(|h| h.borrow_mut().push((at, made)));
+            ACTIVE.with(|a| {
+                if let Some((start, inputs, live)) = a.borrow().as_ref() {
+                    if made < *start {
+                        // The worst kind among the fact's locals.
+                        let kind = FACT_LOCALS.with(|f| {
+                            f.borrow().get(&made).map_or(0, |ls| {
+                                ls.iter()
+                                    .map(|&(id, lv)| {
+                                        if inputs.contains(&id) {
+                                            0
+                                        } else if lv == u16::MAX {
+                                            4
+                                        } else if usize::from(lv) >= live.len() {
+                                            2
+                                        } else if live[usize::from(lv)] == id {
+                                            1
+                                        } else {
+                                            3
+                                        }
+                                    })
+                                    .max()
+                                    .unwrap_or(0)
+                            })
+                        });
+                        SCOPE.with(|s| {
+                            let mut s = s.borrow_mut();
+                            s.0 += 1;
+                            s.1[kind] += 1;
+                            s.2[kind].insert(*start);
+                        });
+                    }
+                }
+            });
         }
     }
 
@@ -1761,6 +1985,7 @@ pub(crate) mod prof {
                 e.idx, e.depth, e.name, us, cold_us, cold_exprs, nodes, locals, now()
             );
         }
+        SPANS.with(|s| s.borrow_mut().push((e.idx, now(), us as u64)));
         CALLS.with(|c| {
             let mut c = c.borrow_mut();
             let v = c.entry(e.name).or_insert((0, 0));
@@ -1798,6 +2023,17 @@ pub(crate) mod prof {
                 for (at, made) in h.borrow_mut().drain(..) {
                     f.write_all(&at.to_le_bytes()).unwrap();
                     f.write_all(&made.to_le_bytes()).unwrap();
+                }
+            });
+        }
+        if let Some(path) = std::env::var_os("NANODA_SPANS") {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+            SPANS.with(|s| {
+                for (idx, end, us) in s.borrow_mut().drain(..) {
+                    for x in [idx, end, us] {
+                        f.write_all(&x.to_le_bytes()).unwrap();
+                    }
                 }
             });
         }
