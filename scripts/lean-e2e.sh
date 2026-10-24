@@ -19,9 +19,10 @@
 # (lean_plan.py): that's the library, attested once, batch by batch, each trusting the nodes it
 # needs from earlier batches. Batches that don't depend on each other go in parallel: several
 # attesters (ATTESTERS), each filling a work package of its own with several batches a round
-# (tools/lean/attest.py). The poster's bounty names the theorem's
+# (witness's scripts/attest-batches.py). The poster's bounty names the theorem's
 # statement node by hash, and cites one attested node, so its reveal may trust attested nodes (the
-# check has its pins built in, for its Lean toolchain: check/pins.txt). A theorem whose proof alone is too slow for a batch is split into smaller theorems
+# check has its pins built in, for its Lean toolchain: check/pins.txt). A theorem whose proof
+# alone is too slow for a batch is split into smaller theorems
 # where that helps (lean_split.py; the statement, and so its hash, stays). The solver commits,
 # then reveals the theorem and its proof, trusting the attested nodes it needs. Every attest and
 # the reveal must fit one refine; the node log (target witness) shows the gas each used. Each op
@@ -150,7 +151,8 @@ plan() {
 # and a theorem split off a proof STMT_GAS to check its statement (lean_split.py --stmt-ms). Both
 # are budgeted in native time, so turn them into milliseconds on this machine: gas_per_ms.py
 # checks a few batches natively and in witness-sim. TRACE_MS and STMT_MS set the times directly.
-# The rate also turns each batch's traced time into the gas attest.py budgets it.
+# The rate also turns each batch's traced time into the gas its check is estimated to use, which
+# attesting budgets packages by.
 calibrate() {
 	GAS_PER_MS=$(python3 tools/lean/gas_per_ms.py ./target/release/lean-host "$WITNESS_DIR/target/release/witness-sim" \
 		"$CHECK" "$TMP/nodes" "$TMP/plan.json")
@@ -175,7 +177,7 @@ if [ ${#OVER[@]} -gt 0 ]; then
 	fi
 fi
 W_DIR=$TMP/w
-BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
+BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR" --gas-per-ms "$GAS_PER_MS")
 # The check has its pins built in, for its Lean toolchain: the export's must be among them.
 PINS=$(cat "$W_DIR/pins")
 for ((i = 0; i < ${#PINS}; i += 64)); do
@@ -212,7 +214,7 @@ wait_slot $(( $(slot) + 3 ))
 item "$($W propose --service "$SVC" --nonce 0 --fee-asset test --commit-deposit 10 --attest-deposit 10)"
 expect "witness configured" 'fee_asset: Some' config --config
 
-# Library attesters, each with its own nonces and core (attest.py): by default as many as the
+# Library attesters, each with its own nonces and core (attest-batches.py): by default as many as the
 # testnet has cores. PACKAGE_GAS caps the refine gas in a package: a local testnet's validators
 # share one machine, which drops packages it can't refine in time; SETTLE_SLOTS waits after each
 # round lands, while they audit it.
@@ -220,9 +222,9 @@ ATTESTERS=${ATTESTERS:-pat,quinn}
 step "library attesters ($ATTESTERS) attest the library: $BATCHES batches"
 for who in alice bob ${ATTESTERS//,/ }; do item "$($W mint --to "$who" --amount 1000000)"; done
 expect "${ATTESTERS%%,*} has the test asset" '^1000000$' balance --balance "${ATTESTERS%%,*}" --asset test
-if [ "${JAM_RPC:-}" = sim ]; then CHAIN=(--sim "$JAMT"); else CHAIN=(--witness-dir "$WITNESS_DIR"); fi
-python3 tools/lean/attest.py "$W_DIR" "$TMP/plan.json" "$BATCHES" --witness "$W" --service "$SVC" --check "$CHECK" \
-	--check-gas $GAS --gas-per-ms "$GAS_PER_MS" --attesters "$ATTESTERS" \
+if [ "${JAM_RPC:-}" = sim ]; then CHAIN=(--sim "$JAMT"); else CHAIN=(); fi
+python3 "$WITNESS_DIR/scripts/attest-batches.py" "$W_DIR" --witness "$W" --service "$SVC" --check "$CHECK" \
+	--check-gas $GAS --attesters "$ATTESTERS" \
 	${PACKAGE_GAS:+--package-gas "$PACKAGE_GAS"} ${SETTLE_SLOTS:+--settle "$SETTLE_SLOTS"} "${CHAIN[@]}"
 
 step "alice posts the bounty: a proof of the statement node $GOAL"
