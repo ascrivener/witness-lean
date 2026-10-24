@@ -12,7 +12,7 @@ milliseconds a batch. A node too slow for any batch alone is *heavy*:
 Heavy nodes are done in N parallel jobs (default 6), in WORK/heavy/HASH, and skipped when done
 (their ops.json exists), so a run can be resumed.
 
-WORK is laid out as attest-batches.py reads it: batch-N.subjects (node, proof and judgment
+WORK is laid out as attest-batches.py reads it, with paths relative to WORK (run it there): batch-N.subjects (node, proof and judgment
 files), batch-N.trust (CLAIM:ENTRY references), batch-N.witness and batch-N.gas, with every
 heavy node's ops as batches of their own, and each heavy node's own batch trusting what its
 judgments' last op trusts and citing the judgments it needs. Node and proof files go in
@@ -148,18 +148,20 @@ def main():
     for n, b in enumerate(batches):
         for e, i in enumerate(b[1]):
             home[hashes[i]] = (n, e)
-    claim = lambda n: f"{a.work}/batch-{n}.claim"
+    claim = lambda n: f"batch-{n}.claim"
     node_refs = lambda hs: [f"{claim(home[h][0])}:{home[h][1]}" for h in hs]
 
-    def write(n, subjects, refs, witness_items, gas):
+    def write(n, subjects, refs, proofs, gas):
+        witness_items = [open(f, "rb").read() for f in proofs]
         if len(pack(witness_items)) > MAX_WITNESS:
             # Too big for the witness: the proofs go among the subjects, as lean_batches.py does.
-            subjects, witness_items = subjects + witness_items, []
-        open(f"{a.work}/batch-{n}.subjects", "w").write(",".join(subjects))
+            subjects, witness_items = subjects + proofs, []
+        open(f"{a.work}/batch-{n}.subjects", "w").write(",".join(rel(f) for f in subjects))
         open(f"{a.work}/batch-{n}.trust", "w").write(",".join(refs))
         open(f"{a.work}/batch-{n}.witness", "wb").write(pack(witness_items))
         open(f"{a.work}/batch-{n}.gas", "w").write(str(int(gas)))
 
+    rel = lambda f: os.path.relpath(f, a.work)
     heavy_set = set(heavy)
     total = len(batches)
     ops_written = 0
@@ -177,20 +179,16 @@ def main():
                 refs = node_refs(op["trust_nodes"]) + [f"{claim(number[c])}:0" for c in op["trust_ops"]]
                 with open(f"{d}/{op['witness']}", "rb") as f:
                     w = f.read()
-                open(f"{a.work}/batch-{total}.subjects", "w").write(f"{d}/{op['subject']}")
+                open(f"{a.work}/batch-{total}.subjects", "w").write(rel(f"{d}/{op['subject']}"))
                 open(f"{a.work}/batch-{total}.trust", "w").write(",".join(refs))
                 open(f"{a.work}/batch-{total}.witness", "wb").write(w)
                 open(f"{a.work}/batch-{total}.gas", "w").write(str(int(4e9)))
                 total += 1
                 ops_written += 1
             refs = node_refs(o["final"]["trust_nodes"]) + [f"{claim(number[c])}:0" for c in o["final"]["trust_ops"]]
-            write(n, files, refs, [open(f, "rb").read() for f in proofs], 4e9)
+            write(n, files, refs, proofs, 4e9)
             continue
-        witness = [open(f, "rb").read() for f in proofs]
-        if len(pack(witness)) > MAX_WITNESS:
-            write(n, files + proofs, node_refs(hashes[i] for i in trusted), [], ms * GAS_PER_MS)
-        else:
-            write(n, files, node_refs(hashes[i] for i in trusted), witness, ms * GAS_PER_MS)
+        write(n, files, node_refs(hashes[i] for i in trusted), proofs, ms * GAS_PER_MS)
     print(f"{len(batches)} batches and {ops_written} heavy ops", file=sys.stderr)
     print(total)
 
