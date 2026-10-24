@@ -12,7 +12,8 @@
 # - flt4: x⁴ + y⁴ ≠ z⁴, Mathlib's fermatLastTheoremFour, revealed as is (in the primes project):
 #   7,579 nodes in 269 batches over 91 depths. Like primes, it needs the full spec's refine gas.
 # - fta: the fundamental theorem of algebra, Mathlib's Complex.exists_root: 46,201 nodes in 2,416
-#   batches over 293 depths. The heaviest (iteratedFDerivWithin_succ_apply_right) uses 4.1×10⁹ gas.
+#   batches over 293 depths. The heaviest, iteratedFDerivWithin_succ_apply_right alone (its proof
+#   doesn't split usefully), uses 4.57×10⁹ gas, so fta gives checks all 5×10⁹ witness allows.
 #
 # The solver's export is converted to content-addressed nodes (tools/lean/lean_nodes.py), and
 # everything but the solver's theorem is planned into batches by dependency depth
@@ -49,7 +50,7 @@ case "${1:-gcd}" in
 		THEOREM=fermatLastTheoremFour GAS=4500000000 ;;
 	fta)
 		PROJECT=check/testdata/primes SOLUTION_MODULE=Mathlib.Analysis.Complex.Polynomial.Basic
-		THEOREM=Complex.exists_root GAS=4500000000 ;;
+		THEOREM=Complex.exists_root GAS=5000000000 ;;
 	*) echo "usage: $0 [gcd|primes|flt4|fta]" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
