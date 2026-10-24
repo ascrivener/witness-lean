@@ -26,6 +26,10 @@ PROOF_MAGIC = b"LEANPRF\x01"
 TAG_STATEMENT = 23
 TAG_PROOF = 24
 DECL_KINDS = ("axiom", "thm", "def", "opaque", "quot", "inductive")
+# The constants the kernel uses to expand a literal (as lean-host's convert.rs): imported by a
+# node with a literal as if its terms named them, wherever they're declared.
+NAT_LITERAL = ("Nat",)
+STRING_LITERAL = ("Nat", "String", "String.ofList", "Char", "Char.ofNat", "List.nil", "List.cons")
 
 
 def blake2b256(data):
@@ -54,6 +58,13 @@ class Export:
                 self.decls.append(it)
         # The level of each universe parameter, by its name.
         self.param_levels = {v: i for i, it in self.levels.items() for k, v in [body(it)] if k == "param"}
+        # The names a literal's expansion uses, by their index.
+        lasts = {n.rsplit(".", 1)[-1] for n in STRING_LITERAL}
+        self.literal_names = {}
+        for i, it in self.names.items():
+            k, v = body(it)
+            if k == "str" and v["str"] in lasts and self.name_str(i) in STRING_LITERAL:
+                self.literal_names[self.name_str(i)] = i
 
     def name_str(self, i):
         if i == 0:
@@ -75,6 +86,7 @@ class Closure:
         self.ex = ex
         self.names, self.levels, self.exprs = {}, {}, {}  # export index -> None, in order
         self.consts = set()  # name indices of constants mentioned
+        self.literal_consts = set()  # what the literals among the terms expand through
 
     def name(self, i):
         chain = []
@@ -114,6 +126,8 @@ class Closure:
             stack.append((i, True))
             k, v = body(self.ex.exprs[i])
             if k in ("bvar", "natVal", "strVal"):
+                lit = {"natVal": NAT_LITERAL, "strVal": STRING_LITERAL}.get(k, ())
+                self.literal_consts |= {self.ex.literal_names[n] for n in lit if n in self.ex.literal_names}
                 continue
             if k == "sort":
                 self.level(v)
@@ -282,6 +296,7 @@ def convert(ex):
                 if nm not in node_of:
                     raise ValueError(f"{ex.name_str(v['name'])} mentions {ex.name_str(nm)}, declared later or not at all")
                 out.add(node_of[nm])
+            out |= {node_of[nm] for nm in closure.literal_consts - own if nm in node_of}
             return sorted(out)
 
         imports = imports_of(c, own)

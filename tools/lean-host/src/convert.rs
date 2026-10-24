@@ -41,6 +41,12 @@ enum Expr {
 	Proj(u32, u64, u32),
 }
 
+/// The constants the kernel uses to expand a literal: a natural number unfolds through `Nat`'s
+/// constructors, and a string to `String.ofList` of `Char.ofNat`s in a `List`. No term names them,
+/// so a node with a literal imports their nodes as if it did, wherever they're declared.
+const NAT_LITERAL: &[&str] = &["Nat"];
+const STRING_LITERAL: &[&str] = &["Nat", "String", "String.ofList", "Char", "Char.ofNat", "List.nil", "List.cons"];
+
 /// The export's tables, by export index.
 struct Export {
 	names: Vec<(u32, NamePart)>,
@@ -48,6 +54,8 @@ struct Export {
 	exprs: Vec<Expr>,
 	/// The level of each universe parameter, by its name (the last one exported, as in Python).
 	param_levels: HashMap<u32, u32>,
+	/// The names a literal's expansion uses (`STRING_LITERAL`), by their index once exported.
+	literal_names: HashMap<String, u32>,
 }
 
 fn u(v: &Value) -> u64 {
@@ -81,7 +89,13 @@ fn nat_bytes(s: &str) -> Box<[u8]> {
 
 impl Export {
 	fn new() -> Export {
-		Export { names: vec![(0, NamePart::Num(0))], levels: vec![Level::Zero], exprs: Vec::new(), param_levels: HashMap::new() }
+		Export {
+			names: vec![(0, NamePart::Num(0))],
+			levels: vec![Level::Zero],
+			exprs: Vec::new(),
+			param_levels: HashMap::new(),
+			literal_names: HashMap::new(),
+		}
 	}
 
 	fn name_str(&self, i: u32) -> String {
@@ -111,6 +125,17 @@ impl Export {
 				(u32_(&n["pre"]), NamePart::Num(u(&n["i"])))
 			};
 			self.names.push(item);
+			let i = self.names.len() as u32 - 1;
+			let last = match &self.names[i as usize].1 {
+				NamePart::Str(s) => s.as_ref(),
+				NamePart::Num(_) => "",
+			};
+			if STRING_LITERAL.iter().any(|n| n.rsplit('.').next() == Some(last)) {
+				let full = self.name_str(i);
+				if STRING_LITERAL.contains(&full.as_str()) {
+					self.literal_names.insert(full, i);
+				}
+			}
 		} else if let Some(i) = line.get("il") {
 			check(i, self.levels.len(), "level");
 			let idx = self.levels.len() as u32;
@@ -186,11 +211,24 @@ struct Closure<'e> {
 	levels: Ordered,
 	exprs: Ordered,
 	consts: HashSet<u32>,
+	/// What the literals among the terms expand through: imported, but not in the tables.
+	literal_consts: HashSet<u32>,
 }
 
 impl<'e> Closure<'e> {
 	fn new(ex: &'e Export) -> Self {
-		Closure { ex, names: Ordered::default(), levels: Ordered::default(), exprs: Ordered::default(), consts: HashSet::new() }
+		Closure {
+			ex,
+			names: Ordered::default(),
+			levels: Ordered::default(),
+			exprs: Ordered::default(),
+			consts: HashSet::new(),
+			literal_consts: HashSet::new(),
+		}
+	}
+
+	fn literal(&mut self, names: &[&str]) {
+		self.literal_consts.extend(names.iter().filter_map(|n| self.ex.literal_names.get(*n)));
 	}
 
 	fn name(&mut self, mut i: u32) {
@@ -236,7 +274,9 @@ impl<'e> Closure<'e> {
 			}
 			stack.push((i, true));
 			match &self.ex.exprs[i as usize] {
-				Expr::BVar(_) | Expr::Nat(_) | Expr::Str(_) => {},
+				Expr::BVar(_) => {},
+				Expr::Nat(_) => self.literal(NAT_LITERAL),
+				Expr::Str(_) => self.literal(STRING_LITERAL),
 				Expr::Sort(l) => self.level(*l),
 				Expr::Const(n, us) => {
 					self.name(*n);
@@ -542,6 +582,7 @@ impl Converter {
 					panic!("{} mentions {}, declared later or not at all", self.ex.name_str(of), self.ex.name_str(*n))
 				})
 			})
+			.chain(c.literal_consts.iter().filter(|n| !own.contains(n)).filter_map(|n| self.node_of.get(n).copied()))
 			.collect();
 		out.sort();
 		out.dedup();

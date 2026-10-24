@@ -18,7 +18,12 @@ node := "LEANNOD\x01" ++ u(n) ++ import^n ++ item*
 
 - **`import`:** the 32-byte hash of a node declaring a constant this one mentions. Every constant
   the node mentions (in a `const` or `proj` expression) must be declared by the node itself or by
-  one of its imports. Sorted, no duplicates.
+  one of its imports. Sorted, no duplicates. A literal counts as mentioning what the kernel
+  expands it through, though no expression names it: a natural number `Nat`, and a string `Nat`,
+  `String`, `String.ofList`, `Char`, `Char.ofNat`, `List.nil` and `List.cons`, each imported if
+  it's declared before the node. Without them, a node about `""` can fail where its imports are
+  all that's loaded (nanoda expands a string literal only with `Char.ofNat` loaded). nanoda
+  doesn't require these imports: missing, they only cost a check that fails.
 - **`item`:** as in the [binary format](binary_format.md): names, levels and expressions, then the
   declaration. Indices are local: names count from 1 (0 is anonymous), levels from 1 (0 is
   zero), expressions from 0, each in the order the node lists them. So a node holds every name,

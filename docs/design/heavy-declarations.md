@@ -330,7 +330,8 @@ and `scripts/mathlib-sim.sh` attests it in witness-sim:
 - 966 nodes too heavy for one batch (872 theorems, 89 definitions, 5 inductives), split into
   46,446 ops, planned at about 8.7×10¹³ gas: more than every other batch together;
 - every batch also trusts the kernel's built-in nodes (the check's pins and what they import, 228
-  nodes and 78 KB) attested below its depth. A string literal's expansion uses `String.ofList`,
+  nodes and 78 KB) attested below its depth (`--trust-builtins`; the converters have since been
+  fixed, see the open questions). A string literal's expansion uses `String.ofList`,
   `Char.ofNat` and `List`'s constructors without naming them, so neither a node's imports nor the
   profile's lookups list them: `String.ofList_nil`, about `""`, failed without `Char.ofNat`, which
   nanoda's expansion requires to be loaded even for an empty string.
@@ -351,9 +352,10 @@ written.
    blob, are the levers.
 2. **Latency.** The heaviest theorem takes 254 rounds, about 25 minutes of 6-second slots even
    with every core free. Rounds come from the longest chain of needs; wider units would shorten it.
-3. **Literal dependencies.** Trusting the built-in nodes everywhere works around the converter:
-   a node whose terms hold a string literal should import what its expansion uses. That changes
-   node hashes, so it waits for the next layout.
+3. **Literal dependencies.** The converters now make a node with a literal import what its
+   expansion uses (`tools/lean/node_format.md`), so a new layout needs no built-in nodes trusted
+   everywhere (`mathlib_work.py --trust-builtins`, kept for packs converted before). That changes
+   node hashes, so Mathlib needs converting again to use it.
 4. **Chains.** Long reductions (`decide`, big computations) are chains rather than trees. The same
    mechanism attests them link by link (`a ≡ a₁ ≡ a₂ …`) if the intermediate terms stay small.
    None of the heavy tail measured so far is of this kind.
