@@ -10,6 +10,11 @@ authors.workspace = true
 [package.metadata.jam]
 type = "authorizer"
 
+[features]
+# Research only: an attest op whose witness holds pieces (see nanoda_lib::piece) runs them instead
+# of checking its subject. Unsound as a check; for measuring pieces' gas.
+pieces = []
+
 [dependencies]
 witness-check = { workspace = true, features = ["alloc"] }
 polkavm-derive.workspace = true

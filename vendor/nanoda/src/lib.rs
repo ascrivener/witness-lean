@@ -23,6 +23,7 @@ pub mod level;
 pub mod name;
 pub mod nodes;
 pub mod parser;
+pub mod piece;
 pub mod pretty_printer;
 pub mod quot;
 pub mod tc;

@@ -840,7 +840,7 @@ pub struct NameCache<'p> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SortedPair<'t>(ExprPtr<'t>, ExprPtr<'t>);
+pub struct SortedPair<'t>(pub(crate) ExprPtr<'t>, pub(crate) ExprPtr<'t>);
 
 impl<'t> SortedPair<'t> {
     pub fn new(a: ExprPtr<'t>, b: ExprPtr<'t>) -> Self {

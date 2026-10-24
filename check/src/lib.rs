@@ -120,6 +120,21 @@ fn import_list(mut bytes: &[u8]) -> Option<Vec<Hash>> {
 /// proof) imports; a trusted node's imports needn't be there (see `nanoda_lib::nodes`), an
 /// untrusted one's must.
 fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+	let nodes = load(pins, entries)?;
+	for (i, node) in nodes.nodes.iter().enumerate() {
+		let entry = &entries[&node.hash];
+		if !entry.trusted {
+			if node.assumed {
+				return None;
+			}
+			nodes.check(i);
+		}
+	}
+	Some(nodes)
+}
+
+/// Load `entries`, trusted ones first, each after its imports.
+fn load<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
 	let mut loader = NodeLoader::new(pins);
 	for trusted_phase in [true, false] {
 		for (root, _) in entries.iter().filter(|(_, e)| e.trusted == trusted_phase) {
@@ -153,17 +168,7 @@ fn load_and_check<'a>(pins: &[Hash], entries: &BTreeMap<Hash, Entry<'a>>) -> Opt
 			}
 		}
 	}
-	let nodes = loader.finish().ok()?;
-	for (i, node) in nodes.nodes.iter().enumerate() {
-		let entry = &entries[&node.hash];
-		if !entry.trusted {
-			if node.assumed {
-				return None;
-			}
-			nodes.check(i);
-		}
-	}
-	Some(nodes)
+	loader.finish().ok()
 }
 
 /// Add `node` to `entries`. The same trusted node may come twice (an op may cite a subject
@@ -188,12 +193,47 @@ fn attach<'a>(entries: &mut BTreeMap<Hash, Entry<'a>>, proofs: &[&'a [u8]]) -> O
 }
 
 fn attest(input: &Input, pins: &[Hash]) -> Option<()> {
+	#[cfg(feature = "pieces")]
+	{
+		let pieces: Vec<&[u8]> =
+			parse_witness(input.witness)?.into_iter().filter(|w| w.starts_with(nanoda_lib::piece::PIECE_MAGIC)).collect();
+		if !pieces.is_empty() {
+			return run_pieces(input, pins, &pieces);
+		}
+	}
+	let entries = attest_entries(input)?;
+	load_and_check(pins, &entries).map(|_| ())
+}
+
+/// An attest op's nodes, loaded but not checked: for running pieces of a check on their own
+/// (research; see `nanoda_lib::piece`).
+pub fn load_attest<'a>(input: &Input<'a>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+	load(&pins(PINS)?, &attest_entries(input)?)
+}
+
+/// Run each piece on its own, in a fresh checker for the op's one untrusted theorem; true if each
+/// returns what it did inside the whole check.
+#[cfg(feature = "pieces")]
+fn run_pieces(input: &Input, pins: &[Hash], pieces: &[&[u8]]) -> Option<()> {
+	let nodes = load(pins, &attest_entries(input)?)?;
+	let subject = nodes.nodes.iter().find(|n| n.theorem && !n.assumed)?;
+	let declar = *nodes.file.declars.get_index(subject.declars.start)?.1.info();
+	for piece in pieces {
+		let run = nodes.file.with_tc_and_declar(declar, |tc| nanoda_lib::piece::run(tc, piece, || 0)).ok()?;
+		run.same.then_some(())?;
+	}
+	Some(())
+}
+
+fn attest_entries<'a>(input: &Input<'a>) -> Option<BTreeMap<Hash, Entry<'a>>> {
 	if !input.params.is_empty() {
 		return None;
 	}
 	let mut entries = BTreeMap::new();
 	let mut subjects = 0;
 	let mut proofs = parse_witness(input.witness)?;
+	#[cfg(feature = "pieces")]
+	proofs.retain(|w| !w.starts_with(nanoda_lib::piece::PIECE_MAGIC));
 	for blob in input.blobs() {
 		// A batch too big for an op carries its proofs among its subjects instead.
 		if !blob.trusted && blob.data.starts_with(PROOF_MAGIC) {
@@ -207,7 +247,7 @@ fn attest(input: &Input, pins: &[Hash]) -> Option<()> {
 		return None;
 	}
 	attach(&mut entries, &proofs)?;
-	load_and_check(pins, &entries).map(|_| ())
+	Some(entries)
 }
 
 fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {

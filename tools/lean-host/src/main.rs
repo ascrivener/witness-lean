@@ -17,6 +17,15 @@
 //!                                  `over T: NAME` for each declaration that alone takes longer;
 //!                                  each batch in OUT records how long it took (`ms`)
 //!
+//!     lean-host piece ARGS PIECE...
+//!                                  run each piece (see nanoda_lib::piece) on its own, in the
+//!                                  environment ARGS (an attest op's arguments) loads, against its
+//!                                  one untrusted theorem, each in a fresh checker
+//!
+//!     lean-host piece-args ARGS PIECE OUT
+//!                                  write OUT: ARGS with PIECE added to its witness, for running
+//!                                  in PolkaVM with a check built with the `pieces` feature
+//!
 //! DIR is a `lean_nodes.py` output directory. What a native millisecond costs in PolkaJam
 //! v0.1.29's recompiler depends on the machine (about 29M gas on one, 77M on an M3), so budgets in
 //! milliseconds come from gas budgets measured there (`tools/lean/gas_per_ms.py`).
@@ -283,6 +292,41 @@ fn write_args(dir: &Dir, plan: &str, n: usize, out: &str) {
 	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &encode(&proofs))).unwrap();
 }
 
+/// Run each of `pieces` on its own, in a fresh checker for the declaration `args` attests.
+fn pieces(args: &str, pieces: &[&str]) {
+	let args = std::fs::read(args).expect("arguments");
+	let input = witness_check::Input::parse(&args).expect("well-formed arguments");
+	let t0 = Instant::now();
+	let nodes = lean_check::load_attest(&input).expect("nodes load");
+	let subject = nodes.nodes.iter().find(|n| n.theorem && !n.assumed).expect("an untrusted theorem");
+	let declar = *nodes.file.declars.get_index(subject.declars.start).unwrap().1.info();
+	println!("environment: {} nodes loaded in {:?}", nodes.nodes.len(), t0.elapsed());
+	let epoch = Instant::now();
+	let now = || epoch.elapsed().as_nanos();
+	for path in pieces {
+		let bytes = std::fs::read(path).expect("piece");
+		let r = nodes.file.with_tc_and_declar(declar, |tc| nanoda_lib::piece::run(tc, &bytes, now)).expect("piece loads");
+		println!(
+			"piece {path} same {} bytes {} names {} levels {} exprs {} facts {} load_us {} run_us {}",
+			r.same, bytes.len(), r.names, r.levels, r.exprs, r.facts, r.load_ns / 1000, r.run_ns / 1000
+		);
+	}
+}
+
+/// `args` with `piece` added to the witness.
+fn piece_args(args: &str, piece: &str, out: &str) {
+	let args = std::fs::read(args).expect("arguments");
+	let input = witness_check::Input::parse(&args).expect("well-formed arguments");
+	let blobs: Vec<CheckBlob> = input.blobs().map(|b| CheckBlob { trusted: b.trusted, hash: *b.hash, data: b.data }).collect();
+	let mut items: Vec<Vec<u8>> = lean_check::parse_witness(input.witness).expect("witness").into_iter().map(<[u8]>::to_vec).collect();
+	items.push(std::fs::read(piece).expect("piece"));
+	let mode = match input.mode {
+		witness_check::Mode::Attest => CheckMode::Attest,
+		witness_check::Mode::Reveal => CheckMode::Reveal,
+	};
+	std::fs::write(out, check_args(mode, &blobs, input.params, &encode(&items))).unwrap();
+}
+
 fn main() {
 	// Type errors panic, which counts as false, as on the PVM.
 	std::panic::set_hook(Box::new(|info| eprintln!("check panicked: {info}")));
@@ -302,6 +346,8 @@ fn main() {
 			let ok = std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false);
 			println!("{ok} in {:?}", start.elapsed());
 		},
+		["piece-args", args, piece, out] => piece_args(args, piece, out),
+		["piece", args, ref ps @ ..] if !ps.is_empty() => pieces(args, ps),
 		["args", dir, p, n, out] => write_args(&Dir::open(dir), p, n.parse().expect("batch number"), out),
 		["trace", dir, p, out] => trace(&Dir::open(dir), p, out, Duration::from_millis(100)),
 		["trace", dir, p, out, ms] => trace(&Dir::open(dir), p, out, Duration::from_millis(ms.parse().expect("milliseconds"))),

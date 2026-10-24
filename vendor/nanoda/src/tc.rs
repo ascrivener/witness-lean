@@ -522,6 +522,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
                 None
             };
             if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                prof::dump(self, &t, if matches!(flag, InferFlag::Check) { 0 } else { 1 }, &[e], crate::piece::write::Returned::Expr(r), &seed);
                 let saved = core::mem::replace(&mut self.tc_cache, seed);
                 let c = prof::begin_cold(self);
                 let r2 = self.infer_inner(e, flag);
@@ -820,6 +821,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
                 None
             };
             if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                prof::dump(self, &t, 2, &[e], crate::piece::write::Returned::Expr(r), &seed);
                 let saved = core::mem::replace(&mut self.tc_cache, seed);
                 let c = prof::begin_cold(self);
                 let r2 = self.whnf_inner(e);
@@ -1050,6 +1052,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
                 None
             };
             if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                prof::dump(self, &t, 3, &[x, y], crate::piece::write::Returned::Bool(r), &seed);
                 let saved = core::mem::replace(&mut self.tc_cache, seed);
                 let c = prof::begin_cold(self);
                 let r2 = self.def_eq_inner(x, y);
@@ -1400,7 +1403,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     ///
     /// After each reduction, check whether we can show definitional equality without having
     /// to continue unfolding.
-    fn lazy_delta_step(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> DeltaResult<'t> {
+    pub(crate) fn lazy_delta_step(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> DeltaResult<'t> {
         #[cfg(feature = "trace")]
         {
             let t = prof::enter(self, "lazy_delta");
@@ -1417,6 +1420,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
                 None
             };
             if let Some((seed, n, warm_us)) = prof::seed(self, &t) {
+                prof::dump(self, &t, 4, &[x, y], crate::piece::write::Returned::Delta(r), &seed);
                 let saved = core::mem::replace(&mut self.tc_cache, seed);
                 let c = prof::begin_cold(self);
                 let r2 = self.lazy_delta_step_inner(x, y);
@@ -1748,6 +1752,23 @@ pub(crate) mod prof {
         // Seeding isn't the enclosing calls' work.
         COLD_US.with(|t| *t.borrow_mut() += t0.elapsed().as_micros());
         Some((out, n, warm_us))
+    }
+
+    /// NANODA_DUMP=dir: write each piece, with its facts, to dir/IDX.piece (see `crate::piece`).
+    pub(crate) fn dump<'t>(
+        tc: &TypeChecker<'_, 't, '_>,
+        e: &Entry,
+        kind: u8,
+        inputs: &[ExprPtr<'t>],
+        result: crate::piece::write::Returned<'t>,
+        seed: &crate::util::TcCache<'t>,
+    ) {
+        if let Some(dir) = std::env::var_os("NANODA_DUMP") {
+            let t0 = Instant::now();
+            let bytes = crate::piece::write::piece(tc, kind, tc.ctx.dbj_level_counter, inputs, result, seed);
+            std::fs::write(std::path::Path::new(&dir).join(std::format!("{}.piece", e.idx)), bytes).unwrap();
+            COLD_US.with(|t| *t.borrow_mut() += t0.elapsed().as_micros());
+        }
     }
 
     pub(crate) fn replayed(tc: &TypeChecker<'_, '_, '_>, e: &Entry, same: bool, seeded: usize, warm_us: u128, m: (u128, usize)) {
