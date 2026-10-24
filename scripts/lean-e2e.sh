@@ -209,14 +209,17 @@ item "$($W propose --service "$SVC" --nonce 0 --fee-asset test --commit-deposit 
 expect "witness configured" 'fee_asset: Some' config --config
 
 # Library attesters, each with its own nonces and core (attest.py): by default as many as the
-# testnet has cores.
+# testnet has cores. PACKAGE_GAS caps the refine gas in a package: a local testnet's validators
+# share one machine, which drops packages it can't refine in time; SETTLE_SLOTS waits after each
+# round lands, while they audit it.
 ATTESTERS=${ATTESTERS:-pat,quinn}
 step "library attesters ($ATTESTERS) attest the library: $BATCHES batches"
 for who in alice bob ${ATTESTERS//,/ }; do item "$($W mint --to "$who" --amount 1000000)"; done
 expect "${ATTESTERS%%,*} has the test asset" '^1000000$' balance --balance "${ATTESTERS%%,*}" --asset test
 if [ "${JAM_RPC:-}" = sim ]; then CHAIN=(--sim "$JAMT"); else CHAIN=(--witness-dir "$WITNESS_DIR"); fi
 python3 tools/lean/attest.py "$W_DIR" "$TMP/plan.json" "$BATCHES" --witness "$W" --service "$SVC" --check "$CHECK" \
-	--pins "$PINS" --check-gas $GAS --gas-per-ms "$GAS_PER_MS" --attesters "$ATTESTERS" "${CHAIN[@]}"
+	--pins "$PINS" --check-gas $GAS --gas-per-ms "$GAS_PER_MS" --attesters "$ATTESTERS" \
+	${PACKAGE_GAS:+--package-gas "$PACKAGE_GAS"} ${SETTLE_SLOTS:+--settle "$SETTLE_SLOTS"} "${CHAIN[@]}"
 
 step "alice posts the bounty: a proof of the statement node $GOAL"
 CITE=$(cat "$W_DIR/goal.cite")

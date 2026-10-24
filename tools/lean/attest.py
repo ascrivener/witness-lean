@@ -4,6 +4,13 @@
     attest.py WORK PLAN BATCHES --witness W --service SVC --check CHECK --pins HEX --check-gas G
               --gas-per-ms RATE --attesters A,B,... [--sim WITNESS_SIM | --witness-dir DIR]
 
+--package-gas caps the refine gas a package is filled with. On a laptop testnet every guarantor
+and auditor shares one machine, which can't refine a package of the chain's full 5×10⁹ inside
+the guarantors' deadline: "Slow refine ... 5 s" in the node log, then "Not enough signatures",
+and the package is dropped. A batch needing more still goes alone. --settle waits some slots after
+a round lands, while the validators audit it: on one machine, a round sent straight after the
+last can find them too busy to refine it in time.
+
 WORK is lean_batches.py's output for PLAN (lean-host trace's, which records each batch's native
 `ms`), BATCHES the number of batches in it. A batch needs the batches it trusts attested first;
 batches that don't depend on each other can go in any order. So in each round, every attester
@@ -44,18 +51,26 @@ MARGIN = 1.3
 ACCUMULATE_BASE = 400_000
 ACCUMULATE_PER_PARENT = 15_000
 # Rounds a batch may fail before it goes alone with all the gas, and before giving up.
-ALONE_AFTER, GIVE_UP_AFTER = 1, 4
+ALONE_AFTER, GIVE_UP_AFTER = 1, 6
 # The most bytes a package's encoding (payloads, not extrinsics) may take: jam-submit.py's
 # MAX_PACKAGE, what PolkaJam v0.1.29's nodes accept. Witness-sim keeps to it too. An attestation's
 # payload is small (its citations are an extrinsic): estimated, then measured once built.
 MAX_PACKAGE = 200 * 1024
 PACKAGE_PER_ITEM = 1024
-# Slots to wait for a round to land, and seconds between polls of the chain.
-LAND_SLOTS, POLL = 8, 2
+# Slots to wait for a round to land (a package that lands does in two or three), and seconds
+# between polls of the chain.
+LAND_SLOTS, POLL = 4, 2
+# Threads building ops, at low priority: on a local testnet the validators share this machine,
+# and a package they can't refine in time is dropped.
+BUILDERS = 4
 
 
 def run(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def low_priority():
+    os.nice(10)
 
 
 class Chain:
@@ -136,13 +151,14 @@ class Attester:
         """Batch n's op for `who` with `nonce`: its payload and extrinsics."""
         with tempfile.TemporaryDirectory() as x:
             trust = open(f"{self.a.work}/batch-{n}.trust").read()
-            payload = self.w(
+            payload = subprocess.run([self.a.witness,
                 "attest", "--service", self.a.service, "--attester", who, "--nonce", str(nonce),
                 "--check", self.a.check, "--params", self.a.pins,
                 "--subjects", open(f"{self.a.work}/batch-{n}.subjects").read(),
                 *(["--trust", trust] if trust else []),
                 "--witness-file", f"{self.a.work}/batch-{n}.proofs", "--check-gas", str(self.a.check_gas),
-                "--claim-out", f"{self.a.work}/batch-{n}.claim", "--extrinsics", x)
+                "--claim-out", f"{self.a.work}/batch-{n}.claim", "--extrinsics", x],
+                check=True, capture_output=True, text=True, preexec_fn=low_priority).stdout.strip()
             extrinsics = [open(f"{x}/{i}", "rb").read() for i in range(len(os.listdir(x)))]
         return bytes.fromhex(payload.removeprefix("0x")), extrinsics
 
@@ -168,7 +184,7 @@ class Attester:
     def package(self, who, pending, taken):
         """Choose batches for who's next package, from pending in order, and build them."""
         p = self.chain.params
-        room = {"refine": p["max_refine_gas"], "accumulate": p["max_accumulate_gas"],
+        room = {"refine": self.a.package_gas or p["max_refine_gas"], "accumulate": p["max_accumulate_gas"],
                 "input": int(0.95 * p["max_input"]), "package": MAX_PACKAGE, "items": p["max_work_items"]}
         chosen = []
         for n in pending:
@@ -198,7 +214,7 @@ class Attester:
         # Build in parallel, but a batch only once those it trusts in this package are built: an
         # op cites their claims, which building writes.
         base, built = self.nonce(who), {}
-        with ThreadPoolExecutor(8) as pool:
+        with ThreadPoolExecutor(BUILDERS) as pool:
             def build(i, n):
                 for m in self.deps[n] & built.keys():
                     built[m].result()
@@ -215,7 +231,7 @@ class Attester:
             k = len(payload) + 128 + 40 * len(extrinsics)
             if not items and package + k > MAX_PACKAGE:
                 sys.exit(f"attest.py: batch {n}'s op alone is {len(payload)} bytes, over a package's {MAX_PACKAGE}")
-            if items and (refine + r > p["max_refine_gas"] or accumulate + acc > p["max_accumulate_gas"]
+            if items and (refine + r > (self.a.package_gas or p["max_refine_gas"]) or accumulate + acc > p["max_accumulate_gas"]
                           or size + s > 0.95 * p["max_input"] or package + k > MAX_PACKAGE
                           or count + len(extrinsics) > p["max_extrinsics"]):
                 break
@@ -264,6 +280,11 @@ class Attester:
                 time.sleep(POLL)
             landed = taken - waiting
             self.attested |= landed
+            if landed and self.a.settle and not self.chain.sim:
+                # Let the validators audit what landed before giving them more to refine.
+                settle = self.chain.slot() + self.a.settle
+                while self.chain.slot() < settle:
+                    time.sleep(POLL)
             for n in waiting:
                 self.tries[n] += 1
                 if self.tries[n] > GIVE_UP_AFTER:
@@ -282,6 +303,8 @@ def main():
         p.add_argument(f"--{flag}", required=True)
     p.add_argument("--check-gas", type=int, required=True)
     p.add_argument("--gas-per-ms", type=float, required=True)
+    p.add_argument("--package-gas", type=int, help="refine gas to fill a package with (default the chain's)")
+    p.add_argument("--settle", type=int, default=0, help="slots to wait after a round lands (default 0)")
     p.add_argument("--sim")
     p.add_argument("--witness-dir")
     a = p.parse_args()
