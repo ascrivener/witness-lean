@@ -1,18 +1,23 @@
 /-
 Split a theorem's proof into smaller theorems, so each can be checked in its own refine.
 
-    #witness_split Foo 2000 10
+    #witness_split Foo 2000 10 60
 
 walks Foo's proof bottom-up. Each sub-proof still at least 2000 expression nodes (counting those
 already split off as just their reference) becomes a theorem `Foo.wsplit_<k>` over the local
 variables it needs, and is replaced by a reference to it, if the kernel checks the new statement
 alone in at most 10 ms: each piece's statement is checked again on its own, so one over expensive
 types can cost more than it saves. Only proofs are split off. Any two proofs of a proposition are
-definitionally equal, so a reference checks wherever the sub-proof did.
+definitionally equal, so a reference checks wherever the sub-proof did. The rewritten proof is
+`Foo.wsplit`, with Foo's statement.
 
-The rewritten proof is added as `Foo.wsplit`, with Foo's statement. The command then reports
-`split` if the kernel checks every piece in under 80% of the time Foo's own proof takes, else
-`kept`: a proof whose cost is one expensive step doesn't come apart.
+The split has to fit: every piece (the rewritten proof among them) must check in at most 60% of
+the time Foo's own proof takes, the share of a refine Foo is over by. A split that doesn't fit
+is tried again finer, with half the budget, down to 64 nodes, so the part of the proof that's
+slow comes apart further. The command reports `split` for the first split that fits; or, if none
+does, for the one with the fastest slowest piece, if that's at least 5% faster than the whole (it
+may still bring the proof under a hard limit); else `kept`, when the proof's cost is one step
+that doesn't come apart. Timings are the kernel's, best of two.
 
 `lean_split.py` compiles a file of these commands, exports the results and attaches `Foo.wsplit`'s
 proof to Foo's statement node.
@@ -112,18 +117,50 @@ def thmMs (name : Name) : CoreM Nat := do
   let .thmInfo info ← getConstInfo name | throwError m!"{name} is not a theorem"
   kernelMs (.thmDecl { info with name := name ++ `witness_split_timing })
 
-elab "#witness_split " id:ident budget:num stmtMs:num : command => liftTermElabM do
-  let name ← realizeGlobalConstNoOverloadWithInfo id
-  let .thmInfo info ← getConstInfo name | throwError m!"{name} is not a theorem"
-  let ((value, _), st) ← (visit name info.levelParams budget.getNat stmtMs.getNat info.value).run {}
+/-- Split `name`'s proof, splitting off sub-proofs of `budget` nodes or more, and add the result
+(`name.wsplit` and the pieces) to the environment. Returns the slowest piece's time and how many
+theorems were split off, and logs which piece is slowest. -/
+def attempt (name : Name) (info : TheoremVal) (budget stmtMs : Nat) : TermElabM (Nat × Nat) := do
+  let ((value, _), st) ← (visit name info.levelParams budget stmtMs info.value).run {}
   let value ← instantiateMVars value
   let split := name ++ `wsplit
   addDecl (.thmDecl { name := split, levelParams := info.levelParams, type := info.type, value })
-  -- Keep the split only if no piece costs close to what the whole proof did.
-  let was ← thmMs name
   let mut most ← thmMs split
-  for l in st.lemmas do most := max most (← thmMs l)
-  let verdict := if st.lemmas.size > 0 && most * 5 < was * 4 then "split" else "kept"
-  logInfo m!"witness_split {verdict} {name}: {st.lemmas.size} theorems, slowest {most} ms, was {was} ms"
+  let mut slowest := split
+  for l in st.lemmas do
+    let t ← thmMs l
+    if t > most then (most, slowest) := (t, l)
+  logInfo m!"witness_split try {name}: budget {budget}, {st.lemmas.size} theorems, slowest {slowest} at {most} ms"
+  return (most, st.lemmas.size)
+
+/-- The smallest budget tried, in expression nodes. -/
+def minBudget : Nat := 64
+
+elab "#witness_split " id:ident budget:num stmtMs:num pct:num : command => liftTermElabM do
+  let name ← realizeGlobalConstNoOverloadWithInfo id
+  let .thmInfo info ← getConstInfo name | throwError m!"{name} is not a theorem"
+  let was ← thmMs name
+  let target := was * pct.getNat / 100
+  let env ← getEnv
+  -- The best split so far: its slowest piece, its budget and how many theorems it split off.
+  let mut best : Option (Nat × Nat × Nat) := none
+  let mut size := budget.getNat
+  while size ≥ minBudget do
+    setEnv env
+    let (most, pieces) ← attempt name info size stmtMs.getNat
+    if pieces > 0 then
+      if best.all (fun (m, _, _) => most < m) then best := some (most, size, pieces)
+      if most ≤ target then break
+    size := size / 2
+  setEnv env
+  match best with
+  | some (most, chosen, pieces) =>
+    if most * 20 < was * 19 then
+      let (most, _) ← attempt name info chosen stmtMs.getNat
+      let fits := if most ≤ target then "fits" else "over"
+      logInfo m!"witness_split split {name}: {pieces} theorems at budget {chosen}, slowest {most} ms, was {was} ms ({fits} {target} ms)"
+      return
+    logInfo m!"witness_split kept {name}: best {pieces} theorems at budget {chosen}, slowest {most} ms, was {was} ms"
+  | none => logInfo m!"witness_split kept {name}: nothing to split off, {was} ms"
 
 end WitnessSplit

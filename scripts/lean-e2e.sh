@@ -168,10 +168,11 @@ cp out/lean-check.jam "$CHECK"
 plan
 # A theorem slower than that on its own: split its proof into smaller theorems where that helps
 # (lean_split.py), and plan again.
-mapfile -t OVER < <(sed -n 's/^over [^:]*: //p' "$TMP/trace.log")
+# Each as NAME=MS, so it's split to fit TRACE_MS (lean-host prints `over 60.18ms: NAME`).
+mapfile -t OVER < <(sed -n 's/^over \([0-9.]*\)ms: \(.*\)$/\2=\1/p; s/^over [^:]*[^m]s: \(.*\)$/\1/p' "$TMP/trace.log")
 if [ ${#OVER[@]} -gt 0 ]; then
 	SPLIT=$(LEAN4EXPORT=$LEAN4EXPORT python3 tools/lean/lean_split.py "$PROJECT" "$SOLUTION_MODULE" "$TMP/nodes" "${OVER[@]}" \
-		--stmt-ms "${STMT_MS:-10}")
+		--stmt-ms "${STMT_MS:-10}" --trace-ms "$TRACE_MS")
 	if [ -n "$SPLIT" ]; then
 		echo "split: $SPLIT" | tr '\n' ' '; echo
 		plan
