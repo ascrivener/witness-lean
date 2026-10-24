@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Split theorems whose proofs are too slow to check in one refine (see WitnessSplit.lean).
 
-    LEAN4EXPORT=path/to/lean4export lean_split.py PROJECT MODULE NODES_DIR NAME... \\
-        [--budget N] [--stmt-ms MS]
+    LEAN4EXPORT=path/to/lean4export lean_split.py PROJECT MODULE NODES_DIR NAME[=MS]... \\
+        [--budget N] [--stmt-ms MS] [--trace-ms MS]
 
-Runs `#witness_split NAME N MS` (defaults 2000 and 10) on each theorem in Lean project PROJECT,
-importing MODULE, and for each it reports split: exports the new proof and the theorems split off
-from it, converts them to nodes and merges them into NODES_DIR (a lean_nodes.py output). The new
-proof becomes the proof of NAME's statement node, whose hash doesn't change; each piece's node
-goes into the manifest just before NAME's. Prints the names it split.
+Runs `#witness_split NAME N MS PCT` (defaults 2000 and 10) on each theorem in Lean project
+PROJECT, importing MODULE, and for each it reports split: exports the new proof and the theorems
+split off from it, converts them to nodes and merges them into NODES_DIR (a lean_nodes.py output).
+The new proof becomes the proof of NAME's statement node, whose hash doesn't change; each piece's
+node goes into the manifest just before NAME's. Prints the names it split.
+
+PCT is the share of NAME's own time each piece may take: a theorem `lean-host trace` timed at MS
+(`over MS: NAME`) against a batch budget of --trace-ms has to come down to that budget, so
+100 × TRACE_MS / MS percent, at most 100. Without MS (or --trace-ms), 80.
 """
 
 import json
@@ -38,8 +42,8 @@ def split(project, module, names, budget, stmt_ms, work):
                    cwd=project, env=env, check=True)
     with open(f"{work}/WitnessSplitGen.lean", "w") as f:
         f.write(f"import {module}\nimport WitnessSplit\nset_option maxHeartbeats 0\n")
-        for n in names:
-            f.write(f"#witness_split {n} {budget} {stmt_ms}\n")
+        for n, pct in names:
+            f.write(f"#witness_split {n} {budget} {stmt_ms} {pct}\n")
     out = subprocess.run(["lean", f"--root={work}", "-o", f"{work}/WitnessSplitGen.olean", f"{work}/WitnessSplitGen.lean"],
                          cwd=project, env=env, capture_output=True, text=True)
     if out.returncode != 0:
@@ -110,7 +114,7 @@ def merge(nodes_dir, work, done):
 
 
 def main(argv):
-    opts = {"--budget": "2000", "--stmt-ms": "10"}
+    opts = {"--budget": "2000", "--stmt-ms": "10", "--trace-ms": None}
     args = []
     it = iter(argv)
     for a in it:
@@ -120,7 +124,14 @@ def main(argv):
             args.append(a)
     if len(args) < 4:
         sys.exit(__doc__)
-    project, module, nodes_dir, names = args[0], args[1], args[2], args[3:]
+    project, module, nodes_dir = args[0], args[1], args[2]
+    names = []
+    for arg in args[3:]:
+        name, _, ms = arg.partition("=")
+        pct = 80
+        if ms and opts["--trace-ms"]:
+            pct = max(1, min(100, int(100 * float(opts["--trace-ms"]) / float(ms))))
+        names.append((name, pct))
     with tempfile.TemporaryDirectory() as work:
         done = split(project, module, names, int(opts["--budget"]), int(opts["--stmt-ms"]), work)
         if done:
