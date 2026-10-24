@@ -20,8 +20,8 @@
 # needs from earlier batches. Batches that don't depend on each other go in parallel: several
 # attesters (ATTESTERS), each filling a work package of its own with several batches a round
 # (tools/lean/attest.py). The poster's bounty names the theorem's
-# statement node by hash, and cites one attested node so every attestation a reveal uses shares
-# its pins. A theorem whose proof alone is too slow for a batch is split into smaller theorems
+# statement node by hash, and cites one attested node, so its reveal may trust attested nodes (the
+# check has its pins built in, for its Lean toolchain: check/pins.txt). A theorem whose proof alone is too slow for a batch is split into smaller theorems
 # where that helps (lean_split.py; the statement, and so its hash, stays). The solver commits,
 # then reveals the theorem and its proof, trusting the attested nodes it needs. Every attest and
 # the reveal must fit one refine; the node log (target witness) shows the gas each used. Each op
@@ -176,7 +176,11 @@ if [ ${#OVER[@]} -gt 0 ]; then
 fi
 W_DIR=$TMP/w
 BATCHES=$(python3 tools/lean/lean_batches.py "$TMP/nodes" "$TMP/plan.json" "$W_DIR")
+# The check has its pins built in, for its Lean toolchain: the export's must be among them.
 PINS=$(cat "$W_DIR/pins")
+for ((i = 0; i < ${#PINS}; i += 64)); do
+	grep -q "^${PINS:i:64} " check/pins.txt || fail "pinned node ${PINS:i:64} isn't among the check's pins: another toolchain?"
+done
 GOAL=$(cat "$W_DIR/goal.hash")
 
 if [ -n "${WITNESS_SIM:-}" ]; then
@@ -218,13 +222,13 @@ for who in alice bob ${ATTESTERS//,/ }; do item "$($W mint --to "$who" --amount 
 expect "${ATTESTERS%%,*} has the test asset" '^1000000$' balance --balance "${ATTESTERS%%,*}" --asset test
 if [ "${JAM_RPC:-}" = sim ]; then CHAIN=(--sim "$JAMT"); else CHAIN=(--witness-dir "$WITNESS_DIR"); fi
 python3 tools/lean/attest.py "$W_DIR" "$TMP/plan.json" "$BATCHES" --witness "$W" --service "$SVC" --check "$CHECK" \
-	--pins "$PINS" --check-gas $GAS --gas-per-ms "$GAS_PER_MS" --attesters "$ATTESTERS" \
+	--check-gas $GAS --gas-per-ms "$GAS_PER_MS" --attesters "$ATTESTERS" \
 	${PACKAGE_GAS:+--package-gas "$PACKAGE_GAS"} ${SETTLE_SLOTS:+--settle "$SETTLE_SLOTS"} "${CHAIN[@]}"
 
 step "alice posts the bounty: a proof of the statement node $GOAL"
 CITE=$(cat "$W_DIR/goal.cite")
 take alice
-signed alice "$($W create --service "$SVC" --maker alice --nonce $N --check $CHECK --params "$GOAL$PINS" \
+signed alice "$($W create --service "$SVC" --maker alice --nonce $N --check $CHECK --params "$GOAL" \
 	--blobs "$CITE" --reward 500 --check-gas $GAS --expiry $(( $(slot) + 2000 )))"
 expect "bounty 0 open" 'status: Open' bounty --bounty 0
 
@@ -234,7 +238,7 @@ signed bob "$($W commit --service "$SVC" --bounty 0 --hunter bob --nonce $N --sa
 	--witness-file "$W_DIR/goal.pack" 2>/dev/null)"
 expect "bob committed" "nonce: ${NONCE[bob]}" account --account bob
 wait_slot $(( $(slot) + 2 ))
-item "$($W reveal --bounty 0 --check $CHECK --params "$GOAL$PINS" --blobs "$CITE" --trust "$(cat "$W_DIR/goal.trust")" \
+item "$($W reveal --bounty 0 --check $CHECK --params "$GOAL" --blobs "$CITE" --trust "$(cat "$W_DIR/goal.trust")" \
 	--check-gas $GAS --hunter bob --salt 0x0b0b --witness-file "$W_DIR/goal.pack" --extrinsics "$X")"
 expect "bob's proof opens the claim window" 'Revealing' bounty --bounty 0
 

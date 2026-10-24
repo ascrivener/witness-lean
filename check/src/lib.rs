@@ -6,21 +6,25 @@
 //! only pinned nodes may declare the names the kernel treats specially (see
 //! `nanoda_lib::nodes`).
 //!
+//! The pins are built in: the hashes of the nodes allowed to declare `Nat`, `Nat.add`, the
+//! permitted axioms and the like, for the Lean toolchain the check is for (`pins.txt`, made by
+//! `tools/lean/lean_pins.py`; nodes are canonical, so they hash the same in any export on that
+//! toolchain). So the check's hash fixes them: every attestation by one check was checked under
+//! the same pins, and no node checked against a fake `Nat.add` can be trusted. A new toolchain
+//! needs new pins, and so a new check.
+//!
 //! - **Attest mode:** the subjects are a batch of nodes, the trusted blobs are attested nodes
 //!   holding everything the batch imports (recursively), and the witness is the batch's proofs.
 //!   A batch whose proofs would make the op too big may carry them among its subjects instead.
-//!   Params are the pins: the hashes of the nodes allowed to declare `Nat`, `Nat.add`, the
-//!   permitted axioms and the like, 32 bytes each. Every subject is type-checked, each theorem
-//!   with its proof. A library is attested this way in batches, each once.
+//!   Params are empty. Every subject is type-checked, each theorem with its proof. A library is
+//!   attested this way in batches, each once.
 //! - **Reveal mode:** params are the hash of the bounty's theorem statement node (say `theorem
-//!   goal : Goal`, which the poster can hash without a proof), then the pins. The witness is the
-//!   solver's nodes and proofs. Every untrusted node is type-checked, each theorem with its proof,
-//!   and the statement node must be among them, proven (or trusted: attested, so proven before).
+//!   goal : Goal`, which the poster can hash without a proof). The witness is the solver's nodes
+//!   and proofs. Every untrusted node is type-checked, each theorem with its proof, and the
+//!   statement node must be among them, proven (or trusted: attested, so proven before).
 //!
-//! The bounty must cite at least one node attested with params equal to its pins (its `Goal`,
-//! say). witness then makes every attestation a reveal relies on share those params, so every
-//! trusted node was checked under the same pins. Otherwise a node checked against a fake `Nat.add`
-//! could be trusted where the real one is pinned.
+//! witness lets a reveal trust attested subjects only if its bounty cites one (or the hunter
+//! would pick the attestations' params), so a bounty cites an attested node, its `Goal` say.
 //!
 //! Only `propext`, `Classical.choice` and `Quot.sound` may be declared as axioms. Type errors
 //! panic, which counts as false.
@@ -71,9 +75,12 @@ pub fn parse_witness(mut bytes: &[u8]) -> Option<Vec<&[u8]>> {
 	bytes.is_empty().then_some(items)
 }
 
+/// The pins the check is built with: 32-byte hashes, back to back (see the module docs).
+const PINS: &[u8] = include_bytes!("../pins.bin");
+
 /// Pins: 32-byte hashes, back to back.
-fn pins(params: &[u8]) -> Option<Vec<Hash>> {
-	let (pins, rest) = params.as_chunks::<32>();
+fn pins(bytes: &[u8]) -> Option<Vec<Hash>> {
+	let (pins, rest) = bytes.as_chunks::<32>();
 	rest.is_empty().then(|| pins.to_vec())
 }
 
@@ -180,8 +187,10 @@ fn attach<'a>(entries: &mut BTreeMap<Hash, Entry<'a>>, proofs: &[&'a [u8]]) -> O
 	Some(())
 }
 
-fn attest(input: &Input) -> Option<()> {
-	let pins = pins(input.params)?;
+fn attest(input: &Input, pins: &[Hash]) -> Option<()> {
+	if !input.params.is_empty() {
+		return None;
+	}
 	let mut entries = BTreeMap::new();
 	let mut subjects = 0;
 	let mut proofs = parse_witness(input.witness)?;
@@ -198,12 +207,11 @@ fn attest(input: &Input) -> Option<()> {
 		return None;
 	}
 	attach(&mut entries, &proofs)?;
-	load_and_check(&pins, &entries).map(|_| ())
+	load_and_check(pins, &entries).map(|_| ())
 }
 
-fn reveal(input: &Input) -> Option<()> {
-	let (goal, pinned) = input.params.split_first_chunk::<32>()?;
-	let pins = pins(pinned)?;
+fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {
+	let goal: &Hash = input.params.try_into().ok()?;
 	let mut entries = BTreeMap::new();
 	for blob in input.blobs() {
 		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
@@ -214,16 +222,21 @@ fn reveal(input: &Input) -> Option<()> {
 		insert(&mut entries, blake2b256(node), node, false)?;
 	}
 	attach(&mut entries, &proofs)?;
-	let loaded = load_and_check(&pins, &entries)?;
+	let loaded = load_and_check(pins, &entries)?;
 	// Untrusted theorems were proven above, and trusted ones were when they were attested.
 	loaded.nodes[loaded.find(goal)?].theorem.then_some(())
 }
 
 /// The check, for running natively too (see `tools/lean-host`).
 pub fn check(input: &Input) -> bool {
+	pins(PINS).is_some_and(|pins| check_with(input, &pins))
+}
+
+/// The check with `pins` in place of its own, for testing with other fixtures.
+fn check_with(input: &Input, pins: &[Hash]) -> bool {
 	match input.mode {
-		Mode::Attest => attest(input),
-		Mode::Reveal => reveal(input),
+		Mode::Attest => attest(input, pins),
+		Mode::Reveal => reveal(input, pins),
 	}
 	.is_some()
 }

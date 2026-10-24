@@ -15,17 +15,21 @@ node is its statement; its proof is separate. So a node means the same thing whe
 loaded, and checking a declaration needs only the statements it uses, not a whole export.
 
 - **Attest mode** type-checks a batch of nodes (the subjects), each theorem with its proof (the
-  witness), trusting attested nodes for everything the batch imports. Params are the *pins*: the
-  hashes of the nodes allowed to declare the names the kernel treats specially (`Nat`, `Nat.add`
-  and the other operations it computes with natively, and the permitted axioms). A library is
-  attested this way in batches, by dependency depth, each once, by anyone.
-- **Reveal mode** takes params `goal ++ pins`, where `goal` is the hash of the bounty's theorem
+  witness), trusting attested nodes for everything the batch imports. Params are empty. A library
+  is attested this way in batches, by dependency depth, each once, by anyone.
+- **Reveal mode** takes params `goal`, the hash of the bounty's theorem
   statement node, say `theorem goal : Goal`. The poster can hash it without a proof, since a
   statement node doesn't hold one. The witness is the solver's nodes and proofs; they must prove
   the goal node, trusting attested nodes for the rest.
 - Every node must import every constant it mentions, no name may be declared twice, and the
   kernel's special names may only come from pinned nodes. Otherwise a node could declare its own
-  `Nat.add` (or `axiom propext : False`) and the kernel would trust it by name.
+  `Nat.add` (or `axiom propext : False`) and the kernel would trust it by name. The *pins*, the
+  hashes of the nodes allowed to declare the names the kernel treats specially (`Nat`, `Nat.add`
+  and the other operations it computes with natively, and the permitted axioms), are built into
+  the check for its Lean toolchain ([`check/pins.txt`](check/pins.txt), made by
+  `tools/lean/lean_pins.py`): nodes are canonical, so they hash the same in any export on that
+  toolchain. The check's hash fixes them, so every attestation by one check was made under the
+  same pins.
 - Only `propext`, `Classical.choice` and `Quot.sound` may appear as axioms, so no `sorry`.
 
 A bounty goes like this (`scripts/lean-e2e.sh` runs it end to end):
@@ -34,9 +38,8 @@ A bounty goes like this (`scripts/lean-e2e.sh` runs it end to end):
    dependency depth (`lean_plan.py`), and attested batch by batch. Batches of one depth are
    independent, so they can be attested at once.
 2. The poster hashes the statement node of `theorem goal : Goal` and posts a bounty with params
-   `goal ++ pins`. The bounty cites one node attested with params `pins` (its `Goal`, say):
-   witness makes every attestation a reveal relies on share the params of those the bounty
-   cites, so every node the check trusts was checked under the same pins.
+   `goal`. The bounty cites one attested node (its `Goal`, say): witness lets a reveal trust
+   attested nodes only if its bounty cites one.
 3. The solver exports their proof, commits, and reveals their theorem and its proof (and any
    lemmas of their own), trusting the attested nodes they need.
 
@@ -126,7 +129,7 @@ more gas to check than a refine has (about 6.5×10⁹), and everything downstrea
   at witness's 64 KiB `MAX_WITNESS_LEN`; a batch with more carries them among its subjects.
 - **Built-ins are trusted by name in the kernel.** nanoda, like Lean's kernel, computes `Nat.add`
   and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
-  them; a bounty must cite a node attested under the same pins (see How it works).
+  them, built in for its Lean toolchain (see How it works). A new toolchain needs a new check.
 - **A single declaration can be too heavy for a refine:** one lemma of FTA's 46,201 is. A faster
   kernel (allocation and hash-consing dominate) is the next step.
 - **Next:** that, and attesting batches of one depth in parallel.

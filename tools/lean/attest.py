@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Attest a planned library in parallel: several attesters, several batches to a work package.
 
-    attest.py WORK PLAN BATCHES --witness W --service SVC --check CHECK --pins HEX --check-gas G
+    attest.py WORK PLAN BATCHES --witness W --service SVC --check CHECK --check-gas G
               --gas-per-ms RATE --attesters A,B,... [--sim WITNESS_SIM | --witness-dir DIR]
 
 --package-gas caps the refine gas a package is filled with. On a laptop testnet every guarantor
@@ -153,7 +153,7 @@ class Attester:
             trust = open(f"{self.a.work}/batch-{n}.trust").read()
             payload = subprocess.run([self.a.witness,
                 "attest", "--service", self.a.service, "--attester", who, "--nonce", str(nonce),
-                "--check", self.a.check, "--params", self.a.pins,
+                "--check", self.a.check,
                 "--subjects", open(f"{self.a.work}/batch-{n}.subjects").read(),
                 *(["--trust", trust] if trust else []),
                 "--witness-file", f"{self.a.work}/batch-{n}.proofs", "--check-gas", str(self.a.check_gas),
@@ -299,7 +299,7 @@ def main():
     p.add_argument("work")
     p.add_argument("plan")
     p.add_argument("batches", type=int)
-    for flag in ("witness", "service", "check", "pins", "attesters"):
+    for flag in ("witness", "service", "check", "attesters"):
         p.add_argument(f"--{flag}", required=True)
     p.add_argument("--check-gas", type=int, required=True)
     p.add_argument("--gas-per-ms", type=float, required=True)

@@ -64,7 +64,8 @@ impl Dir {
 			None => std::fs::read(format!("{}/proofs/{h}", self.path)).ok(),
 		}
 	}
-	/// The nodes declaring the names the kernel treats specially.
+	/// The nodes declaring the names the kernel treats specially, for loading nodes directly (the
+	/// check has its own, which these are among on its toolchain).
 	fn pins(&self) -> Vec<Hash> {
 		let pinned = |e: &&Value| e["names"].as_array().unwrap().iter().any(|n| PINNED_NAMES.contains(&n.as_str().unwrap()));
 		self.manifest.iter().filter(pinned).map(|e| hex(e["hash"].as_str().unwrap())).collect()
@@ -125,7 +126,6 @@ fn run(mode: CheckMode, blobs: &[(bool, Vec<u8>)], params: &[u8], witness: &[u8]
 
 fn plan(dir: &Dir, plan: &str) {
 	let plan: Vec<Value> = serde_json::from_slice(&std::fs::read(plan).expect("plan")).expect("JSON");
-	let pins: Vec<u8> = dir.pins().concat();
 	let mut times = Vec::new();
 	for (i, batch) in plan.iter().enumerate() {
 		let hashes = |k: &str| batch[k].as_array().unwrap().iter().map(|h| h.as_str().unwrap().to_string()).collect::<Vec<_>>();
@@ -137,7 +137,7 @@ fn plan(dir: &Dir, plan: &str) {
 			.collect();
 		let proofs: Vec<Vec<u8>> = subjects.iter().filter_map(|h| dir.proof(h)).collect();
 		let witness = encode(&proofs);
-		let (ok, t) = run(CheckMode::Attest, &blobs, &pins, &witness);
+		let (ok, t) = run(CheckMode::Attest, &blobs, &[], &witness);
 		let bytes: usize = blobs.iter().map(|(_, d)| d.len()).sum();
 		println!("batch {i}: {ok} in {t:?} ({} trusted, {} subjects, {bytes} bytes, {} of proofs)", trusted.len(), subjects.len(), witness.len());
 		if !ok {
@@ -262,7 +262,7 @@ impl<'d> Tracer<'d> {
 			.chain(subjects.iter().map(|h| (false, self.dir.node(h))))
 			.collect();
 		let proofs: Vec<Vec<u8>> = subjects.iter().filter_map(|h| self.dir.proof(h)).collect();
-		let (ok, t) = run(CheckMode::Attest, &blobs, &self.pins.concat(), &encode(&proofs));
+		let (ok, t) = run(CheckMode::Attest, &blobs, &[], &encode(&proofs));
 		assert!(ok, "a traced batch doesn't check: {subjects:?}");
 		(keep.into_iter().collect(), t)
 	}
@@ -280,7 +280,7 @@ fn write_args(dir: &Dir, plan: &str, n: usize, out: &str) {
 	let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
 	let check_blobs: Vec<CheckBlob> =
 		blobs.iter().zip(&hashes).map(|((trusted, data), h)| CheckBlob { trusted: *trusted, hash: *h, data }).collect();
-	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &dir.pins().concat(), &encode(&proofs))).unwrap();
+	std::fs::write(out, check_args(CheckMode::Attest, &check_blobs, &[], &encode(&proofs))).unwrap();
 }
 
 fn main() {

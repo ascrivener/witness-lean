@@ -11,8 +11,9 @@ MAX_WITNESS_BYTES (default 60000, under witness's MAX_WITNESS_LEN of 64 KiB) car
 among its subjects instead, and gets an empty witness.
 For a plan with a goal: goal.trust,
 goal.pack (the goal's node and proof, the reveal's witness), goal.hash (its hash, hex), and
-goal.cite (one CLAIM:ENTRY the bounty cites, to fix the pins: a node the goal imports). Also
-pins (the pinned nodes' hashes, hex, back to back: the check's attest params). Prints the number
+goal.cite (one CLAIM:ENTRY the bounty cites, so its reveal may trust attested nodes: a node the
+goal imports). Also pins (the export's pinned nodes' hashes, hex, back to back, which must be among
+the check's own: check/pins.txt). Prints the number
 of batches.
 """
 import json
