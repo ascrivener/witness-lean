@@ -109,8 +109,13 @@ Split the check at the level of kernel judgments, and attest the judgments the p
   its own attestation, cited the way attested nodes are now. The new trusted code is the
   "consult attested facts" path: facts must match exactly (terms, contexts, universe levels), and
   it needs adversarial tests of its own, as the Kernel Arena's do for the kernel.
-- **Reuse.** Common facts (the normal form of a popular instance, an instance diamond) recur across
-  Mathlib, so a fact attested once serves every declaration that hits it.
+- **Contexts.** 96% of the facts pieces need mention local variables (the declaration's
+  hypotheses and binders), so facts are mostly specific to their declaration, and few would be
+  reused across Mathlib. They can still be matched exactly: a cache entry that mentions a local is
+  only hit while that local is in scope, so every fact a piece needs should mention only locals in
+  scope where the piece starts. State a piece as a judgment under that context, and each fact
+  closed over a prefix of it; a piece run opens the context as fresh locals, instantiates its facts
+  with them, and seeds its caches, after which lookups match by hash as usual.
 
 This keeps every step re-executed by validators: no ZK proof and no fraud-proof window.
 
@@ -123,8 +128,9 @@ This keeps every step re-executed by validators: no ZK proof and no fraud-proof 
    once, as witness-lean's nodes are, without a Merkle path per node outweighing them. Facts as
    self-contained blobs would be 18–120 MB a piece.
 3. **More than one declaration.** Measured on `instIsIsoIndCoimageImageComparison` only.
-4. **Matching facts across contexts.** A fact found under binders must match the judgment the
-   kernel meets, up to local variables and universes.
+4. **Matching facts across contexts.** That every fact a piece needs mentions only locals in scope
+   at its start follows from how nanoda creates locals, but is unmeasured; universe parameters need
+   the same treatment.
 5. **Chains.** Long reductions (`decide`, big computations) are chains rather than trees. The same
    mechanism attests them link by link (`a ≡ a₁ ≡ a₂ …`) if the intermediate terms stay small.
    None of the heavy tail measured so far is of this kind.
