@@ -396,10 +396,12 @@ fn attest_judgments<'a>(
 		return None;
 	}
 	let declaration = blake2b256(node);
-	// Loaded as trusted, unchecked: it fixes the checker's environment (what's declared before it)
-	// and universe parameters, and nothing here relies on it being true. Its judgments are only
-	// ever seeded into a check of this same node.
-	insert(&mut entries, declaration, node, true)?;
+	// Loaded as an untrusted node, and not checked: it fixes the checker's environment and
+	// universe parameters, and nothing here relies on it being true; its judgments are only ever
+	// seeded into a check of this same node. Untrusted, it loads after every trusted node, as it
+	// does where it's checked, so the checker sees what's declared before it there; and its
+	// imports must be loaded, as there.
+	insert(&mut entries, declaration, node, false)?;
 	let nodes = load(pins, &entries)?;
 	nodes.attest_judgments(nodes.find(&declaration)?, cited, calls, judgments).ok()
 }
@@ -428,6 +430,26 @@ fn reveal(input: &Input, pins: &[Hash]) -> Option<()> {
 	let loaded = load_and_check(pins, &entries, &cited, &parts)?;
 	// Untrusted theorems were proven above, and trusted ones were when they were attested.
 	loaded.nodes[loaded.find(goal)?].theorem.then_some(())
+}
+
+/// An attest op's nodes (trusted and subjects, with their proofs) loaded, not checked: for
+/// planning judgments (see `tools/lean-host`).
+pub fn load_attest<'a>(input: &Input<'a>) -> Option<nanoda_lib::nodes::Nodes<'a>> {
+	let pins = pins(PINS)?;
+	let mut entries = BTreeMap::new();
+	let mut witness = parse_witness(input.witness)?;
+	for blob in input.blobs() {
+		if !blob.trusted && blob.data.starts_with(PROOF_MAGIC) {
+			witness.push(blob.data);
+			continue;
+		}
+		if blob.data.starts_with(JUDGMENT_MAGIC) || blob.data.starts_with(DECLARATIONS_MAGIC) {
+			continue;
+		}
+		insert(&mut entries, *blob.hash, blob.data, blob.trusted)?;
+	}
+	attach(&mut entries, &witness)?;
+	load(&pins, &entries)
 }
 
 /// The check, for running natively too (see `tools/lean-host`).

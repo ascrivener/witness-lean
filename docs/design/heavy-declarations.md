@@ -255,9 +255,11 @@ Caches only ever hold what the kernel derived or what was seeded from attested j
 induction over the rounds every attested fact is a kernel judgment. The declaration's own node is
 attested last, by the ordinary attest op with its caches seeded from the judgments it cites.
 
-**One gap.** Lazy delta steps aren't cached in nanoda. A unit that is one has no entry for its
-parent to be seeded with, so either the check gets a cache for them, or a parent recomputes its
-lazy-delta children.
+**Lazy delta steps** aren't cached in nanoda. A unit that is one runs as a call of its own (call
+kind 4), so the entries it makes are attested; its result isn't an entry, so whatever needs it
+runs the step again, seeded with those entries.
+
+Why this is sound, and what that rests on: `judgment-soundness.md`.
 
 **Adversarial tests**, as for the kernel itself:
 - a forged entry, cited without being attested;
@@ -295,15 +297,63 @@ Capping a group's blob size helps little (500 KB: 13.9×, 68 items).
 So limits aren't the problem: this declaration costs about 65 work items over 17 rounds, and a
 few times its own check in gas.
 
+## What was built
+
+**The planner** (`vendor/nanoda/src/plan.rs`, nanoda's `trace` feature) records every infer,
+whnf, definitional equality and lazy delta call of a declaration's check, with the cache entries
+each made and hit, and cuts the call tree into units by call count. A unit that makes an entry a
+later unit hits from outside becomes a unit of its own; a unit over budget gives up its heaviest
+subtrees. Rounds are the longest path over what units need. Units are grouped into ops by their
+measured replay cost (a first pass writes `costs.json`, a second plans with it), each op's calls
+blob kept under witness's witness limit.
+
+**Seeding per call.** An op cites the judgments its calls need and names, for each call, the
+entries to seed just before it runs, read lazily from the cited blobs (`judgment::Lazy`), so
+only the entries used are rebuilt. An op that would cite more
+than 3 MB cites *relays* instead: ops that cite up to 3 MB of judgments and re-attest just the
+entries needed, so later ops cite less.
+
+**Inductives** are split by declaration, and an inductive type's check by phase (constructors,
+then recursors), only when a block is over budget (`lean-host split-inductive`). A mutual block is
+checked once, not once per member (`check_inductive_declar`; proposed upstream as nanoda#69): that alone
+took `Lean.Meta.Grind.Arith.Cutsat.EqCnstr` from 1.32×10¹⁰ gas to 1.42×10⁹.
+
+**`instIsIsoIndCoimageImageComparison`**, the heaviest theorem: 1,002 ops (558 of them relays) in
+254 rounds, every one passing natively and in PolkaVM. The largest uses 2.55×10⁹ gas, the median
+7.1×10⁸; all together 7.2×10¹¹, about 7× the declaration's whole check.
+
+### All of Mathlib
+
+`tools/lean/mathlib_work.py` lays out Mathlib (717,116 nodes) for witness's `attest-batches.py`,
+and `scripts/mathlib-sim.sh` attests it in witness-sim:
+- 51,090 batches of nodes, planned from `lean-host profile` at 40 ms each (`plan_profile.py`);
+- 966 nodes too heavy for one batch (872 theorems, 89 definitions, 5 inductives), split into
+  46,446 ops, planned at about 8.7×10¹³ gas: more than every other batch together;
+- every batch also trusts the kernel's built-in nodes (the check's pins and what they import, 228
+  nodes and 78 KB) attested below its depth. A string literal's expansion uses `String.ofList`,
+  `Char.ofNat` and `List`'s constructors without naming them, so neither a node's imports nor the
+  profile's lookups list them: `String.ofList_nil`, about `""`, failed without `Char.ofNat`, which
+  nanoda's expansion requires to be loaded even for an empty string.
+
+Every one of the 97,536 batches passes when checked natively (`lean-host batch-args`, then
+`lean-host run`: 22 minutes on 7 threads). Two witness changes were needed to attest them:
+an attestation's witness can be an extrinsic (a heavy op's calls run to 5.3 MB, and a work
+package's payloads to 200 KiB), and `attest-batches.py` resumes a run and builds a sim round at
+once. In witness-sim on an 8-core laptop the run attests about 1.5 batches a second, CPU-bound,
+with every batch, heavy ops included, accepted the first time; it was 9% through when this was
+written.
+
 ## Open questions
 
-1. **Rebuilding only what's needed.** The 1.4× assumes an item rebuilds just the facts its hint
-   names, and that refine's hashing of what it cites is cheap beside that. Both need measuring
-   in PolkaVM.
-2. **Lazy delta steps.** A cache for them, or recomputing them (see above).
-3. **Inductives.** Five are over a refine (at most 151 ms), and judgments don't reach inductive
-   declarations, which nanoda checks by other code with the same caches. Either judgments for
-   inductive checks, or a cheaper inductive check.
+1. **The overhead of splitting.** A split declaration costs about 7× its whole check, mostly in
+   loading the environment for every op and rebuilding cited entries. For Mathlib that's most of
+   the gas. Fewer, larger ops where budget allows, and judgments cited by entry rather than by
+   blob, are the levers.
+2. **Latency.** The heaviest theorem takes 254 rounds, about 25 minutes of 6-second slots even
+   with every core free. Rounds come from the longest chain of needs; wider units would shorten it.
+3. **Literal dependencies.** Trusting the built-in nodes everywhere works around the converter:
+   a node whose terms hold a string literal should import what its expansion uses. That changes
+   node hashes, so it waits for the next layout.
 4. **Chains.** Long reductions (`decide`, big computations) are chains rather than trees. The same
    mechanism attests them link by link (`a ≡ a₁ ≡ a₂ …`) if the intermediate terms stay small.
    None of the heavy tail measured so far is of this kind.
@@ -328,3 +378,10 @@ PVM step.
   `tools/lean/fact_groups.py OUT`.
 - Pieces alone: `NANODA_DUMP` with `NANODA_REPLAY` and `NANODA_PIECES`, then `lean-host piece`,
   or `lean-host piece-args` and `witness-sim check` on `lean-check` built with `--features pieces`.
+- One heavy declaration's ops: `lean-host pack-args PACK CLOSURE ARGS`, then `lean-host
+  judgments ARGS OUT`, `lean-host judgments-ops ARGS OUT` (`VERIFY=1` writes each op's arguments
+  and checks them natively), and the same again with `OUT/costs.json`; an inductive block,
+  `lean-host split-inductive ARGS OUT`.
+- All of Mathlib: `tools/lean/mathlib_work.py PACK PROFILE WORK`, checked natively batch by batch
+  with `lean-host batch-args WORK N ARGS` and `lean-host run ARGS`, then attested with
+  `WITNESS_DIR=… ATTESTERS=… scripts/mathlib-sim.sh WORK`.

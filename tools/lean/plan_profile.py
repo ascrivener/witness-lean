@@ -84,7 +84,7 @@ def plan(d, profile, budget_ms, max_proof):
             # As trace does: the second half may trust the first, attested before it.
             close(level, subjects[:half]); close(level, subjects[half:])
             return
-        batches.append((level, subjects, len(trusted), t_bytes, ms))
+        batches.append((level, subjects, len(trusted), t_bytes, ms, sorted(trusted)))
 
     start = 0
     while start < n:
@@ -131,7 +131,7 @@ def main():
         print(f"  check failed: {nm}")
     if a.plan:
         with open(a.plan, "w") as f:
-            for level, subjects, nt, tb, t in batches:
+            for level, subjects, nt, tb, t, _ in batches:
                 f.write(json.dumps({"depth": int(level), "subjects": subjects, "trusted": nt, "trusted_bytes": tb, "ms": round(t, 2)}) + "\n")
     if a.fit:
         import re
