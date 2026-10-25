@@ -606,6 +606,10 @@ impl<'b, 't> Lazy<'b, 't> {
                 Item::Const { name, levels, at } => {
                     let n = self.name(tc, name)?;
                     if !known(n) {
+                        #[cfg(feature = "trace")]
+                        if std::env::var_os("NANODA_WHY").is_some() {
+                            std::eprintln!("unknown constant {:?} (item {i})", tc.ctx.debug_print(n));
+                        }
                         return Err(unknown());
                     }
                     let mut r = Reader { bytes: at };

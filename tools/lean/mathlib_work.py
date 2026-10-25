@@ -12,15 +12,16 @@ milliseconds a batch. A node too slow for any batch alone is *heavy*:
 Heavy nodes are done in N parallel jobs (default 6), in WORK/heavy/HASH, and skipped when done
 (their ops.json exists), so a run can be resumed.
 
-Every batch also trusts, where attested below its depth, the nodes declaring the names nanoda
-expands a literal through (`LITERAL_NAMES`). A literal can reach a check from a definition it
-unfolds, whose imports a batch doesn't load, and nanoda expands one only if those names are
-loaded, `Char.ofNat` even for `""`: it checks that the names exist rather than looking anything
-up, so the profile never records them. Without them the kernel reduces another way, and can need
-declarations the batch doesn't trust (`String.utf8ByteSize_ofList` needed `List.toByteArray.loop`).
---trust-builtins makes every batch trust instead the kernel's built-in nodes (the check's pins)
-and all they import: needed for a pack converted before nodes imported what their own literals
-expand through.
+Every batch and op also trusts, where attested below its depth, the check's pinned nodes: those
+declaring the names nanoda treats specially (`Nat.add` and its other natively computed functions,
+`String.ofList`, `Char.ofNat` and the like). nanoda takes its shortcuts (computing on literals,
+expanding a string literal) only if those names are loaded, and it checks that they exist rather
+than looking anything up, so neither the profile nor an op's trace records them: a check traced
+with them present takes the shortcut, and without them reduces another way and can need
+declarations it doesn't trust (`String.utf8ByteSize_ofList` needed `List.toByteArray.loop`, and
+judgment ops `instDecidableAnd`). --trust-builtins makes every batch trust the pinned nodes and
+all they import instead: needed for a pack converted before nodes imported what their own
+literals expand through.
 
 WORK is laid out as attest-batches.py reads it, with paths relative to WORK (run it there): batch-N.subjects (node, proof and judgment
 files), batch-N.trust (CLAIM:ENTRY references), batch-N.witness and batch-N.gas, with every
@@ -41,9 +42,6 @@ from lean_pack import pack  # noqa: E402
 import plan_profile  # noqa: E402
 
 MAX_WITNESS = 60000  # under witness's MAX_WITNESS_LEN of 64 KiB, as lean_batches.py
-# The names nanoda expands a natural number or string literal through (lean_nodes.py's
-# STRING_LITERAL): `List` declares `List.nil` and `List.cons`.
-LITERAL_NAMES = {"Nat", "String", "String.ofList", "Char", "Char.ofNat", "List"}
 PINS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../check/pins.txt")
 GAS_PER_MS = 80e6  # this machine (tools/lean/gas_per_ms.py)
 
@@ -190,11 +188,10 @@ def main():
 
     rel = lambda f: os.path.relpath(f, a.work)
     # What every batch trusts besides its own needs, where attested at a lower depth than it: the
-    # nodes declaring the names a literal expands through, or with --trust-builtins the kernel's
-    # built-in nodes (the check's pins) and all they import.
+    # check's pinned nodes, or with --trust-builtins those and all they import.
     index = {h: i for i, h in enumerate(hashes)}
+    pins = [l.split()[0] for l in open(PINS) if l.strip() and not l.startswith("#")]
     if a.trust_builtins:
-        pins = [l.split()[0] for l in open(PINS) if l.strip() and not l.startswith("#")]
         builtins, stack = set(), [index[h] for h in pins]
         while stack:
             i = stack.pop()
@@ -202,7 +199,7 @@ def main():
                 builtins.add(i)
                 stack.extend(int(j) for j in imports[i])
     else:
-        builtins = {i for i, e in enumerate(entries) if LITERAL_NAMES & set(e["names"])}
+        builtins = {index[h] for h in pins}
     level_of = {i: b[0] for b in batches for i in b[1]}
     below = lambda level, mine: sorted(hashes[i] for i in builtins if level_of[i] < level and i not in mine)
     heavy_set = set(heavy)
