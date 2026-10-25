@@ -392,19 +392,20 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	// The op's witness is the theorem's node and the calls: at most 64 KiB (witness's
 	// MAX_WITNESS_LEN), with room for its encoding.
 	let node_len = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).map_or(0, |b| b.data.len());
-	// Overrides, for tuning: PLAN_OP_MS (an op's estimated time), PLAN_RELAY_MB (citing more than
+	// Overrides, for tuning: PLAN_OP_GAS (an op's estimated gas), PLAN_RELAY_MB (citing more than
 	// this goes through relays), PLAN_CALLS_KB (a calls blob, if the witness can be an extrinsic);
-	// PLAN_FINE=1 splits each op's judgment by which ops seed it, with PLAN_BLOB_OVERHEAD (bytes),
-	// PLAN_OWN_PER_CITED, PLAN_MAX_BLOBS and PLAN_CITE_FACTOR (see PlanConfig).
+	// PLAN_FINE=0 writes each op's judgment whole, citing through relays; otherwise each is split
+	// by which ops seed it, tuned by PLAN_BLOB_OVERHEAD (bytes), PLAN_OWN_PER_CITED, PLAN_MAX_BLOBS
+	// and PLAN_CITE_FACTOR (see PlanConfig).
 	let var = |k: &str| std::env::var(k).ok().map(|v| v.parse::<f64>().expect("a number"));
 	let defaults = nanoda_lib::plan::PlanConfig::default();
 	let cfg = nanoda_lib::plan::PlanConfig {
 		budget_ns: (budget_ms * 1e6) as u64,
 		unit_costs,
 		max_calls_bytes: var("PLAN_CALLS_KB").map_or(64 * 1024 - 1024 - node_len, |kb| (kb * 1024.0) as usize),
-		op_ns: var("PLAN_OP_MS").map_or(defaults.op_ns, |ms| (ms * 1e6) as u64),
+		op_gas: var("PLAN_OP_GAS").unwrap_or(defaults.op_gas),
 		relay_bytes: var("PLAN_RELAY_MB").map_or(defaults.relay_bytes, |mb| (mb * 1e6) as usize),
-		fine: var("PLAN_FINE").is_some_and(|f| f != 0.0),
+		fine: var("PLAN_FINE").map_or(defaults.fine, |f| f != 0.0),
 		blob_overhead: var("PLAN_BLOB_OVERHEAD").unwrap_or(defaults.blob_overhead),
 		own_per_cited: var("PLAN_OWN_PER_CITED").unwrap_or(defaults.own_per_cited),
 		max_blobs: var("PLAN_MAX_BLOBS").map_or(defaults.max_blobs, |n| n as usize),

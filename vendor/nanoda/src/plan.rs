@@ -32,14 +32,21 @@ pub struct PlanConfig {
     pub budget_ns: u64,
     /// The work a kernel call counts for when cutting units, in nanoseconds.
     pub ns_per_call: u64,
-    /// Gas a native nanosecond of the kernel costs in PolkaVM.
+    /// An op's gas, estimated (fit to ops measured in PolkaVM, `tools/lean/heavy_bench.py`): per
+    /// native nanosecond of its units' replays (as measured, seeding included), and besides them a
+    /// fixed amount, and per byte of its environment, of what it attests and its calls, and of
+    /// what it cites. `env_bytes` is a typical op's environment: which nodes an op looks up isn't
+    /// known when planning.
     pub gas_per_ns: f64,
-    /// Gas loading the declaration's environment costs.
-    pub env_gas: f64,
-    /// Gas a byte of cited (or attested) judgment costs to rebuild and seed.
-    pub gas_per_byte: f64,
-    /// Most gas an op may plan for.
+    pub fixed_gas: f64,
+    pub env_bytes: usize,
+    pub gas_per_env_byte: f64,
+    pub gas_per_own_byte: f64,
+    pub gas_per_cited_byte: f64,
+    /// Most gas an op may plan for: below witness's 5×10⁹ by the estimate's error.
     pub op_gas: f64,
+    /// A unit not yet measured replays in about this times its calls at `ns_per_call`.
+    pub unmeasured_scale: f64,
     /// Most judgments an op may cite, and their most bytes.
     pub max_cites: usize,
     pub max_cited_bytes: usize,
@@ -51,13 +58,6 @@ pub struct PlanConfig {
     /// Each unit's measured replay time (by its call's index in the record), in nanoseconds,
     /// from checking an earlier plan's ops: a unit's replay doesn't depend on its op.
     pub unit_costs: Option<std::collections::HashMap<usize, u64>>,
-    /// Most native time an op may plan for, in nanoseconds: its fixed cost, its environment and
-    /// blobs at `ns_per_byte`, what it cites at `ns_per_cited_byte`, and its units' replays.
-    pub op_ns: u64,
-    pub fixed_ns: u64,
-    pub env_bytes: usize,
-    pub ns_per_byte: f64,
-    pub ns_per_cited_byte: f64,
     /// Write each op's entries as several judgments, split by which ops seed them, so that an op
     /// cites only blobs holding what it needs, rather than whole ops' judgments (see `split`).
     /// Relays are then not needed.
@@ -79,24 +79,23 @@ impl Default for PlanConfig {
         PlanConfig {
             budget_ns: 25_000_000,
             ns_per_call: 1_000,
-            gas_per_ns: 94.0,
-            env_gas: 6e8,
-            gas_per_byte: 300.0,
-            op_gas: 4.0e9,
+            gas_per_ns: 23.5,
+            fixed_gas: 0.0,
+            env_bytes: 250_000,
+            gas_per_env_byte: 1100.0,
+            gas_per_own_byte: 350.0,
+            gas_per_cited_byte: 30.0,
+            op_gas: 3.0e9,
+            unmeasured_scale: 2.6,
             max_cites: 3000,
-            max_cited_bytes: 12_000_000,
+            max_cited_bytes: 11_000_000,
             max_calls_bytes: 55_000,
             relay_bytes: 3_000_000,
             unit_costs: None,
-            op_ns: 40_000_000,
-            fixed_ns: 4_000_000,
-            env_bytes: 600_000,
-            ns_per_byte: 13.0,
-            ns_per_cited_byte: 4.0,
-            fine: false,
+            fine: true,
             blob_overhead: 2000.0,
             own_per_cited: 12.0,
-            max_blobs: 64,
+            max_blobs: 512,
             cite_factor: 2.0,
         }
     }
@@ -311,7 +310,16 @@ pub(crate) fn plan<'t, 'p>(
     // A unit's cost in its op, in native nanoseconds: its measured replay, or its own work and a
     // little per call; and the bytes its call and what it publishes add to its op.
     let cost = |u: usize| -> u64 {
-        cfg.unit_costs.as_ref().and_then(|c| c.get(&u).copied()).unwrap_or(own[u] + 3_000)
+        cfg.unit_costs.as_ref().and_then(|c| c.get(&u).copied()).unwrap_or_else(|| estimate((own[u] + 3_000) as f64 * cfg.unmeasured_scale) as u64)
+    };
+    // An op's estimated gas, from what it attests and its calls (bytes), what it cites (bytes) and
+    // its units' replays (native nanoseconds).
+    let op_gas = |own: usize, cited: usize, work: u64| {
+        cfg.fixed_gas
+            + cfg.env_bytes as f64 * cfg.gas_per_env_byte
+            + own as f64 * cfg.gas_per_own_byte
+            + cited as f64 * cfg.gas_per_cited_byte
+            + work as f64 * cfg.gas_per_ns
     };
     let unit_bytes = |u: usize| publish[&u].len() * 64 + 32;
 
@@ -414,9 +422,9 @@ pub(crate) fn plan<'t, 'p>(
                         let rg = groups.len();
                         entry_index.push(ents.iter().enumerate().map(|(k, e)| (*e, k)).collect());
                         let cited_bytes: usize = chunk.iter().map(|&c| blob_bytes[c]).sum();
-                        let est_ns = cfg.fixed_ns as f64 + (cfg.env_bytes + relay.len() + calls.len()) as f64 * cfg.ns_per_byte + cited_bytes as f64 * cfg.ns_per_cited_byte;
                         blob_bytes.push(relay.len());
-                        groups.push(Group { round: r, calls, judgments: vec![relay], blobs: vec![rg], cites: chunk, units: 0, gas: est_ns * cfg.gas_per_ns, unit_ns: Vec::new() });
+                        let gas = op_gas(relay.len() + calls.len(), cited_bytes, 0);
+                        groups.push(Group { round: r, calls, judgments: vec![relay], blobs: vec![rg], cites: chunk, units: 0, gas, unit_ns: Vec::new() });
                         group_calls.push(vec![(0, false, Call::Seed, ents.clone())]);
                         group_entries.push(ents.clone());
                         for (k, e) in ents.iter().enumerate() {
@@ -441,13 +449,10 @@ pub(crate) fn plan<'t, 'p>(
                     group_of.insert(u, g);
                 }
                 let cited_bytes: usize = cs.iter().map(|&c| blob_bytes[c]).sum();
-                let est_ns = cfg.fixed_ns as f64
-                    + (cfg.env_bytes + judgment.len() + calls.len()) as f64 * cfg.ns_per_byte
-                    + cited_bytes as f64 * cfg.ns_per_cited_byte
-                    + units.iter().map(|&u| cost(u)).sum::<u64>() as f64;
+                let gas = op_gas(judgment.len() + calls.len(), cited_bytes, units.iter().map(|&u| cost(u)).sum());
                 blob_bytes.push(judgment.len());
                 let unit_ns = units.iter().map(|&u| (u, ns[u], own[u])).collect();
-                groups.push(Group { round: r, calls, judgments: vec![judgment], blobs: vec![g], cites: cs, units: units.len(), gas: est_ns * cfg.gas_per_ns, unit_ns });
+                groups.push(Group { round: r, calls, judgments: vec![judgment], blobs: vec![g], cites: cs, units: units.len(), gas, unit_ns });
                 group_calls.push(units.iter().zip(&unit_seeds).map(|(&u, es)| (rec.calls[u].depth, rec.calls[u].eager, rec.calls[u].call.unwrap(), es.clone())).collect());
                 group_entries.push(entries);
             }
@@ -477,11 +482,7 @@ pub(crate) fn plan<'t, 'p>(
             } else {
                 add.iter().map(|&g| blob_bytes[g]).sum()
             };
-            let est_ns = cfg.fixed_ns as f64
-                + (cfg.env_bytes + bytes + unit_bytes(u)) as f64 * cfg.ns_per_byte
-                + (cited + add_bytes) as f64 * cfg.ns_per_cited_byte
-                + (work + cost(u)) as f64;
-            let over = est_ns > cfg.op_ns as f64 || cites.len() + add.len() > cfg.max_cites || cited + add_bytes > cfg.max_cited_bytes;
+            let over = op_gas(bytes + unit_bytes(u), cited + add_bytes, work + cost(u)) > cfg.op_gas || cites.len() + add.len() > cfg.max_cites || cited + add_bytes > cfg.max_cited_bytes;
             if over && !cur.is_empty() {
                 close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index, &mut group_entries, &mut group_calls)?;
                 bytes = 0;
@@ -511,11 +512,7 @@ pub(crate) fn plan<'t, 'p>(
         (blob_group, final_cites) = split(tc, declaration, cfg, &imports, &mut groups, &group_entries, &group_calls, &need_entries[&0])?;
     }
     let blob_len: Vec<usize> = groups.iter().flat_map(|g| g.judgments.iter().map(Vec::len)).collect();
-    let final_gas = (cfg.fixed_ns as f64
-        + cfg.env_bytes as f64 * cfg.ns_per_byte
-        + final_cites.iter().map(|&b| blob_len[b]).sum::<usize>() as f64 * cfg.ns_per_byte
-        + cost(0) as f64)
-        * cfg.gas_per_ns;
+    let final_gas = op_gas(0, final_cites.iter().map(|&b| blob_len[b]).sum(), cost(0));
     Ok(Plan { groups, blob_group, final_cites, final_gas, calls: n - 1, units: units.len(), rounds, skipped })
 }
 
@@ -524,6 +521,12 @@ pub(crate) fn plan<'t, 'p>(
 fn estimate(x: f64) -> usize {
     x.max(0.0) as usize
 }
+
+/// Entries seeded by the same ops (by index): the ops, the entries, and their judgment's size.
+type Bucket<'t> = (Vec<usize>, Vec<Entry<'t>>, f64);
+
+/// A merge of two buckets (by position), and what it gains.
+type Merge = (f64, usize, usize);
 
 /// A call to write, with the entries to seed before it.
 type SeededCall<'t> = (u16, bool, Call<'t>, Vec<Entry<'t>>);
@@ -560,14 +563,44 @@ fn split<'t, 'p>(
     let old_cited: Vec<usize> = groups.iter().map(|g| g.cites.iter().map(|&c| groups[c].judgments[0].len()).sum()).collect();
     let mut blob_group = Vec::new();
     let mut place: FxHashMap<Entry<'t>, (usize, usize)> = new_fx_hash_map();
-    for (g, entries) in group_entries.iter().enumerate() {
-        let old_own = groups[g].judgments[0].len();
-        let per = old_own as f64 / entries.len().max(1) as f64;
+    // What each op (and the declaration's own check) cites so far, in bytes: a merge mustn't take
+    // one past `max_cited_bytes`, or its arguments past what a work package holds.
+    let mut cited_so_far = vec![0usize; groups.len() + 1];
+    // Each group's entries, bucketed by the ops seeding them, with each bucket's size written
+    // alone (a merged blob is at most its parts' sum); and what each op must still cite of the
+    // groups not yet split, at least: the buckets it seeds from.
+    let write = |es: &mut Vec<Entry<'t>>| -> Result<Vec<u8>, std::boxed::Box<dyn core::error::Error>> {
+        es.sort_by_key(|e| e.terms()[0].get_hash());
+        let imp = imports(tc, es).ok_or("a judgment mentions a constant not declared by a loaded node")?;
+        Ok(judgment::write_judgment(tc, declaration, &imp, es))
+    };
+    let mut all_buckets: Vec<Vec<Bucket<'t>>> = Vec::new();
+    let mut rest = vec![0f64; groups.len() + 1];
+    for entries in group_entries {
         let mut by: std::collections::BTreeMap<&[usize], Vec<Entry<'t>>> = Default::default();
         for e in entries {
             by.entry(consumers.get(e).map_or(&[][..], Vec::as_slice)).or_default().push(*e);
         }
-        let mut buckets: Vec<(Vec<usize>, Vec<Entry<'t>>)> = by.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        let mut buckets = Vec::new();
+        for (cs, mut es) in by {
+            let size = write(&mut es)?.len() as f64;
+            for &h in cs {
+                rest[h] += size;
+            }
+            buckets.push((cs.to_vec(), es, size));
+        }
+        all_buckets.push(buckets);
+    }
+    for (g, mut buckets) in all_buckets.into_iter().enumerate() {
+        let old_own = groups[g].judgments[0].len();
+        // For weighing a merge, an entry's share of the group's whole judgment: blobs share
+        // subterms, which their sizes written alone don't show.
+        let per = old_own as f64 / group_entries[g].len().max(1) as f64;
+        for (cs, _, size) in &buckets {
+            for &h in cs {
+                rest[h] -= size;
+            }
+        }
         // Merge the pair gaining most (a blob's overhead, made and cited, saved; less what each
         // side's consumers now cite of the other) while one gains, and while there are too many.
         let common = |a: &[usize], b: &[usize]| {
@@ -581,47 +614,74 @@ fn split<'t, 'p>(
             }
             n
         };
+        // What each consumer will cite, with this group's blobs as they stand.
+        let mut will: FxHashMap<usize, f64> = new_fx_hash_map();
+        for (cs, _, size) in &buckets {
+            for &h in cs {
+                *will.entry(h).or_insert(cited_so_far[h] as f64) += size;
+            }
+        }
+        let fits = |will: &FxHashMap<usize, f64>, gaining: &[usize], add: f64, other: &[usize]| {
+            gaining.iter().filter(|h| other.binary_search(h).is_err()).all(|&h| will[&h] + add + rest[h] <= cfg.max_cited_bytes as f64)
+        };
         while buckets.len() > 1 {
-            let mut best: Option<(f64, usize, usize)> = None;
+            // The best merge that fits, and, if there are too many blobs, the best of any.
+            let (mut best, mut best_any): (Option<Merge>, Option<Merge>) = (None, None);
+            let must = buckets.len() > cfg.max_blobs;
             for i in 0..buckets.len() {
                 for j in i + 1..buckets.len() {
-                    let (sa, sb) = (&buckets[i].0, &buckets[j].0);
+                    let ((sa, ea, na), (sb, eb, nb)) = (&buckets[i], &buckets[j]);
+                    let fit = fits(&will, sb, *na, sa) && fits(&will, sa, *nb, sb);
+                    let (na, nb) = (ea.len() as f64 * per, eb.len() as f64 * per);
+                    if !fit && !must {
+                        continue;
+                    }
                     let c = common(sa, sb);
                     let union = (sa.len() + sb.len() - c) as f64;
-                    let (na, nb) = (buckets[i].1.len() as f64 * per, buckets[j].1.len() as f64 * per);
                     let added = na * (sb.len() - c) as f64 + nb * (sa.len() - c) as f64;
                     let gain = cfg.blob_overhead * (cfg.own_per_cited + union) - added;
-                    if best.is_none_or(|(b, _, _)| gain > b) {
+                    if fit && best.is_none_or(|(b, _, _)| gain > b) {
                         best = Some((gain, i, j));
+                    }
+                    if best_any.is_none_or(|(b, _, _)| gain > b) {
+                        best_any = Some((gain, i, j));
                     }
                 }
             }
-            let (gain, i, j) = best.unwrap();
-            if gain <= 0.0 && buckets.len() <= cfg.max_blobs {
+            let Some((gain, i, j)) = (if must { best.or(best_any) } else { best }) else { break };
+            if gain <= 0.0 && !must {
                 break;
             }
-            let (sb, eb) = buckets.swap_remove(j);
+            for (gaining, add, other) in [(&buckets[j].0, buckets[i].2, &buckets[i].0), (&buckets[i].0, buckets[j].2, &buckets[j].0)] {
+                for h in gaining.iter().filter(|h| other.binary_search(h).is_err()) {
+                    *will.get_mut(h).unwrap() += add;
+                }
+            }
+            let (sb, eb, nb) = buckets.swap_remove(j);
             let a = &mut buckets[i];
             a.0.extend(sb);
             a.0.sort_unstable();
             a.0.dedup();
             a.1.extend(eb);
+            a.2 += nb;
         }
         let mut judgments = Vec::new();
         let mut blobs = Vec::new();
-        for (_, mut es) in buckets {
-            es.sort_by_key(|e| e.terms()[0].get_hash());
-            let imp = imports(tc, &es).ok_or("a judgment mentions a constant not declared by a loaded node")?;
+        for (cs, mut es, _) in buckets {
+            let j = write(&mut es)?;
             let b = blob_group.len();
             for (k, e) in es.iter().enumerate() {
                 place.insert(*e, (b, k));
             }
-            judgments.push(judgment::write_judgment(tc, declaration, &imp, &es));
+            for h in cs {
+                cited_so_far[h] += j.len();
+            }
+            judgments.push(j);
             blobs.push(b);
             blob_group.push(g);
         }
         let own: usize = judgments.iter().map(Vec::len).sum();
-        groups[g].gas += (own as f64 - old_own as f64) * cfg.ns_per_byte * cfg.gas_per_ns;
+        groups[g].gas += (own as f64 - old_own as f64) * cfg.gas_per_own_byte;
         groups[g].judgments = judgments;
         groups[g].blobs = blobs;
     }
@@ -640,7 +700,7 @@ fn split<'t, 'p>(
             .collect();
         let cited: usize = cs.iter().map(|&b| blob_len[b]).sum();
         let g = &mut groups[h];
-        g.gas += (cited as f64 - old_cited[h] as f64) * cfg.ns_per_cited_byte * cfg.gas_per_ns;
+        g.gas += (cited as f64 - old_cited[h] as f64) * cfg.gas_per_cited_byte;
         g.calls = judgment::write_calls(tc, &items);
         g.cites = cs;
     }
