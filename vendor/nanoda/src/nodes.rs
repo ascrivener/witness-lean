@@ -259,7 +259,20 @@ impl<'p> Nodes<'p> {
     /// proves it.
     pub fn check(&self, i: usize) {
         for d in self.nodes[i].declars.clone() {
-            self.file.check_declar(self.file.declars.get_index(d).unwrap().1);
+            #[cfg(feature = "trace")]
+            let t0 = std::time::Instant::now();
+            let declar = self.file.declars.get_index(d).unwrap().1;
+            self.file.check_declar(declar);
+            #[cfg(feature = "trace")]
+            if std::env::var_os("NANODA_DECLAR_TIMES").is_some() {
+                let kind = match declar {
+                    Declar::Inductive(..) => "inductive",
+                    Declar::Constructor(..) => "constructor",
+                    Declar::Recursor(..) => "recursor",
+                    _ => "other",
+                };
+                std::eprintln!("declar {kind} {:?}: {}", t0.elapsed(), self.file.with_ctx(|ctx| std::format!("{:?}", ctx.debug_print(declar.info().name))));
+            }
         }
     }
 

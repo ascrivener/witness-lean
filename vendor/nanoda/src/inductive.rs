@@ -67,6 +67,16 @@ impl<'t, 'p: 't> ExportFile<'p> {
             }
             _ => panic!("expected inductive")
         };
+        #[cfg(feature = "trace")]
+        let mut lap = {
+            let mut t = std::time::Instant::now();
+            move |what: &str| {
+                std::eprintln!("inductive phase {what}: {:?}", t.elapsed());
+                t = std::time::Instant::now();
+            }
+        };
+        #[cfg(not(feature = "trace"))]
+        let mut lap = |_: &str| {};
         self.with_ctx(|ctx| {
             // The **unmodified** types and constructors for all of the types in this mutual block.
             let unmodified_tys_ctors = ctx.with_tc(env_limit, |tc| {
@@ -76,10 +86,13 @@ impl<'t, 'p: 't> ExportFile<'p> {
 
             // Initialize the big chunk of state used throughout the process of checking
             // this inductive declaration.
+            lap("type");
             let mut st = ctx.with_tc(env_limit, |tc| tc.specialize_nested(ind, unmodified_tys_ctors.clone()));
+            lap("specialize nested");
 
             // Check the (potentially modified) inductive specs against the base environment.
             ctx.with_tc(env_limit, |tc| tc.check_inductive_specs(&mut st));
+            lap("specs");
 
             // The first temporary environment extension, containing any specialized
             // types to deal with nested inductives.
@@ -93,6 +106,7 @@ impl<'t, 'p: 't> ExportFile<'p> {
                     }
                 }
             });
+            lap("constructors");
 
             // The second temporary environment extension, which also includes the constructors.
             let ctor_extension = ctx.mk_ctors_env_ext(&st, ind_ty_ext1);
@@ -106,6 +120,7 @@ impl<'t, 'p: 't> ExportFile<'p> {
                 tc.mk_minors(&mut st);
                 tc.mk_recursors(&st)
             });
+            lap("build recursors");
 
             // The last temporary environment extension, which also includes the recursors.
             let recursor_extension = {
@@ -137,7 +152,8 @@ impl<'t, 'p: 't> ExportFile<'p> {
                     tc.assert_nonnested_ctors_def_eq(&st);
                     tc.assert_nonnested_recursors_def_eq(&st, &recursors);
                 }
-            })
+            });
+            lap("compare with the export");
         })
     }
 }
