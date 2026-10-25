@@ -163,101 +163,48 @@ pub(crate) fn plan<'t, 'p>(
     let n = rec.calls.len();
     let parent: Vec<usize> = rec.calls.iter().map(|c| c.parent as usize).collect();
     let end: Vec<usize> = rec.calls.iter().map(|c| c.end as usize).collect();
+    let result: Vec<Option<Entry<'t>>> = (0..n).map(|i| if i == 0 { None } else { result_entry(rec, i) }).collect();
+    // Whether call `a` encloses call `b` (or is it).
+    let encloses = |a: usize, b: usize| a <= b && b <= end[a];
     // A call's work, for cutting units: the calls made under it, at `ns_per_call` each, rather
     // than its measured time, so the same check is cut into the same units every time (and a
     // unit's measured replay, from an earlier plan, applies to the same unit in the next).
-    let ns: Vec<u64> = (0..n).map(|i| (end[i] - i + 1) as u64 * cfg.ns_per_call).collect();
-    let mut excl = ns.clone();
-    for i in 1..n {
-        excl[parent[i]] = excl[parent[i]].saturating_sub(ns[i]);
-    }
-    let result: Vec<Option<Entry<'t>>> = (0..n).map(|i| if i == 0 { None } else { result_entry(rec, i) }).collect();
-    let cacheable = |i: usize| result[i].is_some();
-    // Whether call `a` encloses call `b` (or is it).
-    let encloses = |a: usize, b: usize| a <= b && b <= end[a];
-
-    let mut is_unit = vec![false; n];
-    is_unit[0] = true;
-    for i in 1..n {
-        if parent[i] == 0 && cacheable(i) {
-            is_unit[i] = true;
+    let work = |weight: &[f64]| -> Vec<u64> {
+        let mut acc = weight.to_vec();
+        for i in (1..n).rev() {
+            acc[parent[i]] += acc[i];
         }
-    }
-    let mut unit_of = vec![0usize; n];
-    loop {
-        for i in 1..n {
-            unit_of[i] = if is_unit[i] { i } else { unit_of[parent[i]] };
-        }
-        let mut promote: FxHashSet<usize> = new_fx_hash_set();
-        // An entry a unit needs from outside its region: the call that made it becomes a unit (or,
-        // where that call's result isn't an entry, its nearest enclosing call whose is, inside
-        // the maker's region), so units stay small and needs shallow, and none is circular.
-        for &(at, entry) in &rec.hits {
-            let m = rec.made[&entry] as usize;
-            let (u, maker) = (unit_of[at as usize], unit_of[m]);
-            if u == maker || encloses(m, u) {
-                continue;
-            }
-            let mut c = m;
-            while c != maker && !cacheable(c) {
-                c = parent[c];
-            }
-            if c != maker && !encloses(c, u) {
-                promote.insert(c);
-            }
-        }
-        // Units over budget give up calls: in each one's region, the biggest calls whose work,
-        // less the units inside them, fits the budget, and that no call that fits encloses.
+        acc.into_iter().map(|w| estimate(w) as u64).collect()
+    };
+    let mut ns = work(&vec![cfg.ns_per_call as f64; n]);
+    let (mut is_unit, mut unit_of) = cut(rec, &parent, &end, &result, &ns, cfg.budget_ns);
+    // A unit whose measured replay is far over budget has calls costlier than their count says:
+    // its calls weigh what it measured, shared out by count, and it's cut again. Its measurement,
+    // and any of the units then cut from it, no longer applies.
+    let mut remeasure = vec![false; n];
+    if let Some(costs) = &cfg.unit_costs {
         let mut own = ns.clone();
-        let mut left = ns.clone();
         for i in 1..n {
             if is_unit[i] {
-                let r = unit_of[parent[i]];
-                own[r] = own[r].saturating_sub(ns[i]);
-                let mut a = parent[i];
-                while a != r {
-                    left[a] = left[a].saturating_sub(ns[i]);
-                    a = parent[a];
+                let p = unit_of[parent[i]];
+                own[p] = own[p].saturating_sub(ns[i]);
+            }
+        }
+        let mut weight = vec![cfg.ns_per_call as f64; n];
+        for i in 0..n {
+            let u = unit_of[i];
+            if let Some(&m) = costs.get(&u) {
+                if m > 2 * cfg.budget_ns && m > own[u] {
+                    weight[i] *= m as f64 / own[u].max(1) as f64;
+                    remeasure[i] = true;
                 }
             }
         }
-        let over: FxHashSet<usize> = (0..n).filter(|&r| is_unit[r] && own[r] > cfg.budget_ns).collect();
-        if !over.is_empty() {
-            let fits = |i: usize| cacheable(i) && left[i] <= cfg.budget_ns;
-            let mut covered = vec![false; n];
-            let mut candidates: FxHashMap<usize, Vec<usize>> = new_fx_hash_map();
-            for i in 1..n {
-                if is_unit[i] {
-                    continue;
-                }
-                let p = parent[i];
-                covered[i] = !is_unit[p] && (covered[p] || fits(p));
-                let r = unit_of[i];
-                if over.contains(&r) && fits(i) && !covered[i] {
-                    candidates.entry(r).or_default().push(i);
-                }
-            }
-            for (r, mut ks) in candidates {
-                ks.sort_by_key(|&k| core::cmp::Reverse(left[k]));
-                let mut rest = own[r];
-                for k in ks {
-                    if rest <= cfg.budget_ns {
-                        break;
-                    }
-                    promote.insert(k);
-                    rest = rest.saturating_sub(left[k]);
-                }
-            }
-        }
-        promote.retain(|&p| !is_unit[p]);
-        if promote.is_empty() {
-            break;
-        }
-        for p in promote {
-            is_unit[p] = true;
+        if remeasure.iter().any(|&r| r) {
+            ns = work(&weight);
+            (is_unit, unit_of) = cut(rec, &parent, &end, &result, &ns, cfg.budget_ns);
         }
     }
-
     // Each unit's needs (the units whose judgments it cites) and what it publishes.
     let units: Vec<usize> = (0..n).filter(|&i| is_unit[i]).collect();
     let mut needs: FxHashMap<usize, FxHashSet<usize>> = units.iter().map(|&u| (u, new_fx_hash_set())).collect();
@@ -310,6 +257,9 @@ pub(crate) fn plan<'t, 'p>(
     // A unit's cost in its op, in native nanoseconds: its measured replay, or its own work and a
     // little per call; and the bytes its call and what it publishes add to its op.
     let cost = |u: usize| -> u64 {
+        if remeasure[u] {
+            return own[u] + 3_000;
+        }
         cfg.unit_costs.as_ref().and_then(|c| c.get(&u).copied()).unwrap_or_else(|| estimate((own[u] + 3_000) as f64 * cfg.unmeasured_scale) as u64)
     };
     // An op's estimated gas, from what it attests and its calls (bytes), what it cites (bytes) and
@@ -514,6 +464,95 @@ pub(crate) fn plan<'t, 'p>(
     let blob_len: Vec<usize> = groups.iter().flat_map(|g| g.judgments.iter().map(Vec::len)).collect();
     let final_gas = op_gas(0, final_cites.iter().map(|&b| blob_len[b]).sum(), cost(0));
     Ok(Plan { groups, blob_group, final_cites, final_gas, calls: n - 1, units: units.len(), rounds, skipped })
+}
+
+/// Cut the recorded calls into units by their work `ns` (see `plan`): whether each call is a
+/// unit, and the unit each is in.
+fn cut<'t>(rec: &Recorder<'t>, parent: &[usize], end: &[usize], result: &[Option<Entry<'t>>], ns: &[u64], budget_ns: u64) -> (Vec<bool>, Vec<usize>) {
+    let n = parent.len();
+    let cacheable = |i: usize| result[i].is_some();
+    let encloses = |a: usize, b: usize| a <= b && b <= end[a];
+    let mut is_unit = vec![false; n];
+    is_unit[0] = true;
+    for i in 1..n {
+        if parent[i] == 0 && cacheable(i) {
+            is_unit[i] = true;
+        }
+    }
+    let mut unit_of = vec![0usize; n];
+    loop {
+        for i in 1..n {
+            unit_of[i] = if is_unit[i] { i } else { unit_of[parent[i]] };
+        }
+        let mut promote: FxHashSet<usize> = new_fx_hash_set();
+        // An entry a unit needs from outside its region: the call that made it becomes a unit (or,
+        // where that call's result isn't an entry, its nearest enclosing call whose is, inside
+        // the maker's region), so units stay small and needs shallow, and none is circular.
+        for &(at, entry) in &rec.hits {
+            let m = rec.made[&entry] as usize;
+            let (u, maker) = (unit_of[at as usize], unit_of[m]);
+            if u == maker || encloses(m, u) {
+                continue;
+            }
+            let mut c = m;
+            while c != maker && !cacheable(c) {
+                c = parent[c];
+            }
+            if c != maker && !encloses(c, u) {
+                promote.insert(c);
+            }
+        }
+        // Units over budget give up calls: in each one's region, the biggest calls whose work,
+        // less the units inside them, fits the budget, and that no call that fits encloses.
+        let mut own = ns.to_vec();
+        let mut left = ns.to_vec();
+        for i in 1..n {
+            if is_unit[i] {
+                let r = unit_of[parent[i]];
+                own[r] = own[r].saturating_sub(ns[i]);
+                let mut a = parent[i];
+                while a != r {
+                    left[a] = left[a].saturating_sub(ns[i]);
+                    a = parent[a];
+                }
+            }
+        }
+        let over: FxHashSet<usize> = (0..n).filter(|&r| is_unit[r] && own[r] > budget_ns).collect();
+        if !over.is_empty() {
+            let fits = |i: usize| cacheable(i) && left[i] <= budget_ns;
+            let mut covered = vec![false; n];
+            let mut candidates: FxHashMap<usize, Vec<usize>> = new_fx_hash_map();
+            for i in 1..n {
+                if is_unit[i] {
+                    continue;
+                }
+                let p = parent[i];
+                covered[i] = !is_unit[p] && (covered[p] || fits(p));
+                let r = unit_of[i];
+                if over.contains(&r) && fits(i) && !covered[i] {
+                    candidates.entry(r).or_default().push(i);
+                }
+            }
+            for (r, mut ks) in candidates {
+                ks.sort_by_key(|&k| core::cmp::Reverse(left[k]));
+                let mut rest = own[r];
+                for k in ks {
+                    if rest <= budget_ns {
+                        break;
+                    }
+                    promote.insert(k);
+                    rest = rest.saturating_sub(left[k]);
+                }
+            }
+        }
+        promote.retain(|&p| !is_unit[p]);
+        if promote.is_empty() {
+            return (is_unit, unit_of);
+        }
+        for p in promote {
+            is_unit[p] = true;
+        }
+    }
 }
 
 /// A byte count estimated as a float, as a whole number (rounded down, at least 0).

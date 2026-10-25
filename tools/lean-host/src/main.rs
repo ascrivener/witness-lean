@@ -436,6 +436,12 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	});
 	std::fs::write(format!("{out}/plan.json"), serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
 	let max_gas = plan.groups.iter().map(|g| g.gas).fold(plan.final_gas, f64::max);
+	// Planned with measured costs, an op estimated over what witness lets a check use won't pass.
+	let over = plan.groups.iter().filter(|g| g.gas > 5e9).count();
+	if cfg.unit_costs.is_some() && over > 0 {
+		eprintln!("{over} ops estimated over 5e9 gas (max {max_gas:.2e}): a unit too heavy to cut");
+		std::process::exit(1);
+	}
 	println!(
 		"{} calls, {} units, {} rounds, {} ops (+ the theorem's own, citing {}), {} judgments of {} KB, cited {} KB in all (most {} cites); estimated gas: max {max_gas:.2e}; {} needs recomputed; planned in {:?}",
 		plan.calls, plan.units, plan.rounds, plan.groups.len(), plan.final_cites.len(), plan.blob_group.len(),
