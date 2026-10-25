@@ -81,10 +81,22 @@ def heavy_job(a, h, kind, closure_file):
     # The second plan's ops, with paths relative to WORK/heavy/h.
     o = json.load(open(f"{d}/p2/ops.json"))
     for op in o["ops"]:
-        op["subject"], op["witness"] = f"p2/{op['subject']}", f"p2/{op['witness']}"
+        op["subjects"], op["witness"] = [f"p2/{s}" for s in op["subjects"]], f"p2/{op['witness']}"
     json.dump(o, open(f"{d}/ops.json.tmp", "w"))
     os.replace(f"{d}/ops.json.tmp", f"{d}/ops.json")
     os.remove(full)
+
+
+def subjects_of(op):
+    """An op's subjects: a judgment op may attest several (`lean-host judgments`, fine), an
+    inductive block's op one."""
+    return op["subjects"] if "subjects" in op else [op["subject"]]
+
+
+def op_ref(r):
+    """A trusted op's subject, as an op's name and the subject's position among its own: a name
+    alone is its first."""
+    return (r, 0) if isinstance(r, str) else (r[0], r[1])
 
 
 def main():
@@ -197,17 +209,17 @@ def main():
             for op in o["ops"]:
                 number[op["name"]] = total
                 nodes = sorted(set(op["trust_nodes"]) | set(below(level, ())))
-                refs = node_refs(nodes) + [f"{claim(number[c])}:0" for c in op["trust_ops"]]
+                refs = node_refs(nodes) + [f"{claim(number[c])}:{k}" for c, k in map(op_ref, op["trust_ops"])]
                 with open(f"{d}/{op['witness']}", "rb") as f:
                     w = f.read()
-                open(f"{a.work}/batch-{total}.subjects", "w").write(rel(f"{d}/{op['subject']}"))
+                open(f"{a.work}/batch-{total}.subjects", "w").write(",".join(rel(f"{d}/{s}") for s in subjects_of(op)))
                 open(f"{a.work}/batch-{total}.trust", "w").write(",".join(refs))
                 open(f"{a.work}/batch-{total}.witness", "wb").write(w)
                 open(f"{a.work}/batch-{total}.gas", "w").write(str(int(4e9)))
                 total += 1
                 ops_written += 1
             nodes = sorted(set(o["final"]["trust_nodes"]) | set(below(level, subjects)))
-            refs = node_refs(nodes) + [f"{claim(number[c])}:0" for c in o["final"]["trust_ops"]]
+            refs = node_refs(nodes) + [f"{claim(number[c])}:{k}" for c, k in map(op_ref, o["final"]["trust_ops"])]
             write(n, files, refs, proofs, 4e9)
             continue
         nodes = sorted(set(hashes[i] for i in trusted) | set(below(level, subjects)))

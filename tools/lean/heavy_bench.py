@@ -68,7 +68,7 @@ def bench(a, name, manifest):
     for g, (group, (ok, gas)) in enumerate(zip(groups, gases)):
         ops.append({
             "ok": ok, "gas": gas, "round": group["round"], "units": group["units"], "cites": len(group["cites"]),
-            "cited_bytes": sum(groups[c]["judgment_bytes"] for c in group["cites"]),
+            "cited_bytes": sum(plan["blobs"][c]["bytes"] for c in group["cites"]), "blobs": len(group["blobs"]),
             "judgment_bytes": group["judgment_bytes"], "calls_bytes": group["calls_bytes"],
             "args_bytes": os.path.getsize(f"{d}/p2/group-{g}.args"), "planned_gas": group["gas"],
         })

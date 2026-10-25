@@ -735,6 +735,72 @@ fn calls_seed_only_from_cited_judgments() {
 	assert!(!attest_judgments(&f.pins(), f.env(), &[&judgment], &[&judgment], f.goal(), &calls(vec![(0, n)])), "past its entries");
 }
 
+/// A varint at `at`, moving past it.
+fn uvar_at(b: &[u8], at: &mut usize) -> usize {
+	let (mut v, mut shift) = (0usize, 0);
+	loop {
+		let x = b[*at];
+		*at += 1;
+		v |= usize::from(x & 0x7f) << shift;
+		if x & 0x80 == 0 {
+			return v;
+		}
+		shift += 7;
+	}
+}
+
+/// A judgment's index: where each kind's offsets start (names, levels, expressions, entries),
+/// their width, each kind's count, and where the items start.
+fn index_of(j: &[u8]) -> ([usize; 4], usize, [usize; 4], usize) {
+	let mut at = jd::JUDGMENT_MAGIC.len() + 32;
+	let n = uvar_at(j, &mut at);
+	at += 32 * n;
+	let counts = [uvar_at(j, &mut at), uvar_at(j, &mut at), uvar_at(j, &mut at), uvar_at(j, &mut at)];
+	let width = usize::from(j[at]);
+	at += 1;
+	let mut starts = [0; 4];
+	for k in 0..4 {
+		starts[k] = at;
+		at += counts[k] * width;
+	}
+	(starts, width, counts, at)
+}
+
+#[test]
+fn a_judgment_is_read_by_its_index() {
+	// The index finds items, but an item is checked as it's read: its tag must be its kind's, and
+	// every reference to its own kind must be to an earlier item, so the terms are finite.
+	let f = pack!("f");
+	let (judgment, calls) = honest(&f);
+	let ok = |j: &[u8]| attest_judgments(&f.pins(), f.env(), &[], &[j], f.goal(), &calls);
+	let cited = |j: &[u8]| attest(&f.pins(), &[f.env(), &[j]].concat(), &[f.goal()], &[f.proof_of(f.goal()).unwrap()]);
+	assert!(ok(&judgment) && cited(&judgment));
+	let (starts, w, counts, items) = index_of(&judgment);
+	let offset = |j: &[u8], kind: usize, i: usize| j[starts[kind] + i * w..][..w].iter().rev().fold(0, |o, &x| (o << 8) | usize::from(x));
+	let with = |kind: usize, i: usize, to: usize| {
+		let mut j = judgment.clone();
+		j[starts[kind] + i * w..][..w].copy_from_slice(&to.to_le_bytes()[..w]);
+		j
+	};
+	// An entry's offset at an expression: not an entry.
+	let bad = with(3, 0, offset(&judgment, 2, 0));
+	assert!(!ok(&bad) && !cited(&bad), "an entry that's an expression");
+	// The last expression (one with children) moved first: its references are no longer earlier.
+	let last = counts[2] - 1;
+	assert!([9, 11, 12, 13, 14, 17].contains(&judgment[items + offset(&judgment, 2, last)]));
+	let mut bad = with(2, 0, offset(&judgment, 2, last));
+	bad[starts[2] + last * w..][..w].copy_from_slice(&offset(&judgment, 2, 0).to_le_bytes()[..w]);
+	assert!(!ok(&bad) && !cited(&bad), "a reference to a later item");
+	// An offset past the items, and an index cut short.
+	let past = judgment.len() - items;
+	if past < 1 << (8 * w) {
+		let bad = with(3, 0, past);
+		assert!(!ok(&bad) && !cited(&bad), "an offset past the items");
+	}
+	let cut = &judgment[..starts[3] + w / 2 + 1];
+	assert!(!ok(cut) && !cited(cut), "an index cut short");
+}
+
 /// The hashes a node or proof imports, from its header.
 fn imports_in(blob: &[u8]) -> Vec<Hash> {
 	let rest = match blob.strip_prefix(NODE_MAGIC) {

@@ -13,10 +13,16 @@
 //! or a lazy delta step), each from a starting depth.
 //!
 //! Format: a magic ([`JUDGMENT_MAGIC`] or [`CALLS_MAGIC`]); for a judgment, the declaration's
-//! node hash (32 bytes) and a `u` count of import hashes (32 bytes each); then items, each a tag
-//! byte and its fields, `u` being an unsigned LEB128 varint. Names count from 1 (0 is
-//! anonymous), levels from 1 (0 is zero), expressions from 0, each in order of appearance; every
-//! reference is to an earlier item.
+//! node hash (32 bytes), a `u` count of import hashes (32 bytes each), and an index (below); then
+//! items, each a tag byte and its fields, `u` being an unsigned LEB128 varint. Names count from 1
+//! (0 is anonymous), levels from 1 (0 is zero), expressions and entries from 0, each kind in
+//! order of appearance; every reference to an item of its own kind is to an earlier one.
+//!
+//! A judgment's index lets a reader find an item without scanning the blob: `u` counts of names,
+//! levels, expressions and entries, an offset width byte `w` (1 to 4), then for each kind in that
+//! order its items' offsets, `w` bytes each, little-endian, from the start of the items. A reader
+//! checks an item's tag and references only when it reads it (see [`Lazy`]): an item nothing
+//! reads can't affect what's believed.
 //!
 //! | Tag | Item | Fields |
 //! |---|---|---|
@@ -52,7 +58,7 @@ use crate::tc::{DeltaResult, InferFlag, TypeChecker};
 use crate::util::{CowStr, ExprPtr, FxHashMap, FxHashSet, LevelPtr, NamePtr, SortedPair, new_fx_hash_map, new_fx_hash_set};
 use core::error::Error;
 
-pub const JUDGMENT_MAGIC: &[u8] = b"LEANJDG\x01";
+pub const JUDGMENT_MAGIC: &[u8] = b"LEANJDG\x02";
 pub const CALLS_MAGIC: &[u8] = b"LEANCAL\x01";
 
 /// A cache entry: what the kernel concluded, and in which cache it keeps it.
@@ -92,7 +98,7 @@ impl<'t> Entry<'t> {
         }
     }
 
-    fn terms(&self) -> [ExprPtr<'t>; 2] {
+    pub(crate) fn terms(&self) -> [ExprPtr<'t>; 2] {
         match *self {
             Entry::Infer(a, b)
             | Entry::InferOnly(a, b)
@@ -133,7 +139,8 @@ pub struct Header<'b> {
     pub declaration: Hash,
     /// The nodes declaring the constants it mentions.
     pub imports: Vec<Hash>,
-    items: &'b [u8],
+    /// Its index and items.
+    rest: &'b [u8],
 }
 
 struct Reader<'b> {
@@ -183,7 +190,7 @@ pub fn header(blob: &[u8]) -> Result<Header<'_>, Box<dyn Error>> {
     let declaration = r.hash()?;
     let n = r.idx()?;
     let imports = (0..n).map(|_| r.hash()).collect::<Result<Vec<_>, _>>()?;
-    Ok(Header { declaration, imports, items: r.bytes })
+    Ok(Header { declaration, imports, rest: r.bytes })
 }
 
 fn style(b: u8) -> Result<BinderStyle, Box<dyn Error>> {
@@ -209,22 +216,15 @@ fn style_byte(s: BinderStyle) -> u8 {
 /// cited entries to seed before it (a cited judgment's position, an entry's position in it).
 pub type CallItem<'t> = (u16, bool, Call<'t>, Vec<(usize, usize)>);
 
-/// A blob's entries, and its calls.
-type Items<'t> = (Vec<Entry<'t>>, Vec<CallItem<'t>>);
-
-/// Rebuild the items in `items` in `tc`, with the checker's own constructors, so that each term
-/// is the pointer the checker would build: entries if `entries`, else calls.
-fn read<'t>(
-    tc: &mut TypeChecker<'_, 't, '_>,
-    items: &[u8],
-    entries: bool,
-) -> Result<Items<'t>, Box<dyn Error>> {
+/// Rebuild a calls blob's items in `tc`, with the checker's own constructors, so that each term
+/// is the pointer the checker would build.
+fn read<'t>(tc: &mut TypeChecker<'_, 't, '_>, items: &[u8]) -> Result<Vec<CallItem<'t>>, Box<dyn Error>> {
     let ctx = &mut *tc.ctx;
     let mut r = Reader { bytes: items };
     let mut names: Vec<NamePtr<'t>> = vec![ctx.anonymous()];
     let mut levels: Vec<LevelPtr<'t>> = vec![ctx.zero()];
     let mut exprs: Vec<ExprPtr<'t>> = Vec::new();
-    let (mut out, mut calls) = (Vec::new(), Vec::new());
+    let mut calls = Vec::new();
     fn get<T: Copy>(r: &mut Reader, v: &[T]) -> Result<T, Box<dyn Error>> {
         Ok(*v.get(r.idx()?).ok_or("a reference to a later item")?)
     }
@@ -306,7 +306,7 @@ fn read<'t>(
                 let level = u16::try_from(r.u()?)?;
                 exprs.push(ctx.remake_dbj_level(name, s, ty, level));
             },
-            32 if !entries => {
+            32 => {
                 let byte = r.byte()?;
                 let (kind, eager) = (byte & 0x7f, byte & 0x80 != 0);
                 let depth = u16::try_from(r.u()?)?;
@@ -322,181 +322,119 @@ fn read<'t>(
                 let seeds = (0..k).map(|_| Ok((r.idx()?, r.idx()?))).collect::<Result<Vec<_>, Box<dyn Error>>>()?;
                 calls.push((depth, eager, call, seeds));
             },
-            33 if entries => {
-                let cache = r.byte()?;
-                let (a, b) = (get(&mut r, &exprs)?, get(&mut r, &exprs)?);
-                out.push(match cache {
-                    0 => Entry::Infer(a, b),
-                    1 => Entry::InferOnly(a, b),
-                    2 => Entry::Whnf(a, b),
-                    3 => Entry::WhnfCore(a, b),
-                    4 => Entry::DefEqFail(a, b, r.byte()? != 0),
-                    5 => Entry::DefEq(a, b),
-                    6 => Entry::CongrFail(a, b),
-                    _ => return Err("bad cache".into()),
-                });
-            },
             _ => return Err(format!("unexpected item tag {tag}").into()),
         }
     }
-    Ok((out, calls))
+    Ok(calls)
 }
 
-/// A judgment's entries, rebuilt in a checker only as they're asked for: a scan first finds each
-/// item and checks that every reference is to an earlier item, then an entry's terms are rebuilt
-/// (each once) when it's needed. Seeding only the entries a call needs costs only those.
+/// Item kinds, as a judgment's index lists them.
+const NAMES: usize = 0;
+const LEVELS: usize = 1;
+const EXPRS: usize = 2;
+const ENTRIES: usize = 3;
+
+/// A judgment's entries, rebuilt in a checker only as they're asked for: its index finds each
+/// item, and an item's tag and references are checked as it's read, each reference to its own
+/// kind to an earlier item, so the terms it describes are finite. Each term is rebuilt once.
+/// Seeding only the entries a call needs costs only those.
+///
+/// As it rebuilds a constant (or a projection's structure name) it asks `known` whether the name
+/// may be mentioned (see [`Lazy::entry`]): every constant an entry mentions is rebuilt with it, or
+/// was with an earlier one, so that checks each name an entry mentions.
 pub struct Lazy<'b, 't> {
-    bytes: &'b [u8],
-    names: Vec<usize>,
-    levels: Vec<usize>,
-    exprs: Vec<usize>,
-    entries: Vec<usize>,
+    items: &'b [u8],
+    width: usize,
+    /// Each kind's offsets.
+    tables: [&'b [u8]; 4],
     name_ptr: Vec<Option<NamePtr<'t>>>,
     level_ptr: Vec<Option<LevelPtr<'t>>>,
     expr_ptr: Vec<Option<ExprPtr<'t>>>,
+    /// Scratch, kept to save allocating.
+    stack: Vec<usize>,
+    levels: Vec<LevelPtr<'t>>,
 }
 
+/// An expression item's children, as expression positions, and how many.
+type Children = ([usize; 3], usize);
+
 impl<'b, 't> Lazy<'b, 't> {
-    /// Scan a judgment's items.
+    /// Read a judgment's index.
     pub fn new(header: &Header<'b>) -> Result<Self, Box<dyn Error>> {
-        let bytes = header.items;
-        let mut r = Reader { bytes };
-        let (mut names, mut levels, mut exprs, mut entries) = (vec![0], vec![0], Vec::new(), Vec::new());
-        let check = |i: usize, n: usize| if i < n { Ok(()) } else { Err::<(), Box<dyn Error>>("a reference to a later item".into()) };
-        while !r.bytes.is_empty() {
-            let at = bytes.len() - r.bytes.len();
-            let tag = r.byte()?;
-            let (nn, nl, ne) = (names.len(), levels.len(), exprs.len());
-            match tag {
-                1 => {
-                    check(r.idx()?, nn)?;
-                    r.bytes()?;
-                    names.push(at);
-                },
-                2 => {
-                    check(r.idx()?, nn)?;
-                    r.u()?;
-                    names.push(at);
-                },
-                3 => {
-                    check(r.idx()?, nl)?;
-                    levels.push(at);
-                },
-                4 | 5 => {
-                    check(r.idx()?, nl)?;
-                    check(r.idx()?, nl)?;
-                    levels.push(at);
-                },
-                6 => {
-                    check(r.idx()?, nn)?;
-                    levels.push(at);
-                },
-                7 | 8 => {
-                    r.bytes()?;
-                    exprs.push(at);
-                },
-                9 => {
-                    check(r.idx()?, nn)?;
-                    for _ in 0..3 {
-                        check(r.idx()?, ne)?;
-                    }
-                    r.byte()?;
-                    exprs.push(at);
-                },
-                10 => {
-                    check(r.idx()?, nn)?;
-                    for _ in 0..r.idx()? {
-                        check(r.idx()?, nl)?;
-                    }
-                    exprs.push(at);
-                },
-                11 => {
-                    check(r.idx()?, ne)?;
-                    check(r.idx()?, ne)?;
-                    exprs.push(at);
-                },
-                12 | 13 => {
-                    check(r.idx()?, nn)?;
-                    style(r.byte()?)?;
-                    check(r.idx()?, ne)?;
-                    check(r.idx()?, ne)?;
-                    exprs.push(at);
-                },
-                14 => {
-                    check(r.idx()?, nn)?;
-                    r.idx()?;
-                    check(r.idx()?, ne)?;
-                    exprs.push(at);
-                },
-                15 => {
-                    check(r.idx()?, nl)?;
-                    exprs.push(at);
-                },
-                16 => {
-                    u16::try_from(r.u()?)?;
-                    exprs.push(at);
-                },
-                17 => {
-                    check(r.idx()?, nn)?;
-                    style(r.byte()?)?;
-                    check(r.idx()?, ne)?;
-                    u16::try_from(r.u()?)?;
-                    exprs.push(at);
-                },
-                33 => {
-                    let cache = r.byte()?;
-                    if cache > 6 {
-                        return Err("bad cache".into());
-                    }
-                    check(r.idx()?, ne)?;
-                    check(r.idx()?, ne)?;
-                    if cache == 4 {
-                        r.byte()?;
-                    }
-                    entries.push(at);
-                },
-                _ => return Err(format!("unexpected item tag {tag}").into()),
-            }
+        let mut r = Reader { bytes: header.rest };
+        let counts = [r.idx()?, r.idx()?, r.idx()?, r.idx()?];
+        let width = usize::from(r.byte()?);
+        if !(1..=4).contains(&width) {
+            return Err("bad offset width".into());
         }
-        let (n, l, e) = (names.len(), levels.len(), exprs.len());
-        Ok(Lazy { bytes, names, levels, exprs, entries, name_ptr: vec![None; n], level_ptr: vec![None; l], expr_ptr: vec![None; e] })
+        let mut tables = [&[][..]; 4];
+        for (t, &n) in tables.iter_mut().zip(&counts) {
+            *t = r.take(n.checked_mul(width).ok_or("too many items")?)?;
+        }
+        let [n, l, e, _] = counts;
+        Ok(Lazy {
+            items: r.bytes,
+            width,
+            tables,
+            name_ptr: vec![None; n + 1],
+            level_ptr: vec![None; l + 1],
+            expr_ptr: vec![None; e],
+            stack: Vec::new(),
+            levels: Vec::new(),
+        })
     }
 
     /// How many entries it holds.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.tables[ENTRIES].len() / self.width
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
-    fn at(&self, offset: usize) -> Reader<'b> {
-        Reader { bytes: &self.bytes[offset..] }
+    fn count(&self, kind: usize) -> usize {
+        self.tables[kind].len() / self.width
+    }
+
+    /// A reader at item `i` of `kind` (counting from 0).
+    fn at(&self, kind: usize, i: usize) -> Result<Reader<'b>, Box<dyn Error>> {
+        let w = self.width;
+        let b = self.tables[kind].get(i * w..i * w + w).ok_or("no such item")?;
+        let offset = b.iter().rev().fold(0usize, |o, &x| (o << 8) | usize::from(x));
+        Ok(Reader { bytes: self.items.get(offset..).ok_or("an offset past the items")? })
+    }
+
+    /// A reference to an earlier item of the same kind (`i` the referrer's position), or to any
+    /// item of another (`i` its count).
+    fn below(r: &mut Reader, i: usize) -> Result<usize, Box<dyn Error>> {
+        let j = r.idx()?;
+        if j < i { Ok(j) } else { Err("a reference to a later item".into()) }
     }
 
     fn name(&mut self, tc: &mut TypeChecker<'_, 't, '_>, i: usize) -> Result<NamePtr<'t>, Box<dyn Error>> {
         if i == 0 {
             return Ok(tc.ctx.anonymous());
         }
-        if let Some(n) = self.name_ptr[i] {
+        if let Some(n) = *self.name_ptr.get(i).ok_or("no such name")? {
             return Ok(n);
         }
-        let mut r = self.at(self.names[i]);
+        let mut r = self.at(NAMES, i - 1)?;
         let out = match r.byte()? {
             1 => {
-                let pfx = r.idx()?;
-                let s = r.str()?;
+                let pfx = Self::below(&mut r, i)?;
+                let s = core::str::from_utf8(r.bytes()?)?;
                 let pfx = self.name(tc, pfx)?;
-                let s = tc.ctx.alloc_string(CowStr::Owned(s));
+                let s = tc.ctx.alloc_string(CowStr::Owned(s.to_string()));
                 tc.ctx.str(pfx, s)
             },
-            _ => {
-                let pfx = r.idx()?;
+            2 => {
+                let pfx = Self::below(&mut r, i)?;
                 let k = r.u()?;
                 let pfx = self.name(tc, pfx)?;
                 tc.ctx.num(pfx, k)
             },
+            _ => return Err("not a name".into()),
         };
         self.name_ptr[i] = Some(out);
         Ok(out)
@@ -506,76 +444,110 @@ impl<'b, 't> Lazy<'b, 't> {
         if i == 0 {
             return Ok(tc.ctx.zero());
         }
-        if let Some(l) = self.level_ptr[i] {
+        if let Some(l) = *self.level_ptr.get(i).ok_or("no such level")? {
             return Ok(l);
         }
-        let mut r = self.at(self.levels[i]);
+        let mut r = self.at(LEVELS, i - 1)?;
         let out = match r.byte()? {
             3 => {
-                let a = r.idx()?;
+                let a = Self::below(&mut r, i)?;
                 let a = self.level(tc, a)?;
                 tc.ctx.succ(a)
             },
             t @ (4 | 5) => {
-                let (a, b) = (r.idx()?, r.idx()?);
+                let (a, b) = (Self::below(&mut r, i)?, Self::below(&mut r, i)?);
                 let (a, b) = (self.level(tc, a)?, self.level(tc, b)?);
                 if t == 4 { tc.ctx.max(a, b) } else { tc.ctx.imax(a, b) }
             },
-            _ => {
+            6 => {
                 let n = r.idx()?;
                 let n = self.name(tc, n)?;
                 tc.ctx.param(n)
             },
+            _ => return Err("not a level".into()),
         };
         self.level_ptr[i] = Some(out);
         Ok(out)
     }
 
-    /// Expression `i`'s children, as expression positions (names and levels are rebuilt as
-    /// they're met).
-    fn children(&self, i: usize) -> Result<Vec<usize>, Box<dyn Error>> {
-        let mut r = self.at(self.exprs[i]);
-        Ok(match r.byte()? {
+    /// Expression `i`'s children, each checked to be earlier.
+    fn children(&self, i: usize) -> Result<Children, Box<dyn Error>> {
+        let mut r = self.at(EXPRS, i)?;
+        let mut c = [0; 3];
+        let n = match r.byte()? {
+            7 | 8 | 10 | 15 | 16 => 0,
             9 => {
                 r.idx()?;
-                vec![r.idx()?, r.idx()?, r.idx()?]
+                c = [Self::below(&mut r, i)?, Self::below(&mut r, i)?, Self::below(&mut r, i)?];
+                3
             },
-            11 => vec![r.idx()?, r.idx()?],
+            11 => {
+                c[..2].copy_from_slice(&[Self::below(&mut r, i)?, Self::below(&mut r, i)?]);
+                2
+            },
             12 | 13 => {
                 r.idx()?;
                 r.byte()?;
-                vec![r.idx()?, r.idx()?]
+                c[..2].copy_from_slice(&[Self::below(&mut r, i)?, Self::below(&mut r, i)?]);
+                2
             },
             14 => {
                 r.idx()?;
                 r.idx()?;
-                vec![r.idx()?]
+                c[0] = Self::below(&mut r, i)?;
+                1
             },
             17 => {
                 r.idx()?;
                 r.byte()?;
-                vec![r.idx()?]
+                c[0] = Self::below(&mut r, i)?;
+                1
             },
-            _ => vec![],
-        })
+            _ => return Err("not an expression".into()),
+        };
+        Ok((c, n))
     }
 
-    /// Rebuild expression `i`, its children first, iteratively: terms can be deep.
-    fn expr(&mut self, tc: &mut TypeChecker<'_, 't, '_>, root: usize) -> Result<ExprPtr<'t>, Box<dyn Error>> {
-        let mut stack = vec![root];
+    /// Rebuild expression `root`, its children first, iteratively: terms can be deep.
+    fn expr(
+        &mut self,
+        tc: &mut TypeChecker<'_, 't, '_>,
+        root: usize,
+        known: &mut dyn FnMut(NamePtr<'t>) -> bool,
+    ) -> Result<ExprPtr<'t>, Box<dyn Error>> {
+        if root >= self.expr_ptr.len() {
+            return Err("no such expression".into());
+        }
+        let mut stack = core::mem::take(&mut self.stack);
+        stack.clear();
+        stack.push(root);
+        let out = self.build(tc, &mut stack, known);
+        self.stack = stack;
+        out?;
+        Ok(self.expr_ptr[root].unwrap())
+    }
+
+    fn build(
+        &mut self,
+        tc: &mut TypeChecker<'_, 't, '_>,
+        stack: &mut Vec<usize>,
+        known: &mut dyn FnMut(NamePtr<'t>) -> bool,
+    ) -> Result<(), Box<dyn Error>> {
         while let Some(&i) = stack.last() {
             if self.expr_ptr[i].is_some() {
                 stack.pop();
                 continue;
             }
-            let missing: Vec<usize> = self.children(i)?.into_iter().filter(|&c| self.expr_ptr[c].is_none()).collect();
-            if !missing.is_empty() {
-                stack.extend(missing);
+            let (c, n) = self.children(i)?;
+            let before = stack.len();
+            stack.extend(c[..n].iter().copied().filter(|&c| self.expr_ptr[c].is_none()));
+            if stack.len() > before {
                 continue;
             }
             stack.pop();
             let e = |l: &Self, c: usize| l.expr_ptr[c].unwrap();
-            let mut r = self.at(self.exprs[i]);
+            let unknown = || -> Box<dyn Error> { "a judgment mentions a constant not declared by one of its imports".into() };
+            let mut r = self.at(EXPRS, i)?;
             let out = match r.byte()? {
                 7 => {
                     let b = r.bytes()?;
@@ -595,11 +567,19 @@ impl<'b, 't> Lazy<'b, 't> {
                 10 => {
                     let n = r.idx()?;
                     let k = r.idx()?;
-                    let ls = (0..k).map(|_| r.idx()).collect::<Result<Vec<_>, _>>()?;
                     let n = self.name(tc, n)?;
-                    let ls = ls.into_iter().map(|l| self.level(tc, l)).collect::<Result<Vec<_>, _>>()?;
-                    let ls = tc.ctx.alloc_levels_slice(&ls);
-                    tc.ctx.mk_const(n, ls)
+                    if !known(n) {
+                        return Err(unknown());
+                    }
+                    let mut ls = core::mem::take(&mut self.levels);
+                    ls.clear();
+                    for _ in 0..k {
+                        let l = r.idx()?;
+                        ls.push(self.level(tc, l)?);
+                    }
+                    let slice = tc.ctx.alloc_levels_slice(&ls);
+                    self.levels = ls;
+                    tc.ctx.mk_const(n, slice)
                 },
                 11 => {
                     let (f, a) = (r.idx()?, r.idx()?);
@@ -617,6 +597,9 @@ impl<'b, 't> Lazy<'b, 't> {
                     let k = r.idx()?;
                     let st = r.idx()?;
                     let n = self.name(tc, n)?;
+                    if !known(n) {
+                        return Err(unknown());
+                    }
                     tc.ctx.mk_proj(n, k, e(self, st))
                 },
                 15 => {
@@ -639,18 +622,26 @@ impl<'b, 't> Lazy<'b, 't> {
             };
             self.expr_ptr[i] = Some(out);
         }
-        Ok(self.expr_ptr[root].unwrap())
+        Ok(())
     }
 
-    /// Entry `k`, rebuilt in `tc`.
-    pub fn entry(&mut self, tc: &mut TypeChecker<'_, 't, '_>, k: usize) -> Result<Entry<'t>, Box<dyn Error>> {
-        let offset = *self.entries.get(k).ok_or("no such entry")?;
-        let mut r = self.at(offset);
-        r.byte()?;
+    /// Entry `k`, rebuilt in `tc`. Each constant rebuilt for it (and each projection's structure
+    /// name) must be `known`.
+    pub fn entry(
+        &mut self,
+        tc: &mut TypeChecker<'_, 't, '_>,
+        k: usize,
+        known: &mut dyn FnMut(NamePtr<'t>) -> bool,
+    ) -> Result<Entry<'t>, Box<dyn Error>> {
+        let mut r = self.at(ENTRIES, k)?;
+        if r.byte()? != 33 {
+            return Err("not an entry".into());
+        }
         let cache = r.byte()?;
-        let (a, b) = (r.idx()?, r.idx()?);
+        let e = self.count(EXPRS);
+        let (a, b) = (Self::below(&mut r, e)?, Self::below(&mut r, e)?);
         let eager = if cache == 4 { r.byte()? != 0 } else { false };
-        let (a, b) = (self.expr(tc, a)?, self.expr(tc, b)?);
+        let (a, b) = (self.expr(tc, a, known)?, self.expr(tc, b, known)?);
         Ok(match cache {
             0 => Entry::Infer(a, b),
             1 => Entry::InferOnly(a, b),
@@ -658,20 +649,16 @@ impl<'b, 't> Lazy<'b, 't> {
             3 => Entry::WhnfCore(a, b),
             4 => Entry::DefEqFail(a, b, eager),
             5 => Entry::DefEq(a, b),
-            _ => Entry::CongrFail(a, b),
+            6 => Entry::CongrFail(a, b),
+            _ => return Err("bad cache".into()),
         })
     }
-}
-
-/// Rebuild a judgment's entries in `tc`.
-pub fn entries<'t>(tc: &mut TypeChecker<'_, 't, '_>, header: &Header) -> Result<Vec<Entry<'t>>, Box<dyn Error>> {
-    Ok(read(tc, header.items, true)?.0)
 }
 
 /// Rebuild a calls blob's calls in `tc` (see [`CallItem`]; eager mode is nanoda's while it
 /// reduces `eagerReduce` terms).
 pub fn calls<'t>(tc: &mut TypeChecker<'_, 't, '_>, blob: &[u8]) -> Result<Vec<CallItem<'t>>, Box<dyn Error>> {
-    Ok(read(tc, blob.strip_prefix(CALLS_MAGIC).ok_or("not calls")?, false)?.1)
+    read(tc, blob.strip_prefix(CALLS_MAGIC).ok_or("not calls")?)
 }
 
 /// Every node reachable from `roots`, through locals' types.
@@ -853,6 +840,8 @@ struct Writer<'a, 'x, 't, 'p> {
     names: FxHashMap<NamePtr<'t>, u64>,
     levels: FxHashMap<LevelPtr<'t>, u64>,
     exprs: FxHashMap<ExprPtr<'t>, u64>,
+    /// Each kind's items' offsets in `out`, for a judgment's index.
+    offsets: [Vec<usize>; 4],
 }
 
 fn uvar(out: &mut Vec<u8>, mut n: u64) {
@@ -868,7 +857,7 @@ fn uvar(out: &mut Vec<u8>, mut n: u64) {
 
 impl<'a, 'x, 't, 'p> Writer<'a, 'x, 't, 'p> {
     fn new(tc: &'a TypeChecker<'x, 't, 'p>, out: Vec<u8>) -> Self {
-        Writer { tc, out, names: new_fx_hash_map(), levels: new_fx_hash_map(), exprs: new_fx_hash_map() }
+        Writer { tc, out, names: new_fx_hash_map(), levels: new_fx_hash_map(), exprs: new_fx_hash_map(), offsets: Default::default() }
     }
 
     fn name(&mut self, n: NamePtr<'t>) -> u64 {
@@ -880,6 +869,7 @@ impl<'a, 'x, 't, 'p> Writer<'a, 'x, 't, 'p> {
             Name::Str(pfx, s, _) => {
                 let p = self.name(pfx);
                 let s = self.tc.ctx.read_string(s).to_string();
+                self.offsets[NAMES].push(self.out.len());
                 self.out.push(1);
                 uvar(&mut self.out, p);
                 uvar(&mut self.out, s.len() as u64);
@@ -887,6 +877,7 @@ impl<'a, 'x, 't, 'p> Writer<'a, 'x, 't, 'p> {
             },
             Name::Num(pfx, k, _) => {
                 let p = self.name(pfx);
+                self.offsets[NAMES].push(self.out.len());
                 self.out.push(2);
                 uvar(&mut self.out, p);
                 uvar(&mut self.out, k);
@@ -905,18 +896,21 @@ impl<'a, 'x, 't, 'p> Writer<'a, 'x, 't, 'p> {
             Level::Zero => return 0,
             Level::Succ(a, _) => {
                 let a = self.level(a);
+                self.offsets[LEVELS].push(self.out.len());
                 self.out.push(3);
                 uvar(&mut self.out, a);
             },
             Level::Max(a, b, _) | Level::IMax(a, b, _) => {
                 let tag = if matches!(self.tc.ctx.read_level(l), Level::Max(..)) { 4 } else { 5 };
                 let (a, b) = (self.level(a), self.level(b));
+                self.offsets[LEVELS].push(self.out.len());
                 self.out.push(tag);
                 uvar(&mut self.out, a);
                 uvar(&mut self.out, b);
             },
             Level::Param(n, _) => {
                 let n = self.name(n);
+                self.offsets[LEVELS].push(self.out.len());
                 self.out.push(6);
                 uvar(&mut self.out, n);
             },
@@ -1022,6 +1016,7 @@ impl<'a, 'x, 't, 'p> Writer<'a, 'x, 't, 'p> {
                     uvar(&mut item, u64::from(level));
                 },
             }
+            self.offsets[EXPRS].push(self.out.len());
             self.out.extend_from_slice(&item);
             let i = self.exprs.len() as u64;
             self.exprs.insert(e, i);
@@ -1033,13 +1028,7 @@ impl<'a, 'x, 't, 'p> Writer<'a, 'x, 't, 'p> {
 /// A judgment blob of `entries`, made checking declaration node `declaration`, with `imports`
 /// (the nodes declaring what [`mentions`] lists).
 pub fn write_judgment<'t>(tc: &TypeChecker<'_, 't, '_>, declaration: &Hash, imports: &[Hash], entries: &[Entry<'t>]) -> Vec<u8> {
-    let mut head = JUDGMENT_MAGIC.to_vec();
-    head.extend_from_slice(declaration);
-    uvar(&mut head, imports.len() as u64);
-    for h in imports {
-        head.extend_from_slice(h);
-    }
-    let mut w = Writer::new(tc, head);
+    let mut w = Writer::new(tc, Vec::new());
     for entry in entries {
         let [a, b] = entry.terms();
         let (a, b) = (w.expr(a), w.expr(b));
@@ -1052,6 +1041,7 @@ pub fn write_judgment<'t>(tc: &TypeChecker<'_, 't, '_>, declaration: &Hash, impo
             Entry::DefEq(..) => 5,
             Entry::CongrFail(..) => 6,
         };
+        w.offsets[ENTRIES].push(w.out.len());
         w.out.extend_from_slice(&[33, cache]);
         uvar(&mut w.out, a);
         uvar(&mut w.out, b);
@@ -1059,7 +1049,22 @@ pub fn write_judgment<'t>(tc: &TypeChecker<'_, 't, '_>, declaration: &Hash, impo
             w.out.push(u8::from(*eager));
         }
     }
-    w.out
+    let mut out = JUDGMENT_MAGIC.to_vec();
+    out.extend_from_slice(declaration);
+    uvar(&mut out, imports.len() as u64);
+    for h in imports {
+        out.extend_from_slice(h);
+    }
+    for o in &w.offsets {
+        uvar(&mut out, o.len() as u64);
+    }
+    let width: u8 = (1..4).find(|&k| w.out.len() < 1 << (8 * k)).unwrap_or(4);
+    out.push(width);
+    for &o in w.offsets.iter().flatten() {
+        out.extend_from_slice(&o.to_le_bytes()[..usize::from(width)]);
+    }
+    out.extend_from_slice(&w.out);
+    out
 }
 
 /// A calls blob of `calls` (see [`CallItem`]).

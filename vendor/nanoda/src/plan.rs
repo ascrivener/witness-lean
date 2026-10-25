@@ -58,6 +58,20 @@ pub struct PlanConfig {
     pub env_bytes: usize,
     pub ns_per_byte: f64,
     pub ns_per_cited_byte: f64,
+    /// Write each op's entries as several judgments, split by which ops seed them, so that an op
+    /// cites only blobs holding what it needs, rather than whole ops' judgments (see `split`).
+    /// Relays are then not needed.
+    pub fine: bool,
+    /// What a judgment blob costs beyond its entries, in bytes: its header's imports, and the
+    /// subterms it repeats from its op's other blobs. Splitting must save more than this.
+    pub blob_overhead: f64,
+    /// A byte of an op's own judgment costs this many bytes cited.
+    pub own_per_cited: f64,
+    /// Most judgments an op may attest.
+    pub max_blobs: usize,
+    /// Planning in fine mode, an op's cited bytes are its needed entries' share of their ops'
+    /// judgments times this.
+    pub cite_factor: f64,
 }
 
 impl Default for PlanConfig {
@@ -79,18 +93,25 @@ impl Default for PlanConfig {
             env_bytes: 600_000,
             ns_per_byte: 13.0,
             ns_per_cited_byte: 4.0,
+            fine: false,
+            blob_overhead: 2000.0,
+            own_per_cited: 12.0,
+            max_blobs: 64,
+            cite_factor: 2.0,
         }
     }
 }
 
-/// One op: some units, run as calls, attesting one judgment.
+/// One op: some units, run as calls, attesting one judgment, or several (`PlanConfig::fine`).
 pub struct Group {
     pub round: usize,
     /// The calls blob (the op's witness, with the declaration's node).
     pub calls: Vec<u8>,
-    /// The judgment it attests (its subject).
-    pub judgment: Vec<u8>,
-    /// The groups whose judgments it cites, by index.
+    /// The judgments it attests (its subjects).
+    pub judgments: Vec<Vec<u8>>,
+    /// Their indices among every op's judgments, in order (see `Plan::blob_group`).
+    pub blobs: Vec<usize>,
+    /// The judgments it cites, by index.
     pub cites: Vec<usize>,
     pub units: usize,
     /// Its estimated gas.
@@ -101,6 +122,8 @@ pub struct Group {
 
 pub struct Plan {
     pub groups: Vec<Group>,
+    /// The group attesting each judgment.
+    pub blob_group: Vec<usize>,
     /// What the declaration's own attestation cites, and its estimated gas.
     pub final_cites: Vec<usize>,
     pub final_gas: f64,
@@ -298,12 +321,17 @@ pub(crate) fn plan<'t, 'p>(
     let mut blob_bytes: Vec<usize> = Vec::new();
     // Each group's entries, by their position in its judgment.
     let mut entry_index: Vec<FxHashMap<Entry<'t>, usize>> = Vec::new();
+    // Each group's entries, in order, and its calls with the entries each seeds (for `split`).
+    let mut group_entries: Vec<Vec<Entry<'t>>> = Vec::new();
+    let mut group_calls: Vec<Vec<SeededCall<'t>>> = Vec::new();
     for r in 1..rounds {
         let mut members: Vec<usize> = units.iter().copied().filter(|&u| u != 0 && round[&u] == r).collect();
         members.sort_unstable();
         let mut cur: Vec<usize> = Vec::new();
         let mut cites: FxHashSet<usize> = new_fx_hash_set();
         let (mut work, mut cited, mut bytes) = (0u64, 0usize, 0usize);
+        // In fine mode, the entries the op being built seeds.
+        let mut op_entries: FxHashSet<Entry<'t>> = new_fx_hash_set();
         #[allow(clippy::too_many_arguments)]
         let close = |cur: &mut Vec<usize>,
                      cites: &mut FxHashSet<usize>,
@@ -312,7 +340,9 @@ pub(crate) fn plan<'t, 'p>(
                      groups: &mut Vec<Group>,
                      group_of: &mut FxHashMap<usize, usize>,
                      blob_bytes: &mut Vec<usize>,
-                     entry_index: &mut Vec<FxHashMap<Entry<'t>, usize>>|
+                     entry_index: &mut Vec<FxHashMap<Entry<'t>, usize>>,
+                     group_entries: &mut Vec<Vec<Entry<'t>>>,
+                     group_calls: &mut Vec<Vec<SeededCall<'t>>>|
          -> Result<(), std::boxed::Box<dyn core::error::Error>> {
             // Write `cur` as one op, or, where its calls would be more than an op's witness may
             // hold, as two or more, splitting it in halves.
@@ -357,7 +387,7 @@ pub(crate) fn plan<'t, 'p>(
                 }
                 // Citing a lot for a few entries: relays, each citing some of those groups and
                 // re-attesting just the entries this op needs from them, are cited instead.
-                if cs.iter().map(|&g| blob_bytes[g]).sum::<usize>() > cfg.relay_bytes && cs.len() > 1 {
+                if !cfg.fine && cs.iter().map(|&g| blob_bytes[g]).sum::<usize>() > cfg.relay_bytes && cs.len() > 1 {
                     let mut chunks: Vec<Vec<usize>> = vec![Vec::new()];
                     let mut size = 0;
                     for &g in &cs {
@@ -386,7 +416,9 @@ pub(crate) fn plan<'t, 'p>(
                         let cited_bytes: usize = chunk.iter().map(|&c| blob_bytes[c]).sum();
                         let est_ns = cfg.fixed_ns as f64 + (cfg.env_bytes + relay.len() + calls.len()) as f64 * cfg.ns_per_byte + cited_bytes as f64 * cfg.ns_per_cited_byte;
                         blob_bytes.push(relay.len());
-                        groups.push(Group { round: r, calls, judgment: relay, cites: chunk, units: 0, gas: est_ns * cfg.gas_per_ns, unit_ns: Vec::new() });
+                        groups.push(Group { round: r, calls, judgments: vec![relay], blobs: vec![rg], cites: chunk, units: 0, gas: est_ns * cfg.gas_per_ns, unit_ns: Vec::new() });
+                        group_calls.push(vec![(0, false, Call::Seed, ents.clone())]);
+                        group_entries.push(ents.clone());
                         for (k, e) in ents.iter().enumerate() {
                             source.insert(*e, (rg, k));
                         }
@@ -415,44 +447,204 @@ pub(crate) fn plan<'t, 'p>(
                     + units.iter().map(|&u| cost(u)).sum::<u64>() as f64;
                 blob_bytes.push(judgment.len());
                 let unit_ns = units.iter().map(|&u| (u, ns[u], own[u])).collect();
-                groups.push(Group { round: r, calls, judgment, cites: cs, units: units.len(), gas: est_ns * cfg.gas_per_ns, unit_ns });
+                groups.push(Group { round: r, calls, judgments: vec![judgment], blobs: vec![g], cites: cs, units: units.len(), gas: est_ns * cfg.gas_per_ns, unit_ns });
+                group_calls.push(units.iter().zip(&unit_seeds).map(|(&u, es)| (rec.calls[u].depth, rec.calls[u].eager, rec.calls[u].call.unwrap(), es.clone())).collect());
+                group_entries.push(entries);
             }
             cites.clear();
             *work = 0;
             *cited = 0;
             Ok(())
         };
+        // In fine mode, what unit `u`'s needs add to the cited bytes of an op seeding `op_entries`,
+        // estimated as each entry's share of its group's judgment.
+        let fine_add = |u: usize, op_entries: &FxHashSet<Entry<'t>>, group_of: &FxHashMap<usize, usize>, blob_bytes: &[usize], group_entries: &[Vec<Entry<'t>>]| {
+            let bytes: f64 = need_entries[&u]
+                .iter()
+                .filter(|e| !op_entries.contains(*e))
+                .map(|e| {
+                    let g = group_of[&maker_unit(e)];
+                    blob_bytes[g] as f64 / group_entries[g].len().max(1) as f64
+                })
+                .sum();
+            estimate(bytes * cfg.cite_factor)
+        };
         for u in members {
             let mine: FxHashSet<usize> = needs[&u].iter().map(|v| group_of[v]).collect();
             let add: Vec<usize> = mine.iter().copied().filter(|g| !cites.contains(g)).collect();
-            let add_bytes: usize = add.iter().map(|&g| blob_bytes[g]).sum();
+            let add_bytes: usize = if cfg.fine {
+                fine_add(u, &op_entries, &group_of, &blob_bytes, &group_entries)
+            } else {
+                add.iter().map(|&g| blob_bytes[g]).sum()
+            };
             let est_ns = cfg.fixed_ns as f64
                 + (cfg.env_bytes + bytes + unit_bytes(u)) as f64 * cfg.ns_per_byte
                 + (cited + add_bytes) as f64 * cfg.ns_per_cited_byte
                 + (work + cost(u)) as f64;
             let over = est_ns > cfg.op_ns as f64 || cites.len() + add.len() > cfg.max_cites || cited + add_bytes > cfg.max_cited_bytes;
             if over && !cur.is_empty() {
-                close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index)?;
+                close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index, &mut group_entries, &mut group_calls)?;
                 bytes = 0;
+                op_entries.clear();
             }
-            for g in mine {
-                if cites.insert(g) {
-                    cited += blob_bytes[g];
+            if cfg.fine {
+                cited += fine_add(u, &op_entries, &group_of, &blob_bytes, &group_entries);
+                op_entries.extend(need_entries[&u].iter().copied());
+                cites.extend(mine);
+            } else {
+                for g in mine {
+                    if cites.insert(g) {
+                        cited += blob_bytes[g];
+                    }
                 }
             }
             cur.push(u);
             work += cost(u);
             bytes += unit_bytes(u);
         }
-        close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index)?;
+        close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index, &mut group_entries, &mut group_calls)?;
     }
     let mut final_cites: Vec<usize> = needs[&0].iter().map(|v| group_of[v]).collect::<FxHashSet<_>>().into_iter().collect();
     final_cites.sort_unstable();
+    let mut blob_group: Vec<usize> = (0..groups.len()).collect();
+    if cfg.fine {
+        (blob_group, final_cites) = split(tc, declaration, cfg, &imports, &mut groups, &group_entries, &group_calls, &need_entries[&0])?;
+    }
+    let blob_len: Vec<usize> = groups.iter().flat_map(|g| g.judgments.iter().map(Vec::len)).collect();
     let final_gas = (cfg.fixed_ns as f64
         + cfg.env_bytes as f64 * cfg.ns_per_byte
-        + final_cites.iter().map(|&g| blob_bytes[g]).sum::<usize>() as f64 * cfg.ns_per_byte
+        + final_cites.iter().map(|&b| blob_len[b]).sum::<usize>() as f64 * cfg.ns_per_byte
         + cost(0) as f64)
         * cfg.gas_per_ns;
-    Ok(Plan { groups, final_cites, final_gas, calls: n - 1, units: units.len(), rounds, skipped })
+    Ok(Plan { groups, blob_group, final_cites, final_gas, calls: n - 1, units: units.len(), rounds, skipped })
+}
+
+/// A byte count estimated as a float, as a whole number (rounded down, at least 0).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn estimate(x: f64) -> usize {
+    x.max(0.0) as usize
+}
+
+/// A call to write, with the entries to seed before it.
+type SeededCall<'t> = (u16, bool, Call<'t>, Vec<Entry<'t>>);
+
+/// For `PlanConfig::fine`: split each group's judgment into blobs of the entries the same ops (or
+/// the declaration's own check, `final_needs`) seed, merging blobs where a blob's overhead costs
+/// more than the citing it saves, then rewrite every group's calls to cite just the blobs it seeds
+/// from. Returns the group of each blob, and the blobs the declaration's own check cites.
+#[allow(clippy::too_many_arguments)]
+fn split<'t, 'p>(
+    tc: &TypeChecker<'_, 't, 'p>,
+    declaration: &Hash,
+    cfg: &PlanConfig,
+    imports: &impl Fn(&TypeChecker<'_, 't, 'p>, &[Entry<'t>]) -> Option<Vec<Hash>>,
+    groups: &mut [Group],
+    group_entries: &[Vec<Entry<'t>>],
+    group_calls: &[Vec<SeededCall<'t>>],
+    final_needs: &[Entry<'t>],
+) -> Result<(Vec<usize>, Vec<usize>), std::boxed::Box<dyn core::error::Error>> {
+    // The ops seeding each entry, the declaration's own check as `groups.len()`.
+    let mut consumers: FxHashMap<Entry<'t>, Vec<usize>> = new_fx_hash_map();
+    for (h, calls) in group_calls.iter().enumerate() {
+        for e in calls.iter().flat_map(|c| &c.3) {
+            consumers.entry(*e).or_default().push(h);
+        }
+    }
+    for e in final_needs {
+        consumers.entry(*e).or_default().push(groups.len());
+    }
+    for v in consumers.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    let old_cited: Vec<usize> = groups.iter().map(|g| g.cites.iter().map(|&c| groups[c].judgments[0].len()).sum()).collect();
+    let mut blob_group = Vec::new();
+    let mut place: FxHashMap<Entry<'t>, (usize, usize)> = new_fx_hash_map();
+    for (g, entries) in group_entries.iter().enumerate() {
+        let old_own = groups[g].judgments[0].len();
+        let per = old_own as f64 / entries.len().max(1) as f64;
+        let mut by: std::collections::BTreeMap<&[usize], Vec<Entry<'t>>> = Default::default();
+        for e in entries {
+            by.entry(consumers.get(e).map_or(&[][..], Vec::as_slice)).or_default().push(*e);
+        }
+        let mut buckets: Vec<(Vec<usize>, Vec<Entry<'t>>)> = by.into_iter().map(|(k, v)| (k.to_vec(), v)).collect();
+        // Merge the pair gaining most (a blob's overhead, made and cited, saved; less what each
+        // side's consumers now cite of the other) while one gains, and while there are too many.
+        let common = |a: &[usize], b: &[usize]| {
+            let (mut i, mut j, mut n) = (0, 0, 0);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    core::cmp::Ordering::Less => i += 1,
+                    core::cmp::Ordering::Greater => j += 1,
+                    core::cmp::Ordering::Equal => (i, j, n) = (i + 1, j + 1, n + 1),
+                }
+            }
+            n
+        };
+        while buckets.len() > 1 {
+            let mut best: Option<(f64, usize, usize)> = None;
+            for i in 0..buckets.len() {
+                for j in i + 1..buckets.len() {
+                    let (sa, sb) = (&buckets[i].0, &buckets[j].0);
+                    let c = common(sa, sb);
+                    let union = (sa.len() + sb.len() - c) as f64;
+                    let (na, nb) = (buckets[i].1.len() as f64 * per, buckets[j].1.len() as f64 * per);
+                    let added = na * (sb.len() - c) as f64 + nb * (sa.len() - c) as f64;
+                    let gain = cfg.blob_overhead * (cfg.own_per_cited + union) - added;
+                    if best.is_none_or(|(b, _, _)| gain > b) {
+                        best = Some((gain, i, j));
+                    }
+                }
+            }
+            let (gain, i, j) = best.unwrap();
+            if gain <= 0.0 && buckets.len() <= cfg.max_blobs {
+                break;
+            }
+            let (sb, eb) = buckets.swap_remove(j);
+            let a = &mut buckets[i];
+            a.0.extend(sb);
+            a.0.sort_unstable();
+            a.0.dedup();
+            a.1.extend(eb);
+        }
+        let mut judgments = Vec::new();
+        let mut blobs = Vec::new();
+        for (_, mut es) in buckets {
+            es.sort_by_key(|e| e.terms()[0].get_hash());
+            let imp = imports(tc, &es).ok_or("a judgment mentions a constant not declared by a loaded node")?;
+            let b = blob_group.len();
+            for (k, e) in es.iter().enumerate() {
+                place.insert(*e, (b, k));
+            }
+            judgments.push(judgment::write_judgment(tc, declaration, &imp, &es));
+            blobs.push(b);
+            blob_group.push(g);
+        }
+        let own: usize = judgments.iter().map(Vec::len).sum();
+        groups[g].gas += (own as f64 - old_own as f64) * cfg.ns_per_byte * cfg.gas_per_ns;
+        groups[g].judgments = judgments;
+        groups[g].blobs = blobs;
+    }
+    let blob_len: Vec<usize> = groups.iter().flat_map(|g| g.judgments.iter().map(Vec::len)).collect();
+    let cites_of = |es: &mut dyn Iterator<Item = &Entry<'t>>| {
+        let mut cs: Vec<usize> = es.map(|e| place[e].0).collect::<FxHashSet<_>>().into_iter().collect();
+        cs.sort_unstable();
+        cs
+    };
+    for (h, calls) in group_calls.iter().enumerate() {
+        let cs = cites_of(&mut calls.iter().flat_map(|c| &c.3));
+        let position: FxHashMap<usize, usize> = cs.iter().enumerate().map(|(j, &b)| (b, j)).collect();
+        let items: Vec<judgment::CallItem<'t>> = calls
+            .iter()
+            .map(|(depth, eager, call, es)| (*depth, *eager, *call, es.iter().map(|e| (position[&place[e].0], place[e].1)).collect()))
+            .collect();
+        let cited: usize = cs.iter().map(|&b| blob_len[b]).sum();
+        let g = &mut groups[h];
+        g.gas += (cited as f64 - old_cited[h] as f64) * cfg.ns_per_cited_byte * cfg.gas_per_ns;
+        g.calls = judgment::write_calls(tc, &items);
+        g.cites = cs;
+    }
+    let final_cites = cites_of(&mut final_needs.iter());
+    Ok((blob_group, final_cites))
 }
 
