@@ -148,12 +148,21 @@ struct Reader<'b> {
 }
 
 impl<'b> Reader<'b> {
+    #[inline]
     fn byte(&mut self) -> Result<u8, Box<dyn Error>> {
         let (&b, rest) = self.bytes.split_first().ok_or("ends early")?;
         self.bytes = rest;
         Ok(b)
     }
+    #[inline]
     fn u(&mut self) -> Result<u64, Box<dyn Error>> {
+        // Most are one byte.
+        if let Some((&b, rest)) = self.bytes.split_first() {
+            if b < 0x80 {
+                self.bytes = rest;
+                return Ok(u64::from(b));
+            }
+        }
         let mut value = 0u64;
         for shift in (0..64).step_by(7) {
             let b = self.byte()?;
@@ -164,6 +173,7 @@ impl<'b> Reader<'b> {
         }
         Err("varint too long".into())
     }
+    #[inline]
     fn idx(&mut self) -> Result<usize, Box<dyn Error>> {
         Ok(usize::try_from(self.u()?)?)
     }
@@ -351,12 +361,39 @@ pub struct Lazy<'b, 't> {
     level_ptr: Vec<Option<LevelPtr<'t>>>,
     expr_ptr: Vec<Option<ExprPtr<'t>>>,
     /// Scratch, kept to save allocating.
-    stack: Vec<usize>,
+    stack: Vec<(usize, Item<'b>)>,
     levels: Vec<LevelPtr<'t>>,
 }
 
-/// An expression item's children, as expression positions, and how many.
-type Children = ([usize; 3], usize);
+/// An expression item, read: names, levels and expressions by position.
+#[derive(Clone, Copy)]
+enum Item<'b> {
+    Nat(&'b [u8]),
+    Str(&'b [u8]),
+    Let { name: usize, ty: usize, val: usize, body: usize, nondep: bool },
+    /// A constant's name, and its levels still to read.
+    Const { name: usize, levels: usize, at: &'b [u8] },
+    App(usize, usize),
+    Binder { pi: bool, name: usize, style: BinderStyle, ty: usize, body: usize },
+    Proj { name: usize, index: usize, structure: usize },
+    Sort(usize),
+    Var(u16),
+    Local { name: usize, style: BinderStyle, ty: usize, level: u16 },
+}
+
+impl Item<'_> {
+    /// Its expression children, and how many.
+    fn children(&self) -> ([usize; 3], usize) {
+        match *self {
+            Item::Let { ty, val, body, .. } => ([ty, val, body], 3),
+            Item::App(f, a) => ([f, a, 0], 2),
+            Item::Binder { ty, body, .. } => ([ty, body, 0], 2),
+            Item::Proj { structure, .. } => ([structure, 0, 0], 1),
+            Item::Local { ty, .. } => ([ty, 0, 0], 1),
+            _ => ([0; 3], 0),
+        }
+    }
+}
 
 impl<'b, 't> Lazy<'b, 't> {
     /// Read a judgment's index.
@@ -398,6 +435,7 @@ impl<'b, 't> Lazy<'b, 't> {
     }
 
     /// A reader at item `i` of `kind` (counting from 0).
+    #[inline]
     fn at(&self, kind: usize, i: usize) -> Result<Reader<'b>, Box<dyn Error>> {
         let w = self.width;
         let b = self.tables[kind].get(i * w..i * w + w).ok_or("no such item")?;
@@ -407,6 +445,7 @@ impl<'b, 't> Lazy<'b, 't> {
 
     /// A reference to an earlier item of the same kind (`i` the referrer's position), or to any
     /// item of another (`i` its count).
+    #[inline]
     fn below(r: &mut Reader, i: usize) -> Result<usize, Box<dyn Error>> {
         let j = r.idx()?;
         if j < i { Ok(j) } else { Err("a reference to a later item".into()) }
@@ -425,7 +464,7 @@ impl<'b, 't> Lazy<'b, 't> {
                 let pfx = Self::below(&mut r, i)?;
                 let s = core::str::from_utf8(r.bytes()?)?;
                 let pfx = self.name(tc, pfx)?;
-                let s = tc.ctx.alloc_string(CowStr::Owned(s.to_string()));
+                let s = tc.ctx.alloc_str(s);
                 tc.ctx.str(pfx, s)
             },
             2 => {
@@ -470,42 +509,43 @@ impl<'b, 't> Lazy<'b, 't> {
         Ok(out)
     }
 
-    /// Expression `i`'s children, each checked to be earlier.
-    fn children(&self, i: usize) -> Result<Children, Box<dyn Error>> {
+    /// Read expression `i`, checking that its children are earlier.
+    fn item(&self, i: usize) -> Result<Item<'b>, Box<dyn Error>> {
         let mut r = self.at(EXPRS, i)?;
-        let mut c = [0; 3];
-        let n = match r.byte()? {
-            7 | 8 | 10 | 15 | 16 => 0,
+        Ok(match r.byte()? {
+            7 => Item::Nat(r.bytes()?),
+            8 => Item::Str(r.bytes()?),
             9 => {
-                r.idx()?;
-                c = [Self::below(&mut r, i)?, Self::below(&mut r, i)?, Self::below(&mut r, i)?];
-                3
+                let name = r.idx()?;
+                let (ty, val, body) = (Self::below(&mut r, i)?, Self::below(&mut r, i)?, Self::below(&mut r, i)?);
+                Item::Let { name, ty, val, body, nondep: r.byte()? != 0 }
             },
-            11 => {
-                c[..2].copy_from_slice(&[Self::below(&mut r, i)?, Self::below(&mut r, i)?]);
-                2
+            10 => {
+                let name = r.idx()?;
+                let levels = r.idx()?;
+                Item::Const { name, levels, at: r.bytes }
             },
-            12 | 13 => {
-                r.idx()?;
-                r.byte()?;
-                c[..2].copy_from_slice(&[Self::below(&mut r, i)?, Self::below(&mut r, i)?]);
-                2
+            11 => Item::App(Self::below(&mut r, i)?, Self::below(&mut r, i)?),
+            t @ (12 | 13) => {
+                let name = r.idx()?;
+                let style = style(r.byte()?)?;
+                Item::Binder { pi: t == 12, name, style, ty: Self::below(&mut r, i)?, body: Self::below(&mut r, i)? }
             },
             14 => {
-                r.idx()?;
-                r.idx()?;
-                c[0] = Self::below(&mut r, i)?;
-                1
+                let name = r.idx()?;
+                let index = r.idx()?;
+                Item::Proj { name, index, structure: Self::below(&mut r, i)? }
             },
+            15 => Item::Sort(r.idx()?),
+            16 => Item::Var(u16::try_from(r.u()?)?),
             17 => {
-                r.idx()?;
-                r.byte()?;
-                c[0] = Self::below(&mut r, i)?;
-                1
+                let name = r.idx()?;
+                let style = style(r.byte()?)?;
+                let ty = Self::below(&mut r, i)?;
+                Item::Local { name, style, ty, level: u16::try_from(r.u()?)? }
             },
             _ => return Err("not an expression".into()),
-        };
-        Ok((c, n))
+        })
     }
 
     /// Rebuild expression `root`, its children first, iteratively: terms can be deep.
@@ -515,13 +555,15 @@ impl<'b, 't> Lazy<'b, 't> {
         root: usize,
         known: &mut dyn FnMut(NamePtr<'t>) -> bool,
     ) -> Result<ExprPtr<'t>, Box<dyn Error>> {
-        if root >= self.expr_ptr.len() {
-            return Err("no such expression".into());
+        if let Some(e) = *self.expr_ptr.get(root).ok_or("no such expression")? {
+            return Ok(e);
         }
         let mut stack = core::mem::take(&mut self.stack);
         stack.clear();
-        stack.push(root);
-        let out = self.build(tc, &mut stack, known);
+        let out = self.item(root).and_then(|item| {
+            stack.push((root, item));
+            self.build(tc, &mut stack, known)
+        });
         self.stack = stack;
         out?;
         Ok(self.expr_ptr[root].unwrap())
@@ -530,50 +572,46 @@ impl<'b, 't> Lazy<'b, 't> {
     fn build(
         &mut self,
         tc: &mut TypeChecker<'_, 't, '_>,
-        stack: &mut Vec<usize>,
+        stack: &mut Vec<(usize, Item<'b>)>,
         known: &mut dyn FnMut(NamePtr<'t>) -> bool,
     ) -> Result<(), Box<dyn Error>> {
-        while let Some(&i) = stack.last() {
+        while let Some(&(i, item)) = stack.last() {
             if self.expr_ptr[i].is_some() {
                 stack.pop();
                 continue;
             }
-            let (c, n) = self.children(i)?;
+            let (c, n) = item.children();
             let before = stack.len();
-            stack.extend(c[..n].iter().copied().filter(|&c| self.expr_ptr[c].is_none()));
+            for &c in &c[..n] {
+                if self.expr_ptr[c].is_none() {
+                    stack.push((c, self.item(c)?));
+                }
+            }
             if stack.len() > before {
                 continue;
             }
             stack.pop();
             let e = |l: &Self, c: usize| l.expr_ptr[c].unwrap();
             let unknown = || -> Box<dyn Error> { "a judgment mentions a constant not declared by one of its imports".into() };
-            let mut r = self.at(EXPRS, i)?;
-            let out = match r.byte()? {
-                7 => {
-                    let b = r.bytes()?;
-                    tc.ctx.mk_nat_lit_quick(num_bigint::BigUint::from_bytes_le(b)).ok_or("nat literals are off")?
-                },
-                8 => {
-                    let s = r.str()?;
+            let out = match item {
+                Item::Nat(b) => tc.ctx.mk_nat_lit_quick(num_bigint::BigUint::from_bytes_le(b)).ok_or("nat literals are off")?,
+                Item::Str(b) => {
+                    let s = core::str::from_utf8(b)?.to_string();
                     tc.ctx.mk_string_lit_quick(CowStr::Owned(s)).ok_or("string literals are off")?
                 },
-                9 => {
-                    let n = r.idx()?;
-                    let (ty, val, body) = (r.idx()?, r.idx()?, r.idx()?);
-                    let nondep = r.byte()? != 0;
-                    let n = self.name(tc, n)?;
+                Item::Let { name, ty, val, body, nondep } => {
+                    let n = self.name(tc, name)?;
                     tc.ctx.mk_let(n, e(self, ty), e(self, val), e(self, body), nondep)
                 },
-                10 => {
-                    let n = r.idx()?;
-                    let k = r.idx()?;
-                    let n = self.name(tc, n)?;
+                Item::Const { name, levels, at } => {
+                    let n = self.name(tc, name)?;
                     if !known(n) {
                         return Err(unknown());
                     }
+                    let mut r = Reader { bytes: at };
                     let mut ls = core::mem::take(&mut self.levels);
                     ls.clear();
-                    for _ in 0..k {
+                    for _ in 0..levels {
                         let l = r.idx()?;
                         ls.push(self.level(tc, l)?);
                     }
@@ -581,43 +619,26 @@ impl<'b, 't> Lazy<'b, 't> {
                     self.levels = ls;
                     tc.ctx.mk_const(n, slice)
                 },
-                11 => {
-                    let (f, a) = (r.idx()?, r.idx()?);
-                    tc.ctx.mk_app(e(self, f), e(self, a))
+                Item::App(f, a) => tc.ctx.mk_app(e(self, f), e(self, a)),
+                Item::Binder { pi, name, style, ty, body } => {
+                    let n = self.name(tc, name)?;
+                    if pi { tc.ctx.mk_pi(n, style, e(self, ty), e(self, body)) } else { tc.ctx.mk_lambda(n, style, e(self, ty), e(self, body)) }
                 },
-                t @ (12 | 13) => {
-                    let n = r.idx()?;
-                    let st = style(r.byte()?)?;
-                    let (ty, body) = (r.idx()?, r.idx()?);
-                    let n = self.name(tc, n)?;
-                    if t == 12 { tc.ctx.mk_pi(n, st, e(self, ty), e(self, body)) } else { tc.ctx.mk_lambda(n, st, e(self, ty), e(self, body)) }
-                },
-                14 => {
-                    let n = r.idx()?;
-                    let k = r.idx()?;
-                    let st = r.idx()?;
-                    let n = self.name(tc, n)?;
+                Item::Proj { name, index, structure } => {
+                    let n = self.name(tc, name)?;
                     if !known(n) {
                         return Err(unknown());
                     }
-                    tc.ctx.mk_proj(n, k, e(self, st))
+                    tc.ctx.mk_proj(n, index, e(self, structure))
                 },
-                15 => {
-                    let l = r.idx()?;
+                Item::Sort(l) => {
                     let l = self.level(tc, l)?;
                     tc.ctx.mk_sort(l)
                 },
-                16 => {
-                    let k = u16::try_from(r.u()?)?;
-                    tc.ctx.mk_var(k)
-                },
-                _ => {
-                    let n = r.idx()?;
-                    let st = style(r.byte()?)?;
-                    let ty = r.idx()?;
-                    let level = u16::try_from(r.u()?)?;
-                    let n = self.name(tc, n)?;
-                    tc.ctx.remake_dbj_level(n, st, e(self, ty), level)
+                Item::Var(k) => tc.ctx.mk_var(k),
+                Item::Local { name, style, ty, level } => {
+                    let n = self.name(tc, name)?;
+                    tc.ctx.remake_dbj_level(n, style, e(self, ty), level)
                 },
             };
             self.expr_ptr[i] = Some(out);
