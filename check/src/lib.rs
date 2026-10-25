@@ -102,7 +102,7 @@ pub fn parse_witness(mut bytes: &[u8]) -> Option<Vec<&[u8]>> {
 }
 
 /// The pins the check is built with: 32-byte hashes, back to back (see the module docs).
-const PINS: &[u8] = include_bytes!("../pins.bin");
+pub const PINS: &[u8] = include_bytes!("../pins.bin");
 
 /// Pins: 32-byte hashes, back to back.
 fn pins(bytes: &[u8]) -> Option<Vec<Hash>> {

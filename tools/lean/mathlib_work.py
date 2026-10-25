@@ -2,6 +2,7 @@
 """Lay out attesting all of Mathlib for witness's attest-batches.py, heavy declarations included.
 
     mathlib_work.py PACK PROFILE WORK [--budget-ms MS] [--jobs N] [--lean-host PATH] [--trust-builtins]
+                    [--sim WITNESS_SIM --check LEAN_CHECK]
 
 PACK is a `lean-host convert --pack` directory (with manifest.jsonl) and PROFILE its `lean-host
 profile`. Batches are planned as plan_profile.py plans them, at MS (default 40) estimated native
@@ -9,8 +10,11 @@ milliseconds a batch. A node too slow for any batch alone is *heavy*:
 - an inductive block is split by declaration and phase (`lean-host split-inductive`);
 - a theorem or definition is checked in judgments: `lean-host judgments` and `judgments-ops`,
   twice, the second plan grouping by the costs the first measured.
-Heavy nodes are done in N parallel jobs (default 6), in WORK/heavy/HASH, and skipped when done
-(their ops.json exists), so a run can be resumed.
+With --sim and --check, each heavy op planned at 10⁹ gas or more is run in PolkaVM, and a
+declaration with one over 4.5×10⁹ is planned again with smaller ops (the plan's estimates, from
+replays timed natively, can be a few times short). Heavy nodes are done in N parallel jobs
+(default 6), in WORK/heavy/HASH, and skipped when done (their ops.json exists), so a run can be
+resumed.
 
 Every batch and op also trusts, where attested below its depth, the check's pinned nodes: those
 declaring the names nanoda treats specially (`Nat.add` and its other natively computed functions,
@@ -33,6 +37,7 @@ import argparse
 import concurrent.futures as cf
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -43,7 +48,10 @@ import plan_profile  # noqa: E402
 
 MAX_WITNESS = 60000  # under witness's MAX_WITNESS_LEN of 64 KiB, as lean_batches.py
 PINS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../check/pins.txt")
-GAS_PER_MS = 80e6  # this machine (tools/lean/gas_per_ms.py)
+GAS_PER_MS = 80e6
+# With --sim: heavy ops planned at VERIFY_MIN gas or more are run in PolkaVM, and none may use
+# more than VERIFY_LIMIT (of a refine's 5e9). DEFAULT_OP_GAS is lean-host's op budget.
+VERIFY_MIN, VERIFY_LIMIT, DEFAULT_OP_GAS = 1e9, 4.5e9, 3e9  # this machine (tools/lean/gas_per_ms.py)
 
 
 class Pack:
@@ -71,8 +79,8 @@ def heavy_job(a, h, kind, closure_file):
     """Do heavy node h: its ops in WORK/heavy/h, ops.json last."""
     d = f"{a.work}/heavy/{h}"
     host = a.lean_host
-    def run(*args):
-        return subprocess.run([host, *args], check=True, capture_output=True, text=True).stdout
+    def run(*args, env=None):
+        return subprocess.run([host, *args], check=True, capture_output=True, text=True, env=env).stdout
     full = f"{d}/full.args"
     if not os.path.exists(full):
         run("pack-args", a.pack, closure_file, full)
@@ -80,10 +88,37 @@ def heavy_job(a, h, kind, closure_file):
         run("split-inductive", full, d, str(int(a.budget_ms)))
         os.remove(full)  # tens of megabytes, made again if needed
         return
-    for p in ("p1", "p2"):
-        costs = [str(25), f"{d}/p1/costs.json"] if p == "p2" else [str(25)]
-        run("judgments", full, f"{d}/{p}", *costs)
-        run("judgments-ops", full, f"{d}/{p}")
+    # Plan, and with --sim run each op planned near the limit in PolkaVM: the plan's estimates
+    # can be some times short (a replay timed natively, in one warm process), so an op over
+    # VERIFY_LIMIT has the declaration planned again with ops smaller in proportion.
+    op_gas = None
+    for attempt in range(4):
+        env = {**os.environ, **({"PLAN_OP_GAS": str(op_gas)} if op_gas else {})}
+        for p in ("p1", "p2"):
+            costs = [str(25), f"{d}/p1/costs.json"] if p == "p2" else [str(25)]
+            run("judgments", full, f"{d}/{p}", *costs, env=env)
+            verify = {"VERIFY": "1", "VERIFY_MIN_GAS": str(VERIFY_MIN)} if p == "p2" and a.sim else {}
+            out = run("judgments-ops", full, f"{d}/{p}", env={**env, **verify})
+            if verify and "FAILED" in out:
+                raise subprocess.CalledProcessError(1, "judgments-ops", out, "an op fails natively")
+        if not a.sim:
+            break
+        groups = json.load(open(f"{d}/p2/plan.json"))["groups"]
+        worst, worst_planned = 0, 0
+        for g, group in enumerate(groups):
+            args = f"{d}/p2/group-{g}.args"
+            if not os.path.exists(args):
+                continue
+            out = subprocess.run([a.sim, "check", a.check, args, str(10**11)], capture_output=True, text=True).stdout
+            os.remove(args)
+            used = int(re.search(r"used (\d+) gas", out).group(1))
+            if used > worst:
+                worst, worst_planned = used, group["gas"]
+        if worst <= VERIFY_LIMIT:
+            break
+        if attempt == 3:
+            raise subprocess.CalledProcessError(1, "judgments", f"an op still uses {worst:.3g} gas", "")
+        op_gas = (op_gas or DEFAULT_OP_GAS) * 0.9 * VERIFY_LIMIT / worst
     # The second plan's ops, with paths relative to WORK/heavy/h.
     o = json.load(open(f"{d}/p2/ops.json"))
     for op in o["ops"]:
@@ -112,6 +147,8 @@ def main():
     p.add_argument("--jobs", type=int, default=6)
     p.add_argument("--lean-host", default=os.path.join(os.path.dirname(__file__), "../../target/release/lean-host"))
     p.add_argument("--trust-builtins", action="store_true")
+    p.add_argument("--sim", help="witness-sim, to run heavy ops near the limit in PolkaVM")
+    p.add_argument("--check", help="the Lean check blob, with --sim")
     a = p.parse_args()
     a.work = os.path.abspath(a.work)
     os.makedirs(f"{a.work}/heavy", exist_ok=True)

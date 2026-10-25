@@ -759,10 +759,19 @@ fn hex_of(h: &Hash) -> String {
 /// each op trusts, cites and carries (see the usage).
 fn judgments_ops(full: &str, out: &str) {
 	let verify = std::env::var_os("VERIFY").is_some();
+	// VERIFY_MIN_GAS: verify only the ops planned at this much gas or more.
+	let verify_min: f64 = std::env::var("VERIFY_MIN_GAS").map_or(0.0, |v| v.parse().expect("a number"));
 	let bytes = std::fs::read(full).expect("arguments");
 	let input = witness_check::Input::parse(&bytes).expect("well-formed arguments");
 	let plan: Value = serde_json::from_slice(&std::fs::read(format!("{out}/plan.json")).unwrap()).unwrap();
 	let closure: Vec<Vec<u8>> = input.blobs().filter(|b| b.trusted).map(|b| b.data.to_vec()).collect();
+	// The check's pinned nodes in the closure, which every op trusts besides what it looks up:
+	// nanoda takes its shortcuts (computing on literals, expanding a string) only with their names
+	// loaded, and checks that they exist rather than looking anything up, so the trace misses
+	// them; an op traced with them present reduces another way without them.
+	let in_closure: std::collections::BTreeSet<Hash> = closure.iter().map(|d| blake2b256(d)).collect();
+	let pinned: Vec<Hash> =
+		lean_check::PINS.chunks(32).map(|c| <Hash>::try_from(c).unwrap()).filter(|h| in_closure.contains(h)).collect();
 	let node = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).expect("a node").data.to_vec();
 	// A theorem's proof; a definition's value is in its node.
 	let proof: Option<Vec<u8>> = input
@@ -834,10 +843,11 @@ fn judgments_ops(full: &str, out: &str) {
 			keep.extend(nanoda_lib::judgment::header(j).unwrap().imports);
 		}
 		keep.extend(statement_imports.iter().copied());
+		keep.extend(pinned.iter().copied());
 		keep.remove(&node_hash);
 		let witness = encode(&[node.clone(), calls]);
 		std::fs::write(format!("{out}/group-{g}.witness"), &witness).unwrap();
-		if verify {
+		if verify && group["gas"].as_f64().unwrap_or(f64::INFINITY) >= verify_min {
 			let by_hash: std::collections::HashMap<Hash, &[u8]> = closure.iter().map(|d| (blake2b256(d), &d[..])).collect();
 			let mut blobs: Vec<(bool, &[u8])> = keep.iter().map(|h| (true, by_hash[h])).collect();
 			blobs.extend(cited_refs.iter().map(|c| (true, *c)));
@@ -871,6 +881,7 @@ fn judgments_ops(full: &str, out: &str) {
 		}
 	});
 	keep.extend(statement_imports.iter().copied());
+	keep.extend(pinned.iter().copied());
 	if let Some(proof) = &proof {
 		keep.extend(import_hashes(&proof[nanoda_lib::nodes::PROOF_MAGIC.len() + 32..]));
 	}
