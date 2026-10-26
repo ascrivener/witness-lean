@@ -48,12 +48,14 @@ impl<'t> Recorder<'t> {
         let parent = self.current();
         self.calls.push(CallRec { call: Some(call), depth, eager, parent, end: idx, ns: 0, outcome: None });
         self.stack.push((idx, Instant::now()));
+        crate::nodes::trace::set_call(idx);
         idx
     }
 
     pub(crate) fn exit(&mut self, idx: u32, outcome: Outcome<'t>) {
         let (top, t0) = self.stack.pop().unwrap();
         debug_assert_eq!(top, idx);
+        crate::nodes::trace::set_call(self.current());
         let end = u32::try_from(self.calls.len() - 1).unwrap();
         let c = &mut self.calls[idx as usize];
         c.end = end;

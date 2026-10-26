@@ -1124,6 +1124,19 @@ pub fn write_calls<'t>(tc: &TypeChecker<'_, 't, '_>, calls: &[CallItem<'t>]) -> 
 /// (see `crate::plan`).
 #[cfg(feature = "trace")]
 pub static CALL_TIMES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+/// A call's kernel work in an attested op (`util::work`'s counters): seeding the entries it needs,
+/// `seeds` of them, and running it.
+#[cfg(feature = "trace")]
+#[derive(Clone, Copy, Debug)]
+pub struct CallWork {
+    pub seed: [u64; 5],
+    pub run: [u64; 5],
+    pub seeds: u32,
+}
+
+/// Each call's kernel work in the last attested op.
+#[cfg(feature = "trace")]
+pub static CALL_WORK: std::sync::Mutex<Vec<CallWork>> = std::sync::Mutex::new(Vec::new());
 
 /// For tests: the locals `e` mentions, and `e` with one of them replaced.
 #[cfg(feature = "testing")]
