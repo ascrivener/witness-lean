@@ -25,6 +25,12 @@
 #   ATTESTERS     attesters, as a1,a2,... (default: three a core)
 #   NAMES         declarations whose closure alone to export (space-separated), for a smoke test
 set -euo pipefail
+# Rust's and Lean's tools, as installed by rustup and elan (scripts/vm-setup.sh): a shell started
+# by tmux or systemd hasn't read the profile that puts them on PATH.
+for env in "$HOME/.cargo/env" "$HOME/.elan/env"; do
+	# shellcheck disable=SC1090
+	[ -f "$env" ] && . "$env"
+done
 cd "$(dirname "$0")/.."
 REPO=$PWD
 RUN=$(mkdir -p "${1:?usage: mathlib-full.sh RUN_DIR}" && cd "$1" && pwd)
