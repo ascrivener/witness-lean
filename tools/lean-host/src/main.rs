@@ -29,8 +29,9 @@
 //!                                  constant a judgment mentions resolves to the node declaring it:
 //!                                  record its check, cut it into ops of at most
 //!                                  MS native milliseconds of the kernel's own work (default 25), and
-//!                                  write OUT/group-N.judgment, OUT/group-N.calls and OUT/plan.json
-//!                                  (each group's round, cites and estimated gas; what the theorem's
+//!                                  write OUT/blob-N.judgment (each op attests one or more),
+//!                                  OUT/group-N.calls and OUT/plan.json (each group's round,
+//!                                  judgments, cites and estimated gas; what the theorem's
 //!                                  own attestation cites); with COSTS (judgments-check's
 //!                                  costs.json for an earlier plan), grouping by each unit's
 //!                                  measured replay time
@@ -391,34 +392,61 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	// The op's witness is the theorem's node and the calls: at most 64 KiB (witness's
 	// MAX_WITNESS_LEN), with room for its encoding.
 	let node_len = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).map_or(0, |b| b.data.len());
+	// Overrides, for tuning: PLAN_OP_GAS (an op's estimated gas), PLAN_RELAY_MB (citing more than
+	// this goes through relays), PLAN_CALLS_KB (a calls blob, if the witness can be an extrinsic);
+	// PLAN_FINE=0 writes each op's judgment whole, citing through relays; otherwise each is split
+	// by which ops seed it, tuned by PLAN_BLOB_OVERHEAD (bytes), PLAN_OWN_PER_CITED, PLAN_MAX_BLOBS
+	// and PLAN_CITE_FACTOR (see PlanConfig).
+	let var = |k: &str| std::env::var(k).ok().map(|v| v.parse::<f64>().expect("a number"));
+	let defaults = nanoda_lib::plan::PlanConfig::default();
 	let cfg = nanoda_lib::plan::PlanConfig {
 		budget_ns: (budget_ms * 1e6) as u64,
 		unit_costs,
-		max_calls_bytes: 64 * 1024 - 1024 - node_len,
-		..Default::default()
+		max_calls_bytes: var("PLAN_CALLS_KB").map_or(64 * 1024 - 1024 - node_len, |kb| (kb * 1024.0) as usize),
+		op_gas: var("PLAN_OP_GAS").unwrap_or(defaults.op_gas),
+		relay_bytes: var("PLAN_RELAY_MB").map_or(defaults.relay_bytes, |mb| (mb * 1e6) as usize),
+		fine: var("PLAN_FINE").map_or(defaults.fine, |f| f != 0.0),
+		blob_overhead: var("PLAN_BLOB_OVERHEAD").unwrap_or(defaults.blob_overhead),
+		own_per_cited: var("PLAN_OWN_PER_CITED").unwrap_or(defaults.own_per_cited),
+		max_blobs: var("PLAN_MAX_BLOBS").map_or(defaults.max_blobs, |n| n as usize),
+		cite_factor: var("PLAN_CITE_FACTOR").unwrap_or(defaults.cite_factor),
+		..defaults
 	};
 	let plan = nodes.plan_judgments(i, &cfg).expect("planned");
 	std::fs::create_dir_all(out).unwrap();
 	let mut groups = Vec::new();
+	let mut blobs = Vec::new();
 	for (g, group) in plan.groups.iter().enumerate() {
-		std::fs::write(format!("{out}/group-{g}.judgment"), &group.judgment).unwrap();
+		for (&b, j) in group.blobs.iter().zip(&group.judgments) {
+			std::fs::write(format!("{out}/blob-{b}.judgment"), j).unwrap();
+			blobs.push(serde_json::json!({"group": g, "bytes": j.len()}));
+		}
 		std::fs::write(format!("{out}/group-{g}.calls"), &group.calls).unwrap();
 		groups.push(serde_json::json!({
-			"round": group.round, "cites": group.cites, "units": group.units, "gas": group.gas,
-			"judgment_bytes": group.judgment.len(), "calls_bytes": group.calls.len(),
+			"round": group.round, "blobs": group.blobs, "cites": group.cites, "units": group.units, "gas": group.gas,
+			"judgment_bytes": group.judgments.iter().map(Vec::len).sum::<usize>(), "calls_bytes": group.calls.len(),
 			"unit_ns": group.unit_ns,
 		}));
 	}
+	let cited: Vec<usize> = plan.groups.iter().map(|g| g.cites.iter().map(|&b| blobs[b]["bytes"].as_u64().unwrap() as usize).sum()).collect();
 	let summary = serde_json::json!({
 		"declaration": nodes.nodes[i].hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
 		"calls": plan.calls, "units": plan.units, "rounds": plan.rounds,
-		"groups": groups, "final_cites": plan.final_cites, "final_gas": plan.final_gas,
+		"groups": groups, "blobs": blobs, "final_cites": plan.final_cites, "final_gas": plan.final_gas,
 	});
 	std::fs::write(format!("{out}/plan.json"), serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
 	let max_gas = plan.groups.iter().map(|g| g.gas).fold(plan.final_gas, f64::max);
+	// Planned with measured costs, an op estimated over what witness lets a check use won't pass.
+	let over = plan.groups.iter().filter(|g| g.gas > 5e9).count();
+	if cfg.unit_costs.is_some() && over > 0 {
+		eprintln!("{over} ops estimated over 5e9 gas (max {max_gas:.2e}): a unit too heavy to cut");
+		std::process::exit(1);
+	}
 	println!(
-		"{} calls, {} units, {} rounds, {} ops (+ the theorem's own, citing {}); estimated gas: max {max_gas:.2e}; {} needs recomputed; planned in {:?}",
-		plan.calls, plan.units, plan.rounds, plan.groups.len(), plan.final_cites.len(), plan.skipped, start.elapsed()
+		"{} calls, {} units, {} rounds, {} ops (+ the theorem's own, citing {}), {} judgments of {} KB, cited {} KB in all (most {} cites); estimated gas: max {max_gas:.2e}; {} needs recomputed; planned in {:?}",
+		plan.calls, plan.units, plan.rounds, plan.groups.len(), plan.final_cites.len(), plan.blob_group.len(),
+		plan.groups.iter().flat_map(|g| g.judgments.iter().map(Vec::len)).sum::<usize>() / 1000, cited.iter().sum::<usize>() / 1000,
+		plan.groups.iter().map(|g| g.cites.len()).max().unwrap_or(0), plan.skipped, start.elapsed()
 	);
 }
 
@@ -476,7 +504,8 @@ fn judgments_check(full: &str, out: &str) {
 		.find(|d| d.starts_with(nanoda_lib::nodes::PROOF_MAGIC))
 		.expect("a proof");
 	let statement_imports = import_hashes(&node[nanoda_lib::nodes::NODE_MAGIC.len()..]);
-	let judgment = |g: u64| std::fs::read(format!("{out}/group-{g}.judgment")).unwrap();
+	let judgment = |b: u64| std::fs::read(format!("{out}/blob-{b}.judgment")).unwrap();
+	let mine_of = |group: &Value| -> Vec<Vec<u8>> { group["blobs"].as_array().unwrap().iter().map(|b| judgment(b.as_u64().unwrap())).collect() };
 	let run = |blobs: &[(bool, Vec<u8>)], witness: &[u8], name: &str| -> (bool, usize) {
 		let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
 		let check_blobs: Vec<CheckBlob> =
@@ -494,21 +523,24 @@ fn judgments_check(full: &str, out: &str) {
 	let mut costs = serde_json::Map::new();
 	for (g, group) in groups.iter().enumerate() {
 		let cited: Vec<Vec<u8>> = group["cites"].as_array().unwrap().iter().map(|c| judgment(c.as_u64().unwrap())).collect();
-		let mine = judgment(g as u64);
+		let mine = mine_of(group);
+		let mine_refs: Vec<&[u8]> = mine.iter().map(Vec::as_slice).collect();
 		let calls = std::fs::read(format!("{out}/group-{g}.calls")).unwrap();
 		let cited_refs: Vec<&[u8]> = cited.iter().map(Vec::as_slice).collect();
 		let mut keep = traced_op(&closure, &node, None, |nodes, i| {
-			nodes.attest_judgments(i, &cited_refs, &calls, &[&mine]).expect("the op checks in the whole closure")
+			nodes.attest_judgments(i, &cited_refs, &calls, &mine_refs).expect("the op checks in the whole closure")
 		});
-		keep.extend(nanoda_lib::judgment::header(&mine).unwrap().imports);
+		for j in &mine {
+			keep.extend(nanoda_lib::judgment::header(j).unwrap().imports);
+		}
 		keep.extend(statement_imports.iter().copied());
 		let mut blobs = env(keep);
 		blobs.extend(cited.into_iter().map(|c| (true, c)));
-		blobs.push((false, mine));
+		let own_bytes: usize = mine.iter().map(Vec::len).sum();
+		blobs.extend(mine.into_iter().map(|j| (false, j)));
 		let env_bytes: usize = blobs.iter().filter(|(t, d)| *t && d.starts_with(nanoda_lib::nodes::NODE_MAGIC)).map(|(_, d)| d.len()).sum();
 		let env_nodes = blobs.iter().filter(|(t, d)| *t && d.starts_with(nanoda_lib::nodes::NODE_MAGIC)).count();
 		let cited_bytes: usize = blobs.iter().filter(|(t, d)| *t && d.starts_with(nanoda_lib::judgment::JUDGMENT_MAGIC)).map(|(_, d)| d.len()).sum();
-		let own_bytes = blobs.last().unwrap().1.len();
 		let calls_bytes = calls.len();
 		let t0 = Instant::now();
 		let (ok, size) = run(&blobs, &encode(&[node.clone(), calls]), &format!("group-{g}"));
@@ -727,10 +759,19 @@ fn hex_of(h: &Hash) -> String {
 /// each op trusts, cites and carries (see the usage).
 fn judgments_ops(full: &str, out: &str) {
 	let verify = std::env::var_os("VERIFY").is_some();
+	// VERIFY_MIN_GAS: verify only the ops planned at this much gas or more.
+	let verify_min: f64 = std::env::var("VERIFY_MIN_GAS").map_or(0.0, |v| v.parse().expect("a number"));
 	let bytes = std::fs::read(full).expect("arguments");
 	let input = witness_check::Input::parse(&bytes).expect("well-formed arguments");
 	let plan: Value = serde_json::from_slice(&std::fs::read(format!("{out}/plan.json")).unwrap()).unwrap();
 	let closure: Vec<Vec<u8>> = input.blobs().filter(|b| b.trusted).map(|b| b.data.to_vec()).collect();
+	// The check's pinned nodes in the closure, which every op trusts besides what it looks up:
+	// nanoda takes its shortcuts (computing on literals, expanding a string) only with their names
+	// loaded, and checks that they exist rather than looking anything up, so the trace misses
+	// them; an op traced with them present reduces another way without them.
+	let in_closure: std::collections::BTreeSet<Hash> = closure.iter().map(|d| blake2b256(d)).collect();
+	let pinned: Vec<Hash> =
+		lean_check::PINS.chunks(32).map(|c| <Hash>::try_from(c).unwrap()).filter(|h| in_closure.contains(h)).collect();
 	let node = input.blobs().find(|b| !b.trusted && b.data.starts_with(nanoda_lib::nodes::NODE_MAGIC)).expect("a node").data.to_vec();
 	// A theorem's proof; a definition's value is in its node.
 	let proof: Option<Vec<u8>> = input
@@ -740,7 +781,8 @@ fn judgments_ops(full: &str, out: &str) {
 		.find(|d| d.starts_with(nanoda_lib::nodes::PROOF_MAGIC));
 	let node_hash = blake2b256(&node);
 	let statement_imports = import_hashes(&node[nanoda_lib::nodes::NODE_MAGIC.len()..]);
-	let judgment = |g: u64| std::fs::read(format!("{out}/group-{g}.judgment")).unwrap();
+	let judgment = |b: u64| std::fs::read(format!("{out}/blob-{b}.judgment")).unwrap();
+	let mine_of = |group: &Value| -> Vec<Vec<u8>> { group["blobs"].as_array().unwrap().iter().map(|b| judgment(b.as_u64().unwrap())).collect() };
 	// The closure, loaded once each way: the theorem as its judgment ops load it (no proof), and as
 	// its own attestation does.
 	let load = |with_proof: bool| -> Vec<u8> {
@@ -766,6 +808,12 @@ fn judgments_ops(full: &str, out: &str) {
 		nodes.nodes.iter().filter(|n| declars.iter().any(|d| n.declars.contains(d))).map(|n| n.hash).collect()
 	};
 	let groups = plan["groups"].as_array().unwrap();
+	// A judgment as witness names it: the op attesting it, and its position among the op's subjects.
+	let blob_ref = |b: u64| -> Value {
+		let g = plan["blobs"][b as usize]["group"].as_u64().unwrap();
+		let k = groups[g as usize]["blobs"].as_array().unwrap().iter().position(|x| x.as_u64() == Some(b)).unwrap();
+		serde_json::json!([format!("group-{g}"), k])
+	};
 	let mut ops = Vec::new();
 	let mut costs = serde_json::Map::new();
 	let (start, mut failed) = (Instant::now(), 0);
@@ -773,11 +821,12 @@ fn judgments_ops(full: &str, out: &str) {
 		let cites: Vec<u64> = group["cites"].as_array().unwrap().iter().map(|c| c.as_u64().unwrap()).collect();
 		let cited: Vec<Vec<u8>> = cites.iter().map(|&c| judgment(c)).collect();
 		let cited_refs: Vec<&[u8]> = cited.iter().map(Vec::as_slice).collect();
-		let mine = judgment(g as u64);
+		let mine = mine_of(group);
+		let mine_refs: Vec<&[u8]> = mine.iter().map(Vec::as_slice).collect();
 		let calls = std::fs::read(format!("{out}/group-{g}.calls")).unwrap();
 		let ok = std::cell::Cell::new(true);
 		let mut keep = looked_up(&ops_nodes, &|| {
-			if let Err(e) = ops_nodes.attest_judgments(i, &cited_refs, &calls, &[&mine]) {
+			if let Err(e) = ops_nodes.attest_judgments(i, &cited_refs, &calls, &mine_refs) {
 				println!("group {g}: {e}");
 				ok.set(false);
 			}
@@ -790,16 +839,19 @@ fn judgments_ops(full: &str, out: &str) {
 		for (unit, ns) in group["unit_ns"].as_array().unwrap().iter().zip(times) {
 			costs.insert(unit[0].as_u64().unwrap().to_string(), Value::from(ns));
 		}
-		keep.extend(nanoda_lib::judgment::header(&mine).unwrap().imports);
+		for j in &mine {
+			keep.extend(nanoda_lib::judgment::header(j).unwrap().imports);
+		}
 		keep.extend(statement_imports.iter().copied());
+		keep.extend(pinned.iter().copied());
 		keep.remove(&node_hash);
 		let witness = encode(&[node.clone(), calls]);
 		std::fs::write(format!("{out}/group-{g}.witness"), &witness).unwrap();
-		if verify {
+		if verify && group["gas"].as_f64().unwrap_or(f64::INFINITY) >= verify_min {
 			let by_hash: std::collections::HashMap<Hash, &[u8]> = closure.iter().map(|d| (blake2b256(d), &d[..])).collect();
 			let mut blobs: Vec<(bool, &[u8])> = keep.iter().map(|h| (true, by_hash[h])).collect();
 			blobs.extend(cited_refs.iter().map(|c| (true, *c)));
-			blobs.push((false, &mine[..]));
+			blobs.extend(mine.iter().map(|j| (false, &j[..])));
 			let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
 			let check_blobs: Vec<CheckBlob> = blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
 			let a = check_args(CheckMode::Attest, &check_blobs, &[], &witness);
@@ -812,10 +864,10 @@ fn judgments_ops(full: &str, out: &str) {
 		}
 		ops.push(serde_json::json!({
 			"name": format!("group-{g}"),
-			"subject": format!("group-{g}.judgment"),
+			"subjects": group["blobs"].as_array().unwrap().iter().map(|b| format!("blob-{b}.judgment")).collect::<Vec<_>>(),
 			"witness": format!("group-{g}.witness"),
 			"trust_nodes": keep.iter().map(hex_of).collect::<Vec<_>>(),
-			"trust_ops": cites.iter().map(|c| format!("group-{c}")).collect::<Vec<_>>(),
+			"trust_ops": cites.iter().map(|&c| blob_ref(c)).collect::<Vec<_>>(),
 		}));
 	}
 	let final_cites: Vec<u64> = plan["final_cites"].as_array().unwrap().iter().map(|c| c.as_u64().unwrap()).collect();
@@ -829,6 +881,7 @@ fn judgments_ops(full: &str, out: &str) {
 		}
 	});
 	keep.extend(statement_imports.iter().copied());
+	keep.extend(pinned.iter().copied());
 	if let Some(proof) = &proof {
 		keep.extend(import_hashes(&proof[nanoda_lib::nodes::PROOF_MAGIC.len() + 32..]));
 	}
@@ -838,7 +891,7 @@ fn judgments_ops(full: &str, out: &str) {
 		"ops": ops,
 		"final": {
 			"trust_nodes": keep.iter().map(hex_of).collect::<Vec<_>>(),
-			"trust_ops": final_cites.iter().map(|c| format!("group-{c}")).collect::<Vec<_>>(),
+			"trust_ops": final_cites.iter().map(|&c| blob_ref(c)).collect::<Vec<_>>(),
 		},
 	});
 	std::fs::write(format!("{out}/ops.json"), serde_json::to_vec(&summary).unwrap()).unwrap();

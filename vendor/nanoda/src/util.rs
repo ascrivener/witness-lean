@@ -430,6 +430,17 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
         }
     }
 
+    /// [`Self::alloc_string`] of a borrowed string, copying it only if it isn't stored yet.
+    pub(crate) fn alloc_str(&mut self, s: &str) -> StringPtr<'t> {
+        if let Some(idx) = self.export_file.dag.strings.get_index_of(s) {
+            Ptr::from(DagMarker::ExportFile, idx)
+        } else if let Some(idx) = self.dag.strings.get_index_of(s) {
+            Ptr::from(DagMarker::TcCtx, idx)
+        } else {
+            Ptr::from(DagMarker::TcCtx, self.dag.strings.insert_full(CowStr::Owned(s.to_string())).0)
+        }
+    }
+
     /// Store a `BigUint` (a bignum), getting back a pointer to the allocated item. If the item was
     /// already stored, forego the allocation and return a pointer to the previously inserted
     /// element. Checks the longer-lived storage first.

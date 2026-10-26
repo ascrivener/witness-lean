@@ -53,9 +53,12 @@ differ in:
   declaration info.
 - *The constants.* A judgment imports the nodes declaring every constant its entries mention. To
   attest it, each mentioned constant must be loaded and declared by one of them; to cite it, each
-  loaded one must be (`Nodes::check_imports`). So a constant in an entry can't mean something else
+  loaded one must be (`Nodes::known`). So a constant in an entry can't mean something else
   where it's used: D's hash alone wouldn't fix that, since a statement node pins what the
-  statement mentions, not the proof, and an op loads only the nodes it touches.
+  statement mentions, not the proof, and an op loads only the nodes it touches. The reader checks
+  this as it rebuilds each constant (`Nodes::known`, asked by `judgment::Lazy::entry`): rebuilding
+  an entry rebuilds every term it's made of, or finds it rebuilt for an earlier entry and checked
+  then, so every constant an entry mentions is checked before the entry is used.
 - *The local context.* A local is a de Bruijn level, a name and a type, so an expression with
   free locals carries what they are. `e : T` about locals holds wherever those same locals are.
 - *Fresh binders.* A call runs from a starting depth above every local its inputs mention
@@ -97,7 +100,10 @@ confirming by review rather than relying on.
    entry made under one state could be false under another. This is the step most worth a kernel
    author's review: every place nanoda writes a cache, and what that write depends on.
 3. **The judgment code is right.** Reading entries back into a checker, the import checks, the
-   depth check and `holds` are new trusted code (`src/judgment.rs`, `src/nodes.rs`).
+   depth check and `holds` are new trusted code (`src/judgment.rs`, `src/nodes.rs`). A judgment's
+   index only finds items: an item is checked when it's read (its tag is its kind's, and its
+   references to its own kind are to earlier items, so every term is finite), and an item nothing
+   reads affects nothing.
 4. **Witness passes as trusted only what this check attested.** Enforced by witness's rules, with
    their own tests.
 
@@ -116,3 +122,4 @@ confirming by review rather than relying on.
 | Attesting needs what the judgment mentions loaded | `attesting_a_judgment_needs_what_it_mentions_loaded` |
 | A local with the right level but another type is another local | `locals_carry_their_types` |
 | A call seeds only from judgments the op cites | `calls_seed_only_from_cited_judgments` |
+| An indexed item is checked as it's read | `a_judgment_is_read_by_its_index` |

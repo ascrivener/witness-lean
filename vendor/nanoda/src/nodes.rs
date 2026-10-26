@@ -303,14 +303,19 @@ impl<'p> Nodes<'p> {
         self.declared_by.iter().find(|(n, _)| n.get_hash() == name.get_hash()).map(|(_, h)| *h)
     }
 
-    /// Check that the constants `entries` mention mean here what they meant where the entries
-    /// were made, or will (see [`crate::judgment`]): each declared, here, by one of `imports`.
+    /// Whether a constant a judgment's entries mention means here what it meant where they were
+    /// made, or will be (see [`crate::judgment`]): declared, here, by one of `imports` (sorted).
     /// Attesting them (`made`), each must be: if one weren't loaded at all, the kernel would read
     /// it as opaque, and could make an entry that's false where it's defined. Citing them, as for
     /// a trusted node, only each that is loaded: one that isn't can't be looked up here, and its
-    /// import's hash fixes what it means, as it did where the entries were attested.
-    fn check_imports<'t>(&self, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>], imports: &[Hash], made: bool) -> Result<(), Box<dyn Error>> {
-        Self::check_imports_in(&self.declared_by_ptr(), tc, entries, imports, made)
+    /// import's hash fixes what it means, as it did where the entries were attested. A judgment's
+    /// reader asks this of every constant it rebuilds (`judgment::Lazy::entry`), so of every one
+    /// an entry it reads mentions.
+    fn known(declared_by: &FxHashMap<u64, Hash>, imports: &[Hash], made: bool, name: NamePtr<'_>) -> bool {
+        match declared_by.get(&name.get_hash()) {
+            Some(h) => imports.binary_search(h).is_ok(),
+            None => !made,
+        }
     }
 
     /// Which node declares each loaded name, by the name's pointer (the environment's names, from
@@ -319,16 +324,11 @@ impl<'p> Nodes<'p> {
         self.declared_by.iter().map(|(n, h)| (n.get_hash(), *h)).collect()
     }
 
-    /// [`Self::check_imports`], given [`Self::declared_by_ptr`].
-    fn check_imports_in<'t>(declared_by: &FxHashMap<u64, Hash>, tc: &TypeChecker<'_, 't, 'p>, entries: &[Entry<'t>], imports: &[Hash], made: bool) -> Result<(), Box<dyn Error>> {
-        for name in judgment::mentions(tc, entries) {
-            match declared_by.get(&name.get_hash()) {
-                Some(h) if imports.contains(h) => {},
-                None if !made => {},
-                _ => return Err("a judgment mentions a constant not declared by one of its imports".into()),
-            }
-        }
-        Ok(())
+    /// A judgment's imports, sorted for [`Self::known`].
+    fn sorted(imports: &[Hash]) -> Vec<Hash> {
+        let mut v = imports.to_vec();
+        v.sort_unstable();
+        v
     }
 
     /// The imports a judgment of `entries` needs here: the nodes declaring what they mention.
@@ -343,14 +343,16 @@ impl<'p> Nodes<'p> {
     /// Seed `tc`, a checker for node `declaration`, with the entries of `cited`: judgments the
     /// caller vouches were attested. Each must be for `declaration`, and import what it mentions.
     fn seed<'t>(&self, tc: &mut TypeChecker<'_, 't, 'p>, declaration: &Hash, cited: &[&[u8]]) -> Result<(), Box<dyn Error>> {
+        let declared_by = self.declared_by_ptr();
         for blob in cited {
             let header = judgment::header(blob)?;
             if header.declaration != *declaration {
                 return Err("a judgment for another declaration".into());
             }
+            let imports = Self::sorted(&header.imports);
+            let mut known = |n: NamePtr<'_>| Self::known(&declared_by, &imports, false, n);
             let mut l = judgment::Lazy::new(&header)?;
-            let entries = (0..l.len()).map(|k| l.entry(tc, k)).collect::<Result<Vec<_>, _>>()?;
-            self.check_imports(tc, &entries, &header.imports, false)?;
+            let entries = (0..l.len()).map(|k| l.entry(tc, k, &mut known)).collect::<Result<Vec<_>, _>>()?;
             judgment::seed(tc, &entries);
         }
         Ok(())
@@ -401,6 +403,7 @@ impl<'p> Nodes<'p> {
         }
         self.file.with_tc_and_declar(*d.info(), |tc| {
             let mut lazy = headers.iter().map(judgment::Lazy::new).collect::<Result<Vec<_>, _>>()?;
+            let imports: Vec<Vec<Hash>> = headers.iter().map(|h| Self::sorted(&h.imports)).collect();
             let declared_by = self.declared_by_ptr();
             let mut levels = new_fx_hash_map();
             #[cfg(feature = "trace")]
@@ -415,14 +418,10 @@ impl<'p> Nodes<'p> {
             for (depth, eager, call, seeds) in calls {
                 #[cfg(feature = "trace")]
                 let ts = std::time::Instant::now();
-                let mut by_judgment: FxHashMap<usize, Vec<Entry<'_>>> = new_fx_hash_map();
                 for (j, k) in seeds {
-                    let entry = lazy.get_mut(j).ok_or("a seed from a judgment not cited")?.entry(tc, k)?;
-                    by_judgment.entry(j).or_default().push(entry);
-                }
-                for (j, entries) in &by_judgment {
-                    Self::check_imports_in(&declared_by, tc, entries, &headers[*j].imports, false)?;
-                    judgment::seed(tc, entries);
+                    let l = lazy.get_mut(j).ok_or("a seed from a judgment not cited")?;
+                    let entry = l.entry(tc, k, &mut |n| Self::known(&declared_by, &imports[j], false, n))?;
+                    judgment::seed(tc, &[entry]);
                 }
                 #[cfg(feature = "trace")]
                 let tc0 = std::time::Instant::now();
@@ -448,9 +447,10 @@ impl<'p> Nodes<'p> {
                 if header.declaration != hash {
                     return Err("a judgment for another declaration".into());
                 }
+                let imports = Self::sorted(&header.imports);
+                let mut known = |n: NamePtr<'_>| Self::known(&declared_by, &imports, true, n);
                 let mut l = judgment::Lazy::new(&header)?;
-                let entries = (0..l.len()).map(|k| l.entry(tc, k)).collect::<Result<Vec<_>, _>>()?;
-                self.check_imports(tc, &entries, &header.imports, true)?;
+                let entries = (0..l.len()).map(|k| l.entry(tc, k, &mut known)).collect::<Result<Vec<_>, _>>()?;
                 // A whnf without unfolding the calls didn't make, because a call took a cached
                 // shortcut its traced run couldn't: computed here, as the checker would. It's a
                 // fact about reduction alone, not about typing.

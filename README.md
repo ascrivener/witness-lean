@@ -140,8 +140,9 @@ included, at about 1.5 a second on an 8-core laptop.
   and friends natively and permits axioms by name, so the check pins the nodes allowed to declare
   them, built in for its Lean toolchain (see How it works). A new toolchain needs a new check.
 - **A heavy declaration costs several times its check.** 966 of Mathlib's declarations need more
-  than a refine; split into judgments, each costs about 7× its whole check (environment loads and
-  rebuilt entries), and the heaviest takes 254 rounds. That's most of Mathlib's gas.
+  than a refine; split into judgments, the ones measured cost 3.4 to 5.5× their whole check, one
+  16× (mostly rebuilding the terms of the entries each op seeds), and the heaviest takes 254
+  rounds. That's most of Mathlib's gas.
 - **Next:** the open questions in [docs/design/heavy-declarations.md](docs/design/heavy-declarations.md)
   (the overhead and latency of splitting, literal dependencies in the converter), a review of the
   judgment soundness argument by a kernel author, and Mathlib on a real testnet.

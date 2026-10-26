@@ -309,18 +309,45 @@ blob kept under witness's witness limit.
 
 **Seeding per call.** An op cites the judgments its calls need and names, for each call, the
 entries to seed just before it runs, read lazily from the cited blobs (`judgment::Lazy`), so
-only the entries used are rebuilt. An op that would cite more
-than 3 MB cites *relays* instead: ops that cite up to 3 MB of judgments and re-attest just the
-entries needed, so later ops cite less.
+only the entries used are rebuilt. A judgment carries an index of its items' offsets, so a reader
+finds an entry without scanning the blob, and checks each item (and each constant against the
+judgment's imports) only as it rebuilds it.
+
+**Judgments split by who seeds them.** An op attests its entries as several judgments, bucketed
+by which later ops seed them and merged where a separate blob's overhead (its imports, the
+subterms it repeats) would cost more than the citing it saves, without taking any op past 11 MB
+cited, so its arguments fit a work package. An op then cites the blobs holding what it needs,
+not whole ops' judgments. (Before this, an op citing more than 3 MB cited *relays*: ops
+re-attesting just the entries needed. `PLAN_FINE=0` plans that way still.)
+
+**Ops sized by a fitted cost model.** An op's gas is estimated from its units' measured native
+replay (about 23.5 gas a nanosecond, seeding included), a typical environment (250 KB at about
+1,100 gas a byte), what it attests (about 350 a byte) and what it cites (about 30 a byte): fit
+to every op of the bench below (R² 0.96; the median op within 0.9 to 1.15× of its estimate).
+Ops are planned to 3×10⁹, leaving room for the estimate's error under witness's 5×10⁹.
 
 **Inductives** are split by declaration, and an inductive type's check by phase (constructors,
 then recursors), only when a block is over budget (`lean-host split-inductive`). A mutual block is
 checked once, not once per member (`check_inductive_declar`; proposed upstream as nanoda#69): that alone
 took `Lean.Meta.Grind.Arith.Cutsat.EqCnstr` from 1.32×10¹⁰ gas to 1.42×10⁹.
 
-**`instIsIsoIndCoimageImageComparison`**, the heaviest theorem: 1,002 ops (558 of them relays) in
-254 rounds, every one passing natively and in PolkaVM. The largest uses 2.55×10⁹ gas, the median
-7.1×10⁸; all together 7.2×10¹¹, about 7× the declaration's whole check.
+**What splitting costs**, measured in PolkaVM (`tools/lean/heavy_bench.py`): each declaration's
+ops' gas in all, over its whole check's. Every op passes; the largest uses 4.1×10⁹ gas.
+
+| Declaration | Rounds | Ops before | Before | Ops now | Now |
+|---|---|---|---|---|---|
+| `CategoryTheory.instIsIsoIndCoimageImageComparison` | 254 | 1,134 (585 relays) | 17.5× | 320 | 5.5× |
+| `AlgebraicGeometry.Proj.awayι_comp_map` | 78 | 1,330 (679 relays) | 44× | 285 | 16.2× |
+| `CategoryTheory.Sheaf.H.longSequence_exact` | 88 | 220 | 7.1× | 103 | 3.4× |
+| `AlgebraicGeometry.Scheme.Hom.toNormalization_app_preimage` | 97 | 203 | 9.5× | 104 | 3.9× |
+| `QuadraticModuleCat.instMonoidalCategoryStruct` (a definition) | 76 | 110 | 5.5× | 96 | 4.0× |
+| `Polynomial.iterate_derivative_derivative_mul_X` (a control) | 11 | 10 | 1.0× | 10 | 1.0× |
+
+Timing each op's phases natively (gas follows native time, at about 25 to 35 gas a nanosecond)
+showed where it went before: rebuilding seeded entries 31%, checking their imports 17% (every
+seeded term walked again for each call), scanning cited blobs 10%, and the kernel's own calls 9%.
+The index, the import check folded into the rebuild, and blobs split by who seeds them took most
+of that.
 
 ### All of Mathlib
 
@@ -346,10 +373,14 @@ written.
 
 ## Open questions
 
-1. **The overhead of splitting.** A split declaration costs about 7× its whole check, mostly in
-   loading the environment for every op and rebuilding cited entries. For Mathlib that's most of
-   the gas. Fewer, larger ops where budget allows, and judgments cited by entry rather than by
-   blob, are the levers.
+1. **The overhead of splitting.** A split declaration now costs 3.4 to 5.5× its whole check,
+   and `Proj.awayι_comp_map` 16× (see What splitting costs). Of the heaviest theorem's ops' gas,
+   rebuilding the terms of seeded entries is 38%, the kernel's own calls 22%, attesting the ops'
+   own judgments 14%, and a fixed cost per op 13%. Every op rebuilds the terms of each entry it
+   seeds, so a declaration whose ops each seed many earlier entries pays for those terms many
+   times: `awayι_comp_map` is wide rather than deep (285 ops in 78 rounds, citing 4.7 MB each).
+   Sharing rebuilt terms across an op's cited judgments, or grouping units that seed the same
+   entries into one op, are the levers left; below about 3× would need a different scheme.
 2. **Latency.** The heaviest theorem takes 254 rounds, about 25 minutes of 6-second slots even
    with every core free. Rounds come from the longest chain of needs; wider units would shorten it.
 3. **Literal dependencies.** The converters now make a node with a literal import what its
