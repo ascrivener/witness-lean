@@ -10,7 +10,7 @@ milliseconds a batch. A node too slow for any batch alone is *heavy*:
 - an inductive block is split by declaration and phase (`lean-host split-inductive`);
 - a theorem or definition is checked in judgments: `lean-host judgments` and `judgments-ops`,
   twice, the second plan grouping by the costs the first measured.
-With --sim and --check, each heavy op planned at 10⁹ gas or more is run in PolkaVM, and a
+With --sim and --check, each heavy op planned at 5×10⁸ gas or more is run in PolkaVM, and a
 declaration with one over 4.5×10⁹ is planned again with smaller ops (the plan's estimates, from
 replays timed natively, can be a few times short). Heavy nodes are done in N parallel jobs
 (default 6), in WORK/heavy/HASH, and skipped when done (their ops.json exists), so a run can be
@@ -48,10 +48,11 @@ import plan_profile  # noqa: E402
 
 MAX_WITNESS = 60000  # under witness's MAX_WITNESS_LEN of 64 KiB, as lean_batches.py
 PINS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../check/pins.txt")
-GAS_PER_MS = 80e6
+GAS_PER_MS = 80e6  # this machine (tools/lean/gas_per_ms.py)
 # With --sim: heavy ops planned at VERIFY_MIN gas or more are run in PolkaVM, and none may use
-# more than VERIFY_LIMIT (of a refine's 5e9). DEFAULT_OP_GAS is lean-host's op budget.
-VERIFY_MIN, VERIFY_LIMIT, DEFAULT_OP_GAS = 1e9, 4.5e9, 3e9  # this machine (tools/lean/gas_per_ms.py)
+# more than VERIFY_LIMIT (of a refine's 5e9), in up to ATTEMPTS plans. DEFAULT_OP_GAS is
+# lean-host's op budget.
+VERIFY_MIN, VERIFY_LIMIT, DEFAULT_OP_GAS, ATTEMPTS = 5e8, 4.5e9, 3e9, 6
 
 
 class Pack:
@@ -92,7 +93,7 @@ def heavy_job(a, h, kind, closure_file):
     # can be some times short (a replay timed natively, in one warm process), so an op over
     # VERIFY_LIMIT has the declaration planned again with ops smaller in proportion.
     op_gas = None
-    for attempt in range(4):
+    for attempt in range(ATTEMPTS):
         env = {**os.environ, **({"PLAN_OP_GAS": str(op_gas)} if op_gas else {})}
         for p in ("p1", "p2"):
             costs = [str(25), f"{d}/p1/costs.json"] if p == "p2" else [str(25)]
@@ -102,6 +103,7 @@ def heavy_job(a, h, kind, closure_file):
             if verify and "FAILED" in out:
                 raise subprocess.CalledProcessError(1, "judgments-ops", out, "an op fails natively")
         if not a.sim:
+            attempt = 0
             break
         groups = json.load(open(f"{d}/p2/plan.json"))["groups"]
         worst, worst_planned = 0, 0
@@ -116,9 +118,9 @@ def heavy_job(a, h, kind, closure_file):
                 worst, worst_planned = used, group["gas"]
         if worst <= VERIFY_LIMIT:
             break
-        if attempt == 3:
+        if attempt == ATTEMPTS - 1:
             raise subprocess.CalledProcessError(1, "judgments", f"an op still uses {worst:.3g} gas", "")
-        op_gas = (op_gas or DEFAULT_OP_GAS) * 0.9 * VERIFY_LIMIT / worst
+        op_gas = (op_gas or DEFAULT_OP_GAS) * 0.8 * VERIFY_LIMIT / worst
     # The second plan's ops, with paths relative to WORK/heavy/h.
     o = json.load(open(f"{d}/p2/ops.json"))
     for op in o["ops"]:
@@ -126,6 +128,7 @@ def heavy_job(a, h, kind, closure_file):
     json.dump(o, open(f"{d}/ops.json.tmp", "w"))
     os.replace(f"{d}/ops.json.tmp", f"{d}/ops.json")
     os.remove(full)
+    return attempt, op_gas
 
 
 def subjects_of(op):
