@@ -232,14 +232,14 @@ def main():
     index = {h: i for i, h in enumerate(hashes)}
     pins = [l.split()[0] for l in open(PINS) if l.strip() and not l.startswith("#")]
     if a.trust_builtins:
-        builtins, stack = set(), [index[h] for h in pins]
+        builtins, stack = set(), [index[h] for h in pins if h in index]
         while stack:
             i = stack.pop()
             if i not in builtins:
                 builtins.add(i)
                 stack.extend(int(j) for j in imports[i])
     else:
-        builtins = {index[h] for h in pins}
+        builtins = {index[h] for h in pins if h in index}  # a part of Mathlib may lack some
     level_of = {i: b[0] for b in batches for i in b[1]}
     below = lambda level, mine: sorted(hashes[i] for i in builtins if level_of[i] < level and i not in mine)
     heavy_set = set(heavy)
