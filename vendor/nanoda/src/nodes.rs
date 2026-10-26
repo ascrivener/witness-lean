@@ -420,14 +420,14 @@ impl<'p> Nodes<'p> {
             // own check, in the whole declaration's, made only later.
             for (depth, eager, call, seeds) in calls {
                 #[cfg(feature = "trace")]
-                let (ts, w0) = (std::time::Instant::now(), crate::util::work::read());
+                let (ts, w0, nseeds) = (std::time::Instant::now(), crate::util::work::read(), seeds.len());
                 for (j, k) in seeds {
                     let l = lazy.get_mut(j).ok_or("a seed from a judgment not cited")?;
                     let entry = l.entry(tc, k, &mut |n| Self::known(&declared_by, &imports[j], false, n))?;
                     judgment::seed(tc, &[entry]);
                 }
                 #[cfg(feature = "trace")]
-                let tc0 = std::time::Instant::now();
+                let (tc0, w_seeded) = (std::time::Instant::now(), crate::util::work::read());
                 judgment::run_memo(tc, depth, eager, call, &mut levels)?;
                 #[cfg(feature = "trace")]
                 {
@@ -435,7 +435,9 @@ impl<'p> Nodes<'p> {
                     slow.push(tc0.elapsed().as_micros());
                     times.push(u64::try_from(ts.elapsed().as_nanos()).unwrap_or(u64::MAX));
                     let w1 = crate::util::work::read();
-                    work.push(core::array::from_fn::<u64, 5, _>(|k| w1[k] - w0[k]));
+                    let seed = core::array::from_fn::<u64, 5, _>(|k| w_seeded[k] - w0[k]);
+                    let run = core::array::from_fn::<u64, 5, _>(|k| w1[k] - w_seeded[k]);
+                    work.push(judgment::CallWork { seed, run, seeds: u32::try_from(nseeds).unwrap_or(u32::MAX) });
                 }
             }
             #[cfg(feature = "trace")]
@@ -522,7 +524,8 @@ impl<'p> Nodes<'p> {
                 .into_iter()
                 .filter_map(|(c, dd)| declar_node.get(dd).copied().filter(|&n| n != u32::MAX && n as usize != i).map(|n| (c, n)))
                 .collect();
-            let env = crate::plan::Env { lookups, node_size };
+            let node_index = self.nodes.iter().enumerate().map(|(k, n)| (n.hash, k as u32)).collect();
+            let env = crate::plan::Env { lookups, node_size, node_index };
             crate::plan::plan(tc, &rec, &hash, cfg, &env, |tc, entries| {
                 let imports = self.judgment_imports(tc, entries);
                 if imports.is_none() {

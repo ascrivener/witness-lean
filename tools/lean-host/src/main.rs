@@ -387,7 +387,17 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	let i = nodes.find(&blake2b256(node.data)).expect("the untrusted node loaded");
 	let unit_costs = costs.map(|c| {
 		let v: Value = serde_json::from_slice(&std::fs::read(c).expect("costs")).expect("JSON");
-		v.as_object().unwrap().iter().map(|(k, ns)| (k.parse().unwrap(), ns.as_u64().unwrap())).collect()
+		// Each unit's cost: its run, its seeding and how many it seeded (`judgments-ops`), or a
+		// single figure, all run.
+		let cost = |c: &Value| match c.as_u64() {
+			Some(run) => nanoda_lib::plan::UnitCost { run, seed: 0, seeds: 0 },
+			None => nanoda_lib::plan::UnitCost {
+				run: c["run"].as_u64().unwrap(),
+				seed: c["seed"].as_u64().unwrap(),
+				seeds: u32::try_from(c["seeds"].as_u64().unwrap()).unwrap(),
+			},
+		};
+		v.as_object().unwrap().iter().map(|(k, c)| (k.parse().unwrap(), cost(c))).collect()
 	});
 	// The op's witness is the theorem's node and the calls: at most 64 KiB (witness's
 	// MAX_WITNESS_LEN), with room for its encoding.
@@ -432,7 +442,7 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 		groups.push(serde_json::json!({
 			"round": group.round, "blobs": group.blobs, "cites": group.cites, "units": group.units, "gas": group.gas,
 			"judgment_bytes": group.judgments.iter().map(Vec::len).sum::<usize>(), "calls_bytes": group.calls.len(),
-			"unit_ns": group.unit_ns,
+			"unit_ns": group.unit_ns, "env": group.env, "work": group.work,
 		}));
 	}
 	let cited: Vec<usize> = plan.groups.iter().map(|g| g.cites.iter().map(|&b| blobs[b]["bytes"].as_u64().unwrap() as usize).sum()).collect();
@@ -872,9 +882,10 @@ fn judgments_ops(full: &str, out: &str) {
 		}
 		let work = nanoda_lib::judgment::CALL_WORK.lock().unwrap().clone();
 		let gas_per_ns = nanoda_lib::plan::PlanConfig::default().gas_per_ns;
+		let ns = |w: &[u64; 5]| (w.iter().zip(WORK_GAS).map(|(&n, g)| n as f64 * g).sum::<f64>() / gas_per_ns) as u64;
 		for (unit, w) in group["unit_ns"].as_array().unwrap().iter().zip(work) {
-			let gas: f64 = w.iter().zip(WORK_GAS).map(|(&n, g)| n as f64 * g).sum();
-			costs.insert(unit[0].as_u64().unwrap().to_string(), Value::from((gas / gas_per_ns) as u64));
+			let cost = serde_json::json!({ "run": ns(&w.run), "seed": ns(&w.seed), "seeds": w.seeds });
+			costs.insert(unit[0].as_u64().unwrap().to_string(), cost);
 		}
 		if verify && group["gas"].as_f64().unwrap_or(f64::INFINITY) >= verify_min {
 			std::fs::write(format!("{out}/group-{g}.args"), &a).unwrap();
@@ -945,7 +956,7 @@ fn main() {
 				let mut pairs: serde_json::Map<String, Value> =
 					nanoda_lib::util::work::NAMES.iter().zip(counts).map(|(k, v)| (k.to_string(), Value::from(v))).collect();
 				for (k, name) in nanoda_lib::util::work::NAMES.iter().enumerate() {
-					pairs.insert(format!("in_{name}"), Value::from(calls.iter().map(|w| w[k]).sum::<u64>()));
+					pairs.insert(format!("in_{name}"), Value::from(calls.iter().map(|w| w.seed[k] + w.run[k]).sum::<u64>()));
 				}
 				println!("{}", Value::Object(pairs));
 			}

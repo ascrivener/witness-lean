@@ -56,9 +56,9 @@ pub struct PlanConfig {
     pub max_calls_bytes: usize,
     /// An op citing more judgment bytes than this cites relays instead (see `plan`).
     pub relay_bytes: usize,
-    /// Each unit's measured replay time (by its call's index in the record), in nanoseconds,
-    /// from checking an earlier plan's ops: a unit's replay doesn't depend on its op.
-    pub unit_costs: Option<std::collections::HashMap<usize, u64>>,
+    /// Each unit's measured cost (by its call's index in the record), from checking an earlier
+    /// plan's ops: its own work, and seeding what it needed that its op hadn't seeded yet.
+    pub unit_costs: Option<std::collections::HashMap<usize, UnitCost>>,
     /// Write each op's entries as several judgments, split by which ops seed them, so that an op
     /// cites only blobs holding what it needs, rather than whole ops' judgments (see `split`).
     /// Relays are then not needed.
@@ -73,6 +73,27 @@ pub struct PlanConfig {
     /// Planning in fine mode, an op's cited bytes are its needed entries' share of their ops'
     /// judgments times this.
     pub cite_factor: f64,
+}
+
+/// A unit's cost in an earlier plan's op, in `gas_per_ns` nanoseconds: its call's own work, and
+/// seeding `seeds` entries before it. Seeding depends on its op (an entry another of the op's units
+/// seeded is there already), so a plan charges each of a unit's entries its op hasn't seeded yet
+/// the unit's average.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnitCost {
+    pub run: u64,
+    pub seed: u64,
+    pub seeds: u32,
+}
+
+impl UnitCost {
+    fn total(&self) -> u64 {
+        self.run + self.seed
+    }
+
+    fn seeding(&self, new: usize) -> u64 {
+        if self.seeds == 0 { 0 } else { self.seed * new as u64 / self.seeds as u64 }
+    }
 }
 
 impl Default for PlanConfig {
@@ -118,6 +139,10 @@ pub struct Group {
     pub gas: f64,
     /// Each unit's call (its index in the record), its time and its own work, in nanoseconds.
     pub unit_ns: Vec<(usize, u64, u64)>,
+    /// What its gas estimate assumed it loads (bytes of nodes) and its units' work (in
+    /// `gas_per_ns` nanoseconds).
+    pub env: usize,
+    pub work: u64,
 }
 
 pub struct Plan {
@@ -159,6 +184,8 @@ fn result_entry<'t>(rec: &Recorder<'t>, i: usize) -> Option<Entry<'t>> {
 pub struct Env {
     pub lookups: Vec<(u32, u32)>,
     pub node_size: Vec<usize>,
+    /// Each loaded node's index, by its hash.
+    pub node_index: FxHashMap<Hash, u32>,
 }
 
 pub(crate) fn plan<'t, 'p>(
@@ -202,7 +229,7 @@ pub(crate) fn plan<'t, 'p>(
         let mut weight = vec![cfg.ns_per_call as f64; n];
         for i in 0..n {
             let u = unit_of[i];
-            if let Some(&m) = costs.get(&u) {
+            if let Some(m) = costs.get(&u).map(UnitCost::total) {
                 if m > 2 * cfg.budget_ns && m > own[u] {
                     weight[i] *= m as f64 / own[u].max(1) as f64;
                     remeasure[i] = true;
@@ -269,13 +296,41 @@ pub(crate) fn plan<'t, 'p>(
         if remeasure[u] {
             return own[u] + 3_000;
         }
-        cfg.unit_costs.as_ref().and_then(|c| c.get(&u).copied()).unwrap_or_else(|| estimate((own[u] + 3_000) as f64 * cfg.unmeasured_scale) as u64)
+        cfg.unit_costs.as_ref().and_then(|c| c.get(&u)).map(UnitCost::total).unwrap_or_else(|| estimate((own[u] + 3_000) as f64 * cfg.unmeasured_scale) as u64)
+    };
+    // Unit `u`'s cost in an op that has seeded `seeded` already: its own work, and seeding only the
+    // entries it needs that aren't there (see `UnitCost`).
+    let cost_in = |u: usize, seeded: &FxHashSet<Entry<'t>>| -> u64 {
+        match cfg.unit_costs.as_ref().and_then(|c| c.get(&u)) {
+            Some(c) if !remeasure[u] => c.run + c.seeding(need_entries[&u].iter().filter(|e| !seeded.contains(*e)).count()),
+            _ => cost(u),
+        }
+    };
+    // The cost of `us`, in order, as one op's units.
+    let op_work = |us: &[usize]| -> u64 {
+        let mut seeded: FxHashSet<Entry<'t>> = new_fx_hash_set();
+        us.iter()
+            .map(|&u| {
+                let c = cost_in(u, &seeded);
+                seeded.extend(need_entries[&u].iter().copied());
+                c
+            })
+            .sum()
     };
     // The nodes each unit looks up itself: an op loads those of its units, besides the nodes
     // every op of this declaration loads (`env_bytes`).
     let mut unit_nodes: FxHashMap<usize, FxHashSet<u32>> = new_fx_hash_map();
     for &(c, node) in &env.lookups {
         unit_nodes.entry(unit_of[c as usize]).or_default().insert(node);
+    }
+    // And the nodes declaring what the entries it publishes mention: its op's judgment imports
+    // them, and an attested judgment's imports must be loaded.
+    for &u in &units {
+        let entries: Vec<Entry<'t>> = publish[&u].iter().copied().collect();
+        if let Some(hashes) = imports(tc, &entries) {
+            let nodes = unit_nodes.entry(u).or_default();
+            nodes.extend(hashes.iter().filter_map(|h| env.node_index.get(h).copied()));
+        }
     }
     let node_bytes = |nodes: &FxHashSet<u32>| nodes.iter().map(|&k| env.node_size[k as usize]).sum::<usize>();
     let units_env = |us: &[usize]| {
@@ -313,7 +368,7 @@ pub(crate) fn plan<'t, 'p>(
         let (mut work, mut cited, mut bytes) = (0u64, 0usize, 0usize);
         // The nodes the op being built looks up, and their bytes.
         let (mut op_nodes, mut looked_up): (FxHashSet<u32>, usize) = (new_fx_hash_set(), 0);
-        // In fine mode, the entries the op being built seeds.
+        // The entries the op being built seeds.
         let mut op_entries: FxHashSet<Entry<'t>> = new_fx_hash_set();
         #[allow(clippy::too_many_arguments)]
         let close = |cur: &mut Vec<usize>,
@@ -399,7 +454,7 @@ pub(crate) fn plan<'t, 'p>(
                         let cited_bytes: usize = chunk.iter().map(|&c| blob_bytes[c]).sum();
                         blob_bytes.push(relay.len());
                         let gas = op_gas(relay.len() + calls.len(), cited_bytes, 0, 0);
-                        groups.push(Group { round: r, calls, judgments: vec![relay], blobs: vec![rg], cites: chunk, units: 0, gas, unit_ns: Vec::new() });
+                        groups.push(Group { round: r, calls, judgments: vec![relay], blobs: vec![rg], cites: chunk, units: 0, gas, unit_ns: Vec::new(), env: cfg.env_bytes, work: 0 });
                         group_calls.push(vec![(0, false, Call::Seed, ents.clone())]);
                         group_entries.push(ents.clone());
                         for (k, e) in ents.iter().enumerate() {
@@ -424,10 +479,12 @@ pub(crate) fn plan<'t, 'p>(
                     group_of.insert(u, g);
                 }
                 let cited_bytes: usize = cs.iter().map(|&c| blob_bytes[c]).sum();
-                let gas = op_gas(judgment.len() + calls.len(), cited_bytes, units_env(&units), units.iter().map(|&u| cost(u)).sum());
+                let (looked_up, work) = (units_env(&units), op_work(&units));
+                let gas = op_gas(judgment.len() + calls.len(), cited_bytes, looked_up, work);
                 blob_bytes.push(judgment.len());
                 let unit_ns = units.iter().map(|&u| (u, ns[u], own[u])).collect();
-                groups.push(Group { round: r, calls, judgments: vec![judgment], blobs: vec![g], cites: cs, units: units.len(), gas, unit_ns });
+                let env = cfg.env_bytes + looked_up;
+                groups.push(Group { round: r, calls, judgments: vec![judgment], blobs: vec![g], cites: cs, units: units.len(), gas, unit_ns, env, work });
                 group_calls.push(units.iter().zip(&unit_seeds).map(|(&u, es)| (rec.calls[u].depth, rec.calls[u].eager, rec.calls[u].call.unwrap(), es.clone())).collect());
                 group_entries.push(entries);
             }
@@ -458,7 +515,7 @@ pub(crate) fn plan<'t, 'p>(
                 add.iter().map(|&g| blob_bytes[g]).sum()
             };
             let new_nodes: usize = unit_nodes.get(&u).into_iter().flatten().filter(|k| !op_nodes.contains(*k)).map(|&k| env.node_size[k as usize]).sum();
-            let over = op_gas(bytes + unit_bytes(u), cited + add_bytes, looked_up + new_nodes, work + cost(u)) > cfg.op_gas
+            let over = op_gas(bytes + unit_bytes(u), cited + add_bytes, looked_up + new_nodes, work + cost_in(u, &op_entries)) > cfg.op_gas
                 || cites.len() + add.len() > cfg.max_cites
                 || cited + add_bytes > cfg.max_cited_bytes;
             if over && !cur.is_empty() {
@@ -473,9 +530,9 @@ pub(crate) fn plan<'t, 'p>(
                     looked_up += env.node_size[k as usize];
                 }
             }
+            work += cost_in(u, &op_entries);
             if cfg.fine {
                 cited += fine_add(u, &op_entries, &group_of, &blob_bytes, &group_entries);
-                op_entries.extend(need_entries[&u].iter().copied());
                 cites.extend(mine);
             } else {
                 for g in mine {
@@ -484,8 +541,8 @@ pub(crate) fn plan<'t, 'p>(
                     }
                 }
             }
+            op_entries.extend(need_entries[&u].iter().copied());
             cur.push(u);
-            work += cost(u);
             bytes += unit_bytes(u);
         }
         close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index, &mut group_entries, &mut group_calls)?;
