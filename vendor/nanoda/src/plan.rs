@@ -289,7 +289,6 @@ pub(crate) fn plan<'t, 'p>(
         let r = needs[&u].iter().map(|v| round.get(v).copied().ok_or("a unit needs one after it")).collect::<Result<Vec<_>, _>>()?;
         round.insert(u, 1 + r.into_iter().max().unwrap_or(0));
     }
-    let rounds = round[&0];
     // A unit's cost in its op, in native nanoseconds: its measured replay, or its own work and a
     // little per call; and the bytes its call and what it publishes add to its op.
     let cost = |u: usize| -> u64 {
@@ -360,10 +359,14 @@ pub(crate) fn plan<'t, 'p>(
     // Each group's entries, in order, and its calls with the entries each seeds (for `split`).
     let mut group_entries: Vec<Vec<Entry<'t>>> = Vec::new();
     let mut group_calls: Vec<Vec<SeededCall<'t>>> = Vec::new();
-    for r in 1..rounds {
-        let mut members: Vec<usize> = units.iter().copied().filter(|&u| u != 0 && round[&u] == r).collect();
-        members.sort_unstable();
+    // Units in round order, then call order, packed into ops across rounds: a unit's needs are in
+    // earlier rounds, so each is either in an op closed already, whose judgment it cites, or
+    // earlier in its own op, whose replay makes the entry before it runs.
+    {
+        let mut members: Vec<usize> = units.iter().copied().filter(|&u| u != 0).collect();
+        members.sort_unstable_by_key(|&u| (round[&u], u));
         let mut cur: Vec<usize> = Vec::new();
+        let mut inside: FxHashSet<usize> = new_fx_hash_set();
         let mut cites: FxHashSet<usize> = new_fx_hash_set();
         let (mut work, mut cited, mut bytes) = (0u64, 0usize, 0usize);
         // The nodes the op being built looks up, and their bytes.
@@ -390,11 +393,14 @@ pub(crate) fn plan<'t, 'p>(
                 queue.push_back(first);
             }
             while let Some(units) = queue.pop_front() {
-                // The entries each unit seeds, each once in the op, and the group that made each.
+                // The entries each unit seeds, each once in the op, and the group that made each:
+                // not those an earlier unit of the op makes.
+                let here: FxHashSet<usize> = units.iter().copied().collect();
+                let r = units.iter().map(|u| round[u]).min().unwrap_or(1);
                 let mut seeded: FxHashSet<Entry<'t>> = new_fx_hash_set();
                 let unit_seeds: Vec<Vec<Entry<'t>>> = units
                     .iter()
-                    .map(|u| need_entries[u].iter().copied().filter(|e| seeded.insert(*e)).collect())
+                    .map(|u| need_entries[u].iter().copied().filter(|e| !here.contains(&maker_unit(e)) && seeded.insert(*e)).collect())
                     .collect();
                 let mut source: FxHashMap<Entry<'t>, (usize, usize)> = seeded
                     .iter()
@@ -498,7 +504,7 @@ pub(crate) fn plan<'t, 'p>(
         let fine_add = |u: usize, op_entries: &FxHashSet<Entry<'t>>, group_of: &FxHashMap<usize, usize>, blob_bytes: &[usize], group_entries: &[Vec<Entry<'t>>]| {
             let bytes: f64 = need_entries[&u]
                 .iter()
-                .filter(|e| !op_entries.contains(*e))
+                .filter(|e| !op_entries.contains(*e) && group_of.contains_key(&maker_unit(e)))
                 .map(|e| {
                     let g = group_of[&maker_unit(e)];
                     blob_bytes[g] as f64 / group_entries[g].len().max(1) as f64
@@ -507,7 +513,7 @@ pub(crate) fn plan<'t, 'p>(
             estimate(bytes * cfg.cite_factor)
         };
         for u in members {
-            let mine: FxHashSet<usize> = needs[&u].iter().map(|v| group_of[v]).collect();
+            let mine: FxHashSet<usize> = needs[&u].iter().filter(|v| !inside.contains(*v)).map(|v| group_of[v]).collect();
             let add: Vec<usize> = mine.iter().copied().filter(|g| !cites.contains(g)).collect();
             let add_bytes: usize = if cfg.fine {
                 fine_add(u, &op_entries, &group_of, &blob_bytes, &group_entries)
@@ -515,15 +521,24 @@ pub(crate) fn plan<'t, 'p>(
                 add.iter().map(|&g| blob_bytes[g]).sum()
             };
             let new_nodes: usize = unit_nodes.get(&u).into_iter().flatten().filter(|k| !op_nodes.contains(*k)).map(|&k| env.node_size[k as usize]).sum();
+            // An earlier unit of the op is sure to make its own result (its call caches it), but
+            // not every other entry it made when traced: its replay can take a shortcut past one.
+            // So a unit needing any other entry from a unit of the op starts a new op, and seeds it.
+            let unsure = need_entries[&u].iter().any(|e| {
+                let m = maker_unit(e);
+                inside.contains(&m) && result[m] != Some(*e)
+            });
             let over = op_gas(bytes + unit_bytes(u), cited + add_bytes, looked_up + new_nodes, work + cost_in(u, &op_entries)) > cfg.op_gas
                 || cites.len() + add.len() > cfg.max_cites
-                || cited + add_bytes > cfg.max_cited_bytes;
+                || cited + add_bytes > cfg.max_cited_bytes
+                || unsure;
             if over && !cur.is_empty() {
                 close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index, &mut group_entries, &mut group_calls)?;
                 bytes = 0;
                 op_entries.clear();
                 op_nodes.clear();
                 looked_up = 0;
+                inside.clear();
             }
             for &k in unit_nodes.get(&u).into_iter().flatten() {
                 if op_nodes.insert(k) {
@@ -541,14 +556,24 @@ pub(crate) fn plan<'t, 'p>(
                     }
                 }
             }
+            // What it seeds and what it makes are in the op for its later units.
             op_entries.extend(need_entries[&u].iter().copied());
+            op_entries.extend(publish[&u].iter().copied());
             cur.push(u);
+            inside.insert(u);
             bytes += unit_bytes(u);
         }
         close(&mut cur, &mut cites, &mut work, &mut cited, &mut groups, &mut group_of, &mut blob_bytes, &mut entry_index, &mut group_entries, &mut group_calls)?;
     }
     let mut final_cites: Vec<usize> = needs[&0].iter().map(|v| group_of[v]).collect::<FxHashSet<_>>().into_iter().collect();
     final_cites.sort_unstable();
+    // Rounds of ops: an op after every op it cites (groups are made in that order).
+    let mut depth = vec![0usize; groups.len()];
+    for g in 0..groups.len() {
+        depth[g] = 1 + groups[g].cites.iter().map(|&c| depth[c]).max().unwrap_or(0);
+        groups[g].round = depth[g];
+    }
+    let rounds = 1 + final_cites.iter().map(|&c| depth[c]).max().unwrap_or(0);
     let mut blob_group: Vec<usize> = (0..groups.len()).collect();
     if cfg.fine {
         (blob_group, final_cites) = split(tc, declaration, cfg, &imports, &mut groups, &group_entries, &group_calls, &need_entries[&0])?;
