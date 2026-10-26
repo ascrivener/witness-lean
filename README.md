@@ -80,6 +80,27 @@ WITNESS_DIR=../witness LEAN4EXPORT=../lean4export/.lake/build/bin/lean4export \
 `primes` fetches Mathlib's build from its cache (`lake exe cache get`), which needs
 `cache.mathlib.org`.
 
+### All of Mathlib
+
+`scripts/mathlib-full.sh RUN_DIR` attests all of Mathlib in witness-sim, start to finish:
+1. export and convert;
+2. profile;
+3. lay out, with each heavy op near the limit run in PolkaVM;
+4. check every item natively;
+5. attest.
+
+Run it again after any stop: each step is skipped once done, and attesting resumes from the
+simulated chain. It takes many hours and over 40 GB, so run it on a machine of its own, detached:
+
+```bash
+GITHUB_TOKEN=... bash scripts/vm-setup.sh   # a fresh Ubuntu VM: toolchains, both repos, lean4export, Mathlib's cache
+tmux new -d -s mathlib "LEAN4EXPORT=~/jam/lean4export/.lake/build/bin/lean4export \
+  ~/jam/witness-lean/scripts/mathlib-full.sh ~/mathlib-run"
+tail -f ~/mathlib-run/run.log
+```
+
+`NAMES="A B"` exports only those declarations' closures, for a quick test.
+
 ## Numbers
 
 Each attestation and the reveal must fit one refine. `tools/lean-host` runs the check natively
