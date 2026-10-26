@@ -295,6 +295,38 @@ pub struct TcCtx<'t, 'p> {
     pub(crate) eager_mode: bool
 }
 
+
+/// Counts of the kernel's work, for sizing ops by what they do rather than how long they take
+/// (`lean-host`'s planner): terms looked up and newly built, names and levels looked up, and
+/// kernel calls. Native builds with `trace` only; [`count`] is nothing otherwise.
+#[cfg(feature = "trace")]
+pub mod work {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static EXPR: AtomicU64 = AtomicU64::new(0);
+    pub static EXPR_NEW: AtomicU64 = AtomicU64::new(0);
+    pub static NAME: AtomicU64 = AtomicU64::new(0);
+    pub static LEVEL: AtomicU64 = AtomicU64::new(0);
+    pub static CALL: AtomicU64 = AtomicU64::new(0);
+    const ALL: [&AtomicU64; 5] = [&EXPR, &EXPR_NEW, &NAME, &LEVEL, &CALL];
+    /// The counters' names, in [`read`]'s order.
+    pub const NAMES: [&str; 5] = ["expr", "expr_new", "name", "level", "call"];
+    pub fn reset() {
+        ALL.iter().for_each(|c| c.store(0, Relaxed));
+    }
+    pub fn read() -> [u64; 5] {
+        ALL.map(|c| c.load(Relaxed))
+    }
+}
+
+/// Count one unit of kernel work in [`work`], with `trace`.
+macro_rules! count {
+    ($c:ident) => {
+        #[cfg(feature = "trace")]
+        crate::util::work::$c.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    };
+}
+pub(crate) use count;
+
 impl<'t, 'p: 't> TcCtx<'t, 'p> {
     pub fn new(export_file: &'t ExportFile<'p>, tdag: &'t mut LeanDag<'t>) -> Self {
         Self { 
@@ -390,6 +422,7 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     /// already stored, forego the allocation and return a pointer to the previously inserted
     /// element. Checks the longer-lived storage first.
     pub fn alloc_name(&mut self, n: Name<'t>) -> NamePtr<'t> {
+        count!(NAME);
         if let Some(idx) = self.export_file.dag.names.get_index_of(&n) {
             Ptr::from(DagMarker::ExportFile, idx)
         } else {
@@ -401,6 +434,7 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     /// already stored, forego the allocation and return a pointer to the previously inserted
     /// element. Checks the longer-lived storage first.
     pub fn alloc_level(&mut self, l: Level<'t>) -> LevelPtr<'t> {
+        count!(LEVEL);
         if let Some(idx) = self.export_file.dag.levels.get_index_of(&l) {
             Ptr::from(DagMarker::ExportFile, idx)
         } else {
@@ -412,10 +446,15 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     /// already stored, forego the allocation and return a pointer to the previously inserted
     /// element. Checks the longer-lived storage first.
     pub fn alloc_expr(&mut self, e: Expr<'t>) -> ExprPtr<'t> {
+        count!(EXPR);
         if let Some(idx) = self.export_file.dag.exprs.get_index_of(&e) {
             Ptr::from(DagMarker::ExportFile, idx)
         } else {
-            Ptr::from(DagMarker::TcCtx, self.dag.exprs.insert_full(e).0)
+            let (idx, new) = self.dag.exprs.insert_full(e);
+            if new {
+                count!(EXPR_NEW);
+            }
+            Ptr::from(DagMarker::TcCtx, idx)
         }
     }
 

@@ -399,9 +399,16 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	// and PLAN_CITE_FACTOR (see PlanConfig).
 	let var = |k: &str| std::env::var(k).ok().map(|v| v.parse::<f64>().expect("a number"));
 	let defaults = nanoda_lib::plan::PlanConfig::default();
+	// What every op of this declaration loads besides what its units look up: the declaration's
+	// node, what its statement imports, and the check's pinned nodes (`judgments-ops`).
+	let sizes: std::collections::HashMap<Hash, usize> = input.blobs().filter(|b| b.trusted).map(|b| (*b.hash, b.data.len())).collect();
+	let mut fixed: std::collections::BTreeSet<Hash> = import_hashes(&node.data[nanoda_lib::nodes::NODE_MAGIC.len()..]).into_iter().collect();
+	fixed.extend(lean_check::PINS.chunks(32).map(|c| <Hash>::try_from(c).unwrap()));
+	let env_bytes = node_len + fixed.iter().filter_map(|h| sizes.get(h)).sum::<usize>();
 	let cfg = nanoda_lib::plan::PlanConfig {
 		budget_ns: (budget_ms * 1e6) as u64,
 		unit_costs,
+		env_bytes,
 		max_calls_bytes: var("PLAN_CALLS_KB").map_or(64 * 1024 - 1024 - node_len, |kb| (kb * 1024.0) as usize),
 		op_gas: var("PLAN_OP_GAS").unwrap_or(defaults.op_gas),
 		relay_bytes: var("PLAN_RELAY_MB").map_or(defaults.relay_bytes, |mb| (mb * 1e6) as usize),
@@ -755,6 +762,11 @@ fn hex_of(h: &Hash) -> String {
 	h.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The gas a unit of each kernel work counter costs (`nanoda_lib::util::work::NAMES`'s order: terms
+/// looked up, terms newly built, names, levels, calls), fit by least squares to ops of nine heavy
+/// declarations run in PolkaVM, with the planner's per-byte terms (`PlanConfig`).
+const WORK_GAS: [f64; 5] = [4517.1, 0.0, 7212.8, 10170.2, 13182.3];
+
 /// Trace every op of a judgment plan in the theorem's whole closure, loaded once, and write what
 /// each op trusts, cites and carries (see the usage).
 fn judgments_ops(full: &str, out: &str) {
@@ -835,10 +847,6 @@ fn judgments_ops(full: &str, out: &str) {
 			failed += 1;
 			println!("group {g} FAILED");
 		}
-		let times = nanoda_lib::judgment::CALL_TIMES.lock().unwrap().clone();
-		for (unit, ns) in group["unit_ns"].as_array().unwrap().iter().zip(times) {
-			costs.insert(unit[0].as_u64().unwrap().to_string(), Value::from(ns));
-		}
 		for j in &mine {
 			keep.extend(nanoda_lib::judgment::header(j).unwrap().imports);
 		}
@@ -847,20 +855,29 @@ fn judgments_ops(full: &str, out: &str) {
 		keep.remove(&node_hash);
 		let witness = encode(&[node.clone(), calls]);
 		std::fs::write(format!("{out}/group-{g}.witness"), &witness).unwrap();
+		// The op as the layout runs it, checked natively and cold (parsed and rebuilt afresh, as in
+		// PolkaVM): each unit's cost for the next plan is the kernel work its call did there,
+		// seeding included, in gas (WORK_GAS) as the planner's nanoseconds.
+		let by_hash: std::collections::HashMap<Hash, &[u8]> = closure.iter().map(|d| (blake2b256(d), &d[..])).collect();
+		let mut blobs: Vec<(bool, &[u8])> = keep.iter().map(|h| (true, by_hash[h])).collect();
+		blobs.extend(cited_refs.iter().map(|c| (true, *c)));
+		blobs.extend(mine.iter().map(|j| (false, &j[..])));
+		let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
+		let check_blobs: Vec<CheckBlob> = blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
+		let a = check_args(CheckMode::Attest, &check_blobs, &[], &witness);
+		let input = witness_check::Input::parse(&a).unwrap();
+		if !std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false) {
+			println!("group {g} FAILED trimmed");
+			failed += 1;
+		}
+		let work = nanoda_lib::judgment::CALL_WORK.lock().unwrap().clone();
+		let gas_per_ns = nanoda_lib::plan::PlanConfig::default().gas_per_ns;
+		for (unit, w) in group["unit_ns"].as_array().unwrap().iter().zip(work) {
+			let gas: f64 = w.iter().zip(WORK_GAS).map(|(&n, g)| n as f64 * g).sum();
+			costs.insert(unit[0].as_u64().unwrap().to_string(), Value::from((gas / gas_per_ns) as u64));
+		}
 		if verify && group["gas"].as_f64().unwrap_or(f64::INFINITY) >= verify_min {
-			let by_hash: std::collections::HashMap<Hash, &[u8]> = closure.iter().map(|d| (blake2b256(d), &d[..])).collect();
-			let mut blobs: Vec<(bool, &[u8])> = keep.iter().map(|h| (true, by_hash[h])).collect();
-			blobs.extend(cited_refs.iter().map(|c| (true, *c)));
-			blobs.extend(mine.iter().map(|j| (false, &j[..])));
-			let hashes: Vec<Hash> = blobs.iter().map(|(_, d)| blake2b256(d)).collect();
-			let check_blobs: Vec<CheckBlob> = blobs.iter().zip(&hashes).map(|((t, d), h)| CheckBlob { trusted: *t, hash: *h, data: d }).collect();
-			let a = check_args(CheckMode::Attest, &check_blobs, &[], &witness);
 			std::fs::write(format!("{out}/group-{g}.args"), &a).unwrap();
-			let input = witness_check::Input::parse(&a).unwrap();
-			if !std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false) {
-				println!("group {g} FAILED trimmed");
-				failed += 1;
-			}
 		}
 		ops.push(serde_json::json!({
 			"name": format!("group-{g}"),
@@ -918,8 +935,20 @@ fn main() {
 			let args = std::fs::read(args).expect("arguments");
 			let input = witness_check::Input::parse(&args).expect("well-formed arguments");
 			let start = Instant::now();
+			nanoda_lib::util::work::reset();
 			let ok = std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false);
 			println!("{ok} in {:?}", start.elapsed());
+			// WORK_COUNTS: the kernel work the check did, as JSON.
+			if std::env::var_os("WORK_COUNTS").is_some() {
+				let counts = nanoda_lib::util::work::read();
+				let calls = nanoda_lib::judgment::CALL_WORK.lock().unwrap().clone();
+				let mut pairs: serde_json::Map<String, Value> =
+					nanoda_lib::util::work::NAMES.iter().zip(counts).map(|(k, v)| (k.to_string(), Value::from(v))).collect();
+				for (k, name) in nanoda_lib::util::work::NAMES.iter().enumerate() {
+					pairs.insert(format!("in_{name}"), Value::from(calls.iter().map(|w| w[k]).sum::<u64>()));
+				}
+				println!("{}", Value::Object(pairs));
+			}
 		},
 		["declarations-args", args, positions, out] => declarations_args(args, positions, out),
 		["judgments", args, out] => judgments(args, out, 25.0, None),

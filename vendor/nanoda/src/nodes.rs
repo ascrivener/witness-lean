@@ -67,6 +67,8 @@ pub struct LoadedNode {
     pub theorem: bool,
     /// A theorem statement loaded without its proof.
     pub assumed: bool,
+    /// Its node's length, in bytes.
+    pub size: usize,
 }
 
 pub struct NodeLoader<'p> {
@@ -172,6 +174,7 @@ impl<'p> NodeLoader<'p> {
         if self.is_loaded(&hash) {
             return Err("node loaded twice".into());
         }
+        let size = node.len();
         let node = header(node.strip_prefix(NODE_MAGIC).ok_or("not a node")?)?;
         let start = self.parser.declars.len();
         let exprs = self.parser.go_node(node.items)?;
@@ -233,7 +236,7 @@ impl<'p> NodeLoader<'p> {
             self.declared_by.insert(*name, hash);
         }
         let i = self.nodes.len();
-        self.nodes.push(LoadedNode { hash, declars: start..self.parser.declars.len(), theorem, assumed });
+        self.nodes.push(LoadedNode { hash, declars: start..self.parser.declars.len(), theorem, assumed, size });
         self.index.insert(hash, i);
         Ok(i)
     }
@@ -412,12 +415,12 @@ impl<'p> Nodes<'p> {
             #[cfg(feature = "trace")]
             let (mut seeding, mut slow) = (core::time::Duration::ZERO, Vec::new());
             #[cfg(feature = "trace")]
-            let mut times = Vec::new();
+            let (mut times, mut work) = (Vec::new(), Vec::new());
             // Each call runs seeded with what it needs, just before it: no call sees an entry its
             // own check, in the whole declaration's, made only later.
             for (depth, eager, call, seeds) in calls {
                 #[cfg(feature = "trace")]
-                let ts = std::time::Instant::now();
+                let (ts, w0) = (std::time::Instant::now(), crate::util::work::read());
                 for (j, k) in seeds {
                     let l = lazy.get_mut(j).ok_or("a seed from a judgment not cited")?;
                     let entry = l.entry(tc, k, &mut |n| Self::known(&declared_by, &imports[j], false, n))?;
@@ -431,11 +434,14 @@ impl<'p> Nodes<'p> {
                     seeding += tc0 - ts;
                     slow.push(tc0.elapsed().as_micros());
                     times.push(u64::try_from(ts.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                    let w1 = crate::util::work::read();
+                    work.push(core::array::from_fn::<u64, 5, _>(|k| w1[k] - w0[k]));
                 }
             }
             #[cfg(feature = "trace")]
             {
                 *judgment::CALL_TIMES.lock().unwrap() = times;
+                *judgment::CALL_WORK.lock().unwrap() = work;
             }
             #[cfg(feature = "trace")]
             if std::env::var_os("NANODA_OP_TIMES").is_some() {
@@ -495,14 +501,29 @@ impl<'p> Nodes<'p> {
             _ => return Err("judgments for a declaration without a value".into()),
         };
         let hash = self.nodes[i].hash;
+        // Which node declares each declaration, and each node's size: for estimating what an op
+        // loads from the nodes its units look up.
+        let mut declar_node = vec![u32::MAX; self.file.declars.len()];
+        for (k, node) in self.nodes.iter().enumerate() {
+            for dd in node.declars.clone() {
+                declar_node[dd] = k as u32;
+            }
+        }
+        let node_size: Vec<usize> = self.nodes.iter().map(|n| n.size).collect();
         self.file.with_tc_and_declar(*d.info(), |tc| {
+            trace::start_log();
             tc.rec = Some(Box::new(crate::record::Recorder::new()));
             tc.check_declar_info(d).unwrap();
             let inferred_type = tc.infer(val, InferFlag::Check);
             tc.assert_def_eq(inferred_type, d.info().ty);
             let mut rec = tc.rec.take().unwrap();
             rec.finish();
-            crate::plan::plan(tc, &rec, &hash, cfg, |tc, entries| {
+            let lookups: Vec<(u32, u32)> = trace::take_log()
+                .into_iter()
+                .filter_map(|(c, dd)| declar_node.get(dd).copied().filter(|&n| n != u32::MAX && n as usize != i).map(|n| (c, n)))
+                .collect();
+            let env = crate::plan::Env { lookups, node_size };
+            crate::plan::plan(tc, &rec, &hash, cfg, &env, |tc, entries| {
                 let imports = self.judgment_imports(tc, entries);
                 if imports.is_none() {
                     for n in judgment::mentions(tc, entries).into_iter().filter(|&n| self.declared_by(n).is_none()) {
@@ -562,17 +583,43 @@ pub mod trace {
         collections::BTreeSet,
         sync::{
             Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU32, Ordering},
         },
     };
+    use std::vec::Vec;
 
     static ON: AtomicBool = AtomicBool::new(false);
     static LOOKUPS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+    // The per-call log, for planning: each lookup with the recorded call making it.
+    static LOG_ON: AtomicBool = AtomicBool::new(false);
+    static CALL: AtomicU32 = AtomicU32::new(0);
+    static LOG: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
 
     pub(crate) fn record(declar: usize) {
         if ON.load(Ordering::Relaxed) {
             LOOKUPS.lock().unwrap().insert(declar);
         }
+        if LOG_ON.load(Ordering::Relaxed) {
+            LOG.lock().unwrap().push((CALL.load(Ordering::Relaxed), declar));
+        }
+    }
+
+    /// The recorded call now running (`record::Recorder`), for the per-call log.
+    pub(crate) fn set_call(call: u32) {
+        CALL.store(call, Ordering::Relaxed);
+    }
+
+    /// Start the per-call log.
+    pub(crate) fn start_log() {
+        LOG.lock().unwrap().clear();
+        CALL.store(0, Ordering::Relaxed);
+        LOG_ON.store(true, Ordering::Relaxed);
+    }
+
+    /// Stop the per-call log, and return it: (call, declaration) pairs.
+    pub(crate) fn take_log() -> Vec<(u32, usize)> {
+        LOG_ON.store(false, Ordering::Relaxed);
+        core::mem::take(&mut *LOG.lock().unwrap())
     }
 
     /// Start recording.

@@ -540,6 +540,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     fn infer_core(&mut self, e: ExprPtr<'t>, flag: InferFlag) -> ExprPtr<'t> {
+        crate::util::count!(CALL);
         if let Some(cached) = self.tc_cache.infer_cache_check.get(&e).copied() {
             self.note_hit(|| Entry::Infer(e, cached));
             return cached
@@ -806,6 +807,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     fn whnf_core(&mut self, e: ExprPtr<'t>) -> ExprPtr<'t> {
+        crate::util::count!(CALL);
         if matches!(self.ctx.read_expr(e), NatLit { .. } | StringLit { .. }) {
             return e
         }
@@ -1015,6 +1017,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     fn def_eq_core(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
+        crate::util::count!(CALL);
         if let Some(easy) = self.def_eq_quick_check(x, y) {
             return easy
         }
