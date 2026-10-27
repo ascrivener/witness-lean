@@ -453,10 +453,12 @@ fn judgments(args: &str, out: &str, budget_ms: f64, costs: Option<&str>) {
 	});
 	std::fs::write(format!("{out}/plan.json"), serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
 	let max_gas = plan.groups.iter().map(|g| g.gas).fold(plan.final_gas, f64::max);
-	// Planned with measured costs, an op estimated over what witness lets a check use won't pass.
-	let over = plan.groups.iter().filter(|g| g.gas > 5e9).count();
+	// Planned with measured costs, an op estimated over what witness lets a check use won't pass,
+	// unless the estimate is high: PLAN_MAX_GAS raises the limit, to measure the ops in PolkaVM.
+	let limit = var("PLAN_MAX_GAS").unwrap_or(5e9);
+	let over = plan.groups.iter().filter(|g| g.gas > limit).count();
 	if cfg.unit_costs.is_some() && over > 0 {
-		eprintln!("{over} ops estimated over 5e9 gas (max {max_gas:.2e}): a unit too heavy to cut");
+		eprintln!("{over} ops estimated over {limit:.2e} gas (max {max_gas:.2e}): a unit too heavy to cut");
 		std::process::exit(1);
 	}
 	println!(

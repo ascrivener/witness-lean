@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Lay out attesting all of Mathlib for witness's attest-batches.py, heavy declarations included.
 
-    mathlib_work.py PACK PROFILE WORK [--budget-ms MS] [--jobs N] [--lean-host PATH] [--trust-builtins]
+    mathlib_work.py PACK PROFILE WORK [--gas-per-ms G] [--budget-ms MS] [--jobs N] [--lean-host PATH]
+                    [--trust-builtins]
                     [--sim WITNESS_SIM --check LEAN_CHECK]
 
 PACK is a `lean-host convert --pack` directory (with manifest.jsonl) and PROFILE its `lean-host
-profile`. Batches are planned as plan_profile.py plans them, at MS (default 40) estimated native
-milliseconds a batch. A node too slow for any batch alone is *heavy*:
+profile`. Batches are planned as plan_profile.py plans them, at MS estimated native milliseconds a
+batch. The profile is timed, so MS depends on the machine: G is what a native millisecond costs in
+gas here (default 80M, an M3's; GCP's 2.8 GHz Xeons are about half that; tools/lean/gas_per_ms.py
+measures it), and MS defaults to 3.2×10⁹ gas's worth (40 ms on an M3). A node too slow for any
+batch alone is *heavy*:
 - an inductive block is split by declaration and phase (`lean-host split-inductive`);
 - a theorem or definition is checked in judgments: `lean-host judgments` and `judgments-ops`,
   twice, the second plan grouping by the costs the first measured.
 With --sim and --check, each heavy op planned at 5×10⁸ gas or more is run in PolkaVM, and a
 declaration with one over 4.5×10⁹ is planned again with smaller ops (the plan's estimates, from
-replays timed natively, can be a few times short). Heavy nodes are done in N parallel jobs
+replays timed natively, can be a few times short). PolkaVM has the last word: an op estimated over
+5×10⁹ is still run there, as the estimate can as well be high. Heavy nodes are done in N parallel jobs
 (default 6), in WORK/heavy/HASH, and skipped when done (their ops.json exists), so a run can be
 resumed.
 
@@ -48,7 +53,8 @@ import plan_profile  # noqa: E402
 
 MAX_WITNESS = 60000  # under witness's MAX_WITNESS_LEN of 64 KiB, as lean_batches.py
 PINS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../check/pins.txt")
-GAS_PER_MS = 80e6  # this machine (tools/lean/gas_per_ms.py)
+GAS_PER_MS = 80e6  # an M3 (tools/lean/gas_per_ms.py)
+BUDGET_GAS = 3.2e9  # a batch's budget, in gas: --budget-ms defaults to it at --gas-per-ms
 # With --sim: heavy ops planned at VERIFY_MIN gas or more are run in PolkaVM, and none may use
 # more than VERIFY_LIMIT (of a refine's 5e9), in up to ATTEMPTS plans. DEFAULT_OP_GAS is
 # lean-host's op budget.
@@ -93,8 +99,10 @@ def heavy_job(a, h, kind, closure_file):
     # can be some times short (a replay timed natively, in one warm process), so an op over
     # VERIFY_LIMIT has the declaration planned again with ops smaller in proportion.
     op_gas = None
+    # PolkaVM checks the ops, so lean-host plans them whatever it estimates.
+    limit = {"PLAN_MAX_GAS": "1e12"} if a.sim else {}
     for attempt in range(ATTEMPTS):
-        env = {**os.environ, **({"PLAN_OP_GAS": str(op_gas)} if op_gas else {})}
+        env = {**os.environ, **limit, **({"PLAN_OP_GAS": str(op_gas)} if op_gas else {})}
         for p in ("p1", "p2"):
             costs = [str(25), f"{d}/p1/costs.json"] if p == "p2" else [str(25)]
             run("judgments", full, f"{d}/{p}", *costs, env=env)
@@ -111,9 +119,12 @@ def heavy_job(a, h, kind, closure_file):
             args = f"{d}/p2/group-{g}.args"
             if not os.path.exists(args):
                 continue
-            out = subprocess.run([a.sim, "check", a.check, args, str(10**11)], capture_output=True, text=True).stdout
+            out = subprocess.run([a.sim, "check", a.check, args, str(10**11)], capture_output=True, text=True)
             os.remove(args)
-            used = int(re.search(r"used (\d+) gas", out).group(1))
+            m = re.search(r"used (\d+) gas", out.stdout)
+            if not m:  # witness-sim refused the check, as BadCheckBlob without a sandbox
+                raise subprocess.CalledProcessError(1, "witness-sim check", out.stdout, out.stderr)
+            used = int(m.group(1))
             if used > worst:
                 worst, worst_planned = used, group["gas"]
         if worst <= VERIFY_LIMIT:
@@ -146,7 +157,8 @@ def op_ref(r):
 def main():
     p = argparse.ArgumentParser(usage=__doc__)
     p.add_argument("pack"); p.add_argument("profile"); p.add_argument("work")
-    p.add_argument("--budget-ms", type=float, default=40)
+    p.add_argument("--gas-per-ms", type=float, default=GAS_PER_MS)
+    p.add_argument("--budget-ms", type=float)
     p.add_argument("--jobs", type=int, default=6)
     p.add_argument("--lean-host", default=os.path.join(os.path.dirname(__file__), "../../target/release/lean-host"))
     p.add_argument("--trust-builtins", action="store_true")
@@ -154,6 +166,7 @@ def main():
     p.add_argument("--check", help="the Lean check blob, with --sim")
     a = p.parse_args()
     a.work = os.path.abspath(a.work)
+    a.budget_ms = a.budget_ms or BUDGET_GAS / a.gas_per_ms
     os.makedirs(f"{a.work}/heavy", exist_ok=True)
     entries = [json.loads(l) for l in open(f"{a.pack}/manifest.jsonl")]
     hashes = [e["hash"] for e in entries]
@@ -271,7 +284,7 @@ def main():
             write(n, files, refs, proofs, 4e9)
             continue
         nodes = sorted(set(hashes[i] for i in trusted) | set(below(level, subjects)))
-        write(n, files, node_refs(nodes), proofs, ms * GAS_PER_MS)
+        write(n, files, node_refs(nodes), proofs, ms * a.gas_per_ms)
     print(f"{len(batches)} batches and {ops_written} heavy ops", file=sys.stderr)
     print(total)
 

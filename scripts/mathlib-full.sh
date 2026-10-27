@@ -23,6 +23,9 @@
 #   PYTHON        a python3 with numpy (default: python3)
 #   JOBS          parallel jobs (default: cores less one)
 #   ATTESTERS     attesters, as a1,a2,... (default: three a core)
+#   GAS_PER_MS    what a native millisecond of checking costs in gas on this machine, which the
+#                 layout's time budgets scale by (default 80000000, an M3's; about 40000000 on
+#                 GCP's 2.8 GHz Xeons; tools/lean/gas_per_ms.py measures it)
 #   NAMES         declarations whose closure alone to export (space-separated), for a smoke test
 set -euo pipefail
 # Rust's and Lean's tools, as installed by rustup and elan (scripts/vm-setup.sh): a shell started
@@ -39,6 +42,7 @@ LEAN4EXPORT=${LEAN4EXPORT:-$(command -v lean4export || true)}
 PYTHON=${PYTHON:-python3}
 CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 JOBS=${JOBS:-$((CORES > 1 ? CORES - 1 : 1))}
+GAS_PER_MS=${GAS_PER_MS:-80000000}
 ATTESTERS=${ATTESTERS:-$("$PYTHON" -c "print(','.join(f'a{i}' for i in range(1, 3 * $CORES + 1)))")}
 PACK=$RUN/pack PROFILE=$RUN/profile WORK=$RUN/work
 HOST=$REPO/target/release/lean-host
@@ -72,6 +76,7 @@ if [ ! -f "$WORK/items" ]; then
 	step "laying out"
 	mkdir -p "$WORK"
 	"$PYTHON" tools/lean/mathlib_work.py "$PACK" "$PROFILE" "$WORK" --jobs "$JOBS" --lean-host "$HOST" \
+		--gas-per-ms "$GAS_PER_MS" \
 		--sim "$SIM" --check "$REPO/out/lean-check.jam" >"$WORK/items.tmp"
 	mv "$WORK/items.tmp" "$WORK/items"
 fi
