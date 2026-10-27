@@ -119,9 +119,12 @@ def heavy_job(a, h, kind, closure_file):
             args = f"{d}/p2/group-{g}.args"
             if not os.path.exists(args):
                 continue
-            out = subprocess.run([a.sim, "check", a.check, args, str(10**11)], capture_output=True, text=True).stdout
+            out = subprocess.run([a.sim, "check", a.check, args, str(10**11)], capture_output=True, text=True)
             os.remove(args)
-            used = int(re.search(r"used (\d+) gas", out).group(1))
+            m = re.search(r"used (\d+) gas", out.stdout)
+            if not m:  # witness-sim refused the check, as BadCheckBlob without a sandbox
+                raise subprocess.CalledProcessError(1, "witness-sim check", out.stdout, out.stderr)
+            used = int(m.group(1))
             if used > worst:
                 worst, worst_planned = used, group["gas"]
         if worst <= VERIFY_LIMIT:

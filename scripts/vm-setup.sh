@@ -70,6 +70,22 @@ step "building"
 (cd "$DIR/witness-lean" && cargo build -q --release -p lean-host && cargo jam-build --out-dir out >/dev/null)
 (cd "$DIR/witness" && cargo build -q --release -p witness-sim -p witness-cli)
 
+# PolkaVM's sandbox also needs a user namespace, which Ubuntu 24.04's AppArmor denies unconfined
+# programs (kernel.apparmor_restrict_unprivileged_userns): without one, too, every check is
+# BadCheckBlob. A profile allows it for witness-sim alone.
+step "AppArmor: user namespaces for witness-sim"
+if [ -d /etc/apparmor.d ]; then
+	sudo tee /etc/apparmor.d/witness-sim >/dev/null <<PROFILE
+abi <abi/4.0>,
+include <tunables/global>
+
+profile witness-sim $DIR/witness/target/release/witness-sim flags=(unconfined) {
+  userns,
+}
+PROFILE
+	sudo apparmor_parser -r /etc/apparmor.d/witness-sim
+fi
+
 cat <<EOF
 
 Ready. Start the run with:
