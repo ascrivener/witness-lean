@@ -15,11 +15,12 @@ batch alone is *heavy*:
 - a theorem or definition is checked in judgments: `lean-host judgments` and `judgments-ops`,
   twice, the second plan grouping by the costs the first measured.
 With --sim and --check, each heavy op planned at 5×10⁸ gas or more is run in PolkaVM, and a
-declaration with one over 4.5×10⁹ is planned again with smaller ops (the plan's estimates, from
-replays timed natively, can be a few times short). PolkaVM has the last word: an op estimated over
-5×10⁹ is still run there, as the estimate can as well be high. Heavy nodes are done in N parallel jobs
-(default 6), in WORK/heavy/HASH, and skipped when done (their ops.json exists), so a run can be
-resumed.
+declaration with one over 4.5×10⁹ is planned again, with every unit measured so far, and smaller
+ops (the plan's estimates, from replays timed natively, can be a few times short). PolkaVM has the
+last word: an op estimated over 5×10⁹ is still run there, as the estimate can as well be high, and
+one measured over 4.5×10⁹ but under 5×10⁹ passes once planning again stops changing the plan.
+Heavy nodes are done in N parallel jobs (default 6), in WORK/heavy/HASH, and skipped when done
+(their ops.json exists), so a run can be resumed.
 
 Every batch and op also trusts, where attested below its depth, the check's pinned nodes: those
 declaring the names nanoda treats specially (`Nat.add` and its other natively computed functions,
@@ -43,6 +44,7 @@ import concurrent.futures as cf
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -59,6 +61,7 @@ BUDGET_GAS = 3.2e9  # a batch's budget, in gas: --budget-ms defaults to it at --
 # more than VERIFY_LIMIT (of a refine's 5e9), in up to ATTEMPTS plans. DEFAULT_OP_GAS is
 # lean-host's op budget.
 VERIFY_MIN, VERIFY_LIMIT, DEFAULT_OP_GAS, ATTEMPTS = 5e8, 4.5e9, 3e9, 6
+MAX_CHECK_GAS = 5e9  # witness's: an op measured under it passes, if planning can't do better
 
 
 class Pack:
@@ -96,25 +99,34 @@ def heavy_job(a, h, kind, closure_file):
         os.remove(full)  # tens of megabytes, made again if needed
         return
     # Plan, and with --sim run each op planned near the limit in PolkaVM: the plan's estimates
-    # can be some times short (a replay timed natively, in one warm process), so an op over
-    # VERIFY_LIMIT has the declaration planned again with ops smaller in proportion.
+    # can be some times short, above all for a unit the second plan cut anew, which the first
+    # didn't measure. An op over VERIFY_LIMIT has the declaration planned again, with every unit
+    # measured so far (the first plan's, and each later plan's cold checks of its ops), so a unit
+    # found heavy is cut smaller; an op of several units also has ops smaller in proportion.
     op_gas = None
     # PolkaVM checks the ops, so lean-host plans them whatever it estimates.
     limit = {"PLAN_MAX_GAS": "1e12"} if a.sim else {}
+    costs = f"{d}/costs.json"  # each unit's measured cost, by its call: units don't depend on the plan
+    last = None
     for attempt in range(ATTEMPTS):
         env = {**os.environ, **limit, **({"PLAN_OP_GAS": str(op_gas)} if op_gas else {})}
-        for p in ("p1", "p2"):
-            costs = [str(25), f"{d}/p1/costs.json"] if p == "p2" else [str(25)]
-            run("judgments", full, f"{d}/{p}", *costs, env=env)
-            verify = {"VERIFY": "1", "VERIFY_MIN_GAS": str(VERIFY_MIN)} if p == "p2" and a.sim else {}
-            out = run("judgments-ops", full, f"{d}/{p}", env={**env, **verify})
-            if verify and "FAILED" in out:
-                raise subprocess.CalledProcessError(1, "judgments-ops", out, "an op fails natively")
+        if attempt == 0:
+            run("judgments", full, f"{d}/p1", str(25), env=env)
+            run("judgments-ops", full, f"{d}/p1", env=env)
+            shutil.copy(f"{d}/p1/costs.json", costs)
+        run("judgments", full, f"{d}/p2", str(25), costs, env=env)
+        verify = {"VERIFY": "1", "VERIFY_MIN_GAS": str(VERIFY_MIN)} if a.sim else {}
+        out = run("judgments-ops", full, f"{d}/p2", env={**env, **verify})
+        if verify and "FAILED" in out:
+            raise subprocess.CalledProcessError(1, "judgments-ops", out, "an op fails natively")
         if not a.sim:
             attempt = 0
             break
+        measured = json.load(open(costs))
+        measured.update(json.load(open(f"{d}/p2/costs.json")))
+        json.dump(measured, open(costs, "w"))
         groups = json.load(open(f"{d}/p2/plan.json"))["groups"]
-        worst, worst_planned = 0, 0
+        worst, worst_units = 0, 0
         for g, group in enumerate(groups):
             args = f"{d}/p2/group-{g}.args"
             if not os.path.exists(args):
@@ -126,12 +138,21 @@ def heavy_job(a, h, kind, closure_file):
                 raise subprocess.CalledProcessError(1, "witness-sim check", out.stdout, out.stderr)
             used = int(m.group(1))
             if used > worst:
-                worst, worst_planned = used, group["gas"]
+                worst, worst_units = used, group["units"]
         if worst <= VERIFY_LIMIT:
             break
-        if attempt == ATTEMPTS - 1:
+        # VERIFY_LIMIT leaves room for the estimates' error, but these ops were measured: when
+        # planning again changes nothing (a unit as small as it cuts), one under witness's limit
+        # passes as measured.
+        plan = [(g["units"], g["unit_ns"]) for g in groups]
+        if plan == last or attempt == ATTEMPTS - 1:
+            if worst <= MAX_CHECK_GAS:
+                print(f"heavy {h}: an op uses {worst:.3g} gas, measured, as small as planning makes it", file=sys.stderr, flush=True)
+                break
             raise subprocess.CalledProcessError(1, "judgments", f"an op still uses {worst:.3g} gas", "")
-        op_gas = (op_gas or DEFAULT_OP_GAS) * 0.8 * VERIFY_LIMIT / worst
+        last = plan
+        if worst_units > 1:
+            op_gas = (op_gas or DEFAULT_OP_GAS) * 0.8 * VERIFY_LIMIT / worst
     # The second plan's ops, with paths relative to WORK/heavy/h.
     o = json.load(open(f"{d}/p2/ops.json"))
     for op in o["ops"]:
