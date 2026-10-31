@@ -62,7 +62,11 @@ case "${1:-gcd}" in
 	aeneas-correct)
 		# The same function, proved to decode exactly the LEB128 value of the bytes it takes.
 		PROJECT=spike/aeneas/lean SOLUTION_MODULE=Leb128Spec THEOREM=leb128.decode_u32_correct GAS=4500000000 ;;
-	*) echo "usage: $0 [gcd|primes|flt4|fta|aeneas|aeneas-correct]" >&2; exit 2 ;;
+	aeneas-fnv)
+		# The fnv crate (1.0.7, from crates.io) as Aeneas translates it: its Hasher::write computes
+		# exactly FNV-1a.
+		PROJECT=spike/aeneas/lean SOLUTION_MODULE=FnvSpec THEOREM=fnv.write_spec GAS=4500000000 ;;
+	*) echo "usage: $0 [gcd|primes|flt4|fta|aeneas|aeneas-correct|aeneas-fnv]" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 JAMT=${POLKAJAM_DIR:+$POLKAJAM_DIR/}jamt

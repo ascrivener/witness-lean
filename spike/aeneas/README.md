@@ -19,7 +19,7 @@ probe/       common Rust features, run through Charon and Aeneas to see what tra
 pins-v4.35.0.*  the pins lean_pins.py makes for Lean v4.35.0
 ```
 
-`scripts/lean-e2e.sh aeneas` and `aeneas-correct` run the two theorems as bounties in
+`scripts/lean-e2e.sh aeneas`, `aeneas-correct` and `aeneas-fnv` run the theorems as bounties in
 witness-sim. Each is posted, committed, revealed and paid, after Aeneas's library closure is
 attested.
 
@@ -68,6 +68,24 @@ Run through Charon and Aeneas nightly-2026.10.31:
 | iterator adaptors with closures (`iter().copied().max_by_key(...)`) | **Aeneas fails** on the whole crate, until the function is removed |
 
 Not tried: `unsafe` (Aeneas doesn't support it), concurrency, `dyn`, complex lifetimes.
+
+## Real crates (real/)
+
+Five small, widely used crates from crates.io, unmodified, run through Charon and Aeneas, then
+type-checked in Lean. "Axioms" are standard-library items Aeneas has no model for: any proof whose
+closure reaches one is refused by the check.
+
+| Crate | Lines | Translation | Lean | Notes |
+|---|---:|---|---|---|
+| fnv 1.0.7 | 367 | complete | type-checks | 3 axioms, all `HashMap`/`HashSet` type aliases the hasher doesn't use. **`Hasher::write` is proved to compute exactly FNV-1a** (`lean/FnvSpec.lean`, a 46-line file), and checked in witness-sim (`lean-e2e.sh aeneas-fnv`): a 3,793-node library in 130 batches, max 1.2×10⁹ gas, then a reveal of 2.8×10⁷. |
+| crc32fast 1.4.2 | 1,390 | complete | type-checks | The table-driven CRC (`update_slow`, the slicing-by-16 `update_fast_16`) and `combine` translate. The SIMD and hardware-CRC paths don't appear: Charon translates the build it's given, and in this one `specialized::State::new` is the stub returning `None`. 4 axioms, all `Debug` formatting and `unwrap_or_else`. |
+| leb128 0.2.5 | 746 | complete | 2 errors | Built on `std::io::Read`/`Write`: 8 axioms (I/O errors, `write_all`), and Aeneas's model of `std::error::Error` lacks `source`. The arithmetic is there, but everything goes through I/O. |
+| adler 1.0.2 | 433 | partial | 2 errors | Iterator `zip` isn't in Aeneas's model. |
+| hex 0.4.3 | 686 | partial | 30 errors | Iterator adaptors (`zip`, `skip`, `map`, `enumerate`), closures, `char`: 26 axioms, 3 `sorry`s. |
+
+So two of five crates translate into Lean that type-checks, and one has a real proof checked end
+to end. The failures are all the same kind: the standard library's iterator, I/O and formatting
+traits, which Aeneas's Lean library doesn't model yet. Plain loops over slices and integers work.
 
 ## What it means
 
