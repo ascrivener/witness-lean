@@ -9,6 +9,10 @@
 //!     lean-host profile DIR OUT    check every node of DIR's pack once, recording each one's time
 //!                                  and lookups (see profile.rs)
 //!     lean-host nodes DIR          load and check every node of DIR, in order, with its proof
+//!     lean-host reveal DIR GOAL…   run the check as a bounty's reveal, every node of DIR in the
+//!                                  witness, once for each GOAL (a statement node's hash): print
+//!                                  which it proves; exit 1 if none (for checking a solution
+//!                                  before submitting it)
 //!     lean-host plan DIR PLAN      attest each batch of PLAN (from lean_plan.py), timing each
 //!     lean-host trace DIR PLAN OUT [MS]
 //!                                  write OUT: PLAN with each batch trusting only what the kernel
@@ -194,6 +198,28 @@ fn run(mode: CheckMode, blobs: &[(bool, Vec<u8>)], params: &[u8], witness: &[u8]
 	let start = Instant::now();
 	let ok = std::panic::catch_unwind(|| lean_check::check(&input)).unwrap_or(false);
 	(ok, start.elapsed())
+}
+
+/// Run the check in reveal mode as a bounty's reveal would, with every node of DIR (and its
+/// proof) in the witness, untrusted, so all of them are checked: for each of GOALS (statement
+/// node hashes), print whether the reveal proves it. Exits 1 if none is proven.
+fn reveal(dir: &Dir, goals: &[&str]) {
+	let mut items = Vec::new();
+	for e in &dir.manifest {
+		let h = e["hash"].as_str().unwrap();
+		items.push(dir.node(h));
+		items.extend(dir.proof(h));
+	}
+	let witness = encode(&items);
+	let mut proven = false;
+	for goal in goals {
+		let (ok, t) = run(CheckMode::Reveal, &[], &hex(goal), &witness);
+		println!("{goal}: {} in {t:?}", if ok { "proven" } else { "not proven" });
+		proven |= ok;
+	}
+	if !proven {
+		std::process::exit(1);
+	}
 }
 
 fn plan(dir: &Dir, plan: &str) {
@@ -944,6 +970,7 @@ fn main() {
 		["profile", dir, out] => profile::profile(dir, out),
 		["nodes", dir] => nodes(&Dir::open(dir)),
 		["plan", dir, p] => plan(&Dir::open(dir), p),
+		["reveal", dir, ref goals @ ..] if !goals.is_empty() => reveal(&Dir::open(dir), goals),
 		["run", args] => {
 			let args = std::fs::read(args).expect("arguments");
 			let input = witness_check::Input::parse(&args).expect("well-formed arguments");
