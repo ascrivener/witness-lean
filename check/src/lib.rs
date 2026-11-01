@@ -65,7 +65,7 @@ use witness_check::{Input, Mode};
 
 // nanoda recurses deeply while type checking. A 1 MiB stack sufficed for every proof the spike
 // measured; natively it asks for 16 MiB for deep ones.
-#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+#[cfg(target_env = "polkavm")]
 polkavm_derive::min_stack_size!(8 * 1024 * 1024);
 
 fn blake2b256(data: &[u8]) -> Hash {
