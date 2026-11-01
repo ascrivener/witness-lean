@@ -14,6 +14,9 @@
 # - fta: the fundamental theorem of algebra, Mathlib's Complex.exists_root: 46,201 nodes in 2,416
 #   batches over 293 depths. The heaviest, iteratedFDerivWithin_succ_apply_right alone (its proof
 #   doesn't split usefully), uses 4.57×10⁹ gas, so fta gives checks all 5×10⁹ witness allows.
+# - aeneas, aeneas-correct: proofs about a Rust function (a LEB128 decoder) translated to Lean by
+#   Aeneas (spike/aeneas): that it never panics, and that it decodes correctly. The project is on
+#   Lean v4.35.0, so LEAN4EXPORT must be built for that.
 #
 # The solver's export is converted to content-addressed nodes (tools/lean/lean_nodes.py), and
 # everything but the solver's theorem is planned into batches by dependency depth
@@ -51,7 +54,19 @@ case "${1:-gcd}" in
 	fta)
 		PROJECT=check/testdata/primes SOLUTION_MODULE=Mathlib.Analysis.Complex.Polynomial.Basic
 		THEOREM=Complex.exists_root GAS=5000000000 ;;
-	*) echo "usage: $0 [gcd|primes|flt4|fta]" >&2; exit 2 ;;
+	aeneas)
+		# A Rust function translated by Aeneas (spike/aeneas), with a proof that it never panics.
+		# Its project is on Lean v4.35.0, whose pins match the check's: LEAN4EXPORT must be built
+		# for v4.35.0.
+		PROJECT=spike/aeneas/lean SOLUTION_MODULE=Leb128Proofs THEOREM=leb128.decode_u32_spec GAS=4500000000 ;;
+	aeneas-correct)
+		# The same function, proved to decode exactly the LEB128 value of the bytes it takes.
+		PROJECT=spike/aeneas/lean SOLUTION_MODULE=Leb128Spec THEOREM=leb128.decode_u32_correct GAS=4500000000 ;;
+	aeneas-fnv)
+		# The fnv crate (1.0.7, from crates.io) as Aeneas translates it: its Hasher::write computes
+		# exactly FNV-1a.
+		PROJECT=spike/aeneas/lean SOLUTION_MODULE=FnvSpec THEOREM=fnv.write_spec GAS=4500000000 ;;
+	*) echo "usage: $0 [gcd|primes|flt4|fta|aeneas|aeneas-correct|aeneas-fnv]" >&2; exit 2 ;;
 esac
 cd "$(dirname "$0")/.."
 JAMT=${POLKAJAM_DIR:+$POLKAJAM_DIR/}jamt

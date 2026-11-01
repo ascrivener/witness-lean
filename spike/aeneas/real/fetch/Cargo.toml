@@ -1,0 +1,11 @@
+[package]
+name = "fetch"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+fnv = "=1.0.7"
+adler = "=1.0.2"
+hex = "=0.4.3"
+leb128 = "=0.2.5"
+crc32fast = "=1.4.2"
+[workspace]
